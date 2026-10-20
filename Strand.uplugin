@@ -1,0 +1,21 @@
+{
+  "FileVersion": 3,
+  "Version": 2,
+  "VersionName": "0.2.0",
+  "FriendlyName": "Strand",
+  "Description": "Reusable spline data assets, SVG/Alembic curve import (optional FBX compatibility), actor sync, PCG and Landscape integration.",
+  "Category": "Editor",
+  "CreatedBy": "Strand",
+  "CanContainContent": false,
+  "IsBetaVersion": true,
+  "Installed": false,
+  "Modules": [
+    { "Name": "Strand", "Type": "Runtime", "LoadingPhase": "Default" },
+    { "Name": "StrandPCG", "Type": "Runtime", "LoadingPhase": "Default" },
+    { "Name": "StrandEditor", "Type": "Editor", "LoadingPhase": "PostEngineInit" }
+  ],
+  "Plugins": [
+    { "Name": "PCG", "Enabled": true },
+    { "Name": "AlembicImporter", "Enabled": true }
+  ]
+}
