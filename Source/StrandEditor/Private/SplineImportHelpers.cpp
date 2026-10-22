@@ -21,6 +21,12 @@ USplineDataAsset* SplineAssetImport::CommitCurves(UObject* Parent, FName Request
     const FString Format = FPaths::GetExtension(SourceFile).ToLower();
     auto RecordSource = [&](USplineDataAsset* Asset, const FSplineImportedCurve& Curve, int32 Index)
     {
+        // Imported source coordinates often have a large DCC canvas offset.
+        // Keep the ORIGINAL positions in the asset, but default viewport placement
+        // to the curve centroid so dropping it places visible spline points near the cursor.
+        Asset->DefaultCoordinateMode = EStrandCoordinateMode::Relative;
+        Asset->DefaultAnchorMode = EStrandAnchorMode::PointCenter;
+        Asset->DefaultAnchorPointIndex = 0;
         Asset->SourceImportFormat = Format;
         Asset->SourceCurveId = Curve.SourceId.IsEmpty()
             ? Curve.Name + FString::Printf(TEXT("#%d"), Index)

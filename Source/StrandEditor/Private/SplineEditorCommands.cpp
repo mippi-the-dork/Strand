@@ -1,8 +1,11 @@
 #include "SplineEditorCommands.h"
 #include "SplineDataAsset.h"
-#include "SplineAssetTrackerComponent.h"
+#include "StrandSplineUserData.h"
 #include "SplineDataAssetFactory.h"
 #include "SplineLandscapeAdapter.h"
+#include "StrandPlacement.h"
+#include "StrandSplineRefresh.h"
+#include "EngineUtils.h"
 #include "Components/SplineComponent.h"
 #include "LandscapeSplinesComponent.h"
 #include "LandscapeSplineControlPoint.h"
@@ -35,20 +38,40 @@ namespace
     {
         FMessageDialog::Open(EAppMsgType::Ok, FText::FromString(Detail));
     }
-    USplineAssetTrackerComponent* FindOrCreateTracker(AActor* Actor)
+    bool MatchesPlacement(const USplineDataAsset* Asset, const USplineComponent* Spline)
     {
-        if (!IsValid(Actor)) { return nullptr; }
-        if (USplineAssetTrackerComponent* Found = Actor->FindComponentByClass<USplineAssetTrackerComponent>())
-        {
-            return Found;
-        }
+        if (!IsValid(Asset) || !IsValid(Spline)) { return false; }
+        const UStrandSplineUserData* Data = UStrandSplineUserData::Get(Spline);
+        return Data && Data->AssignedSplineAsset == Asset
+            ? Data->IsInSync(Spline)
+            : Asset->MatchesSplineComponentWithPlacement(Spline,
+                Asset->DefaultCoordinateMode, Asset->DefaultAnchorMode, Asset->DefaultAnchorPointIndex);
+    }
+
+    void ApplyLinked(USplineDataAsset* Asset, USplineComponent* Spline)
+    {
+        if (!IsValid(Asset) || !IsValid(Spline)) { return; }
+        const UStrandSplineUserData* Data = UStrandSplineUserData::Get(Spline);
+        const EStrandCoordinateMode Mode = Data ? Data->CoordinateMode : Asset->DefaultCoordinateMode;
+        const EStrandAnchorMode Anchor = Data ? Data->AnchorMode : Asset->DefaultAnchorMode;
+        const int32 Index = Data ? Data->AnchorPointIndex : Asset->DefaultAnchorPointIndex;
+        Asset->ApplyToSplineComponentWithPlacement(Spline, Mode, Anchor, Index);
+        StrandSplineRefresh::NotifySplineChanged(Spline);
+    }
+    // Transaction is owned by the caller. Explicit target prevents accidental writes
+    // to arbitrary spline components when an actor has multiple candidates.
+    void ApplyToExplicitComponent(USplineDataAsset* Asset, USplineComponent* Spline)
+    {
+        AActor* Actor = IsValid(Spline) ? Spline->GetOwner() : nullptr;
+        if (!IsValid(Asset) || !IsValid(Actor)) { return; }
         Actor->Modify();
-        USplineAssetTrackerComponent* Tracker = NewObject<USplineAssetTrackerComponent>(Actor,
-            USplineAssetTrackerComponent::StaticClass(), NAME_None, RF_Transactional);
-        Actor->AddInstanceComponent(Tracker);
-        Tracker->OnComponentCreated();
-        Tracker->RegisterComponent();
-        return Tracker;
+        const bool bAlreadyLinked = UStrandSplineUserData::GetAssignedAsset(Spline) == Asset;
+        const bool bMatches = MatchesPlacement(Asset, Spline);
+        UStrandSplineUserData::AssignAsset(Spline, Asset);
+        if (!bMatches || !bAlreadyLinked)
+        {
+            if (!MatchesPlacement(Asset, Spline)) { ApplyLinked(Asset, Spline); }
+        }
     }
 }
 
@@ -101,23 +124,20 @@ USplineComponent* SplineEditorCommands::FindUnambiguousSpline(AActor* Actor)
     if (!IsValid(Actor)) { return nullptr; }
     TArray<USplineComponent*> Components;
     Actor->GetComponents<USplineComponent>(Components);
-    if (USplineAssetTrackerComponent* Tracker = Actor->FindComponentByClass<USplineAssetTrackerComponent>())
-    {
-        if (IsValid(Tracker->TrackedSpline) && Tracker->TrackedSpline->GetOwner() == Actor)
-        {
-            return Tracker->TrackedSpline;
-        }
-    }
-    return Components.Num() == 1 ? Components[0] : nullptr;
+    if (Components.Num() == 1) { return Components[0]; }
+    // Never guess which spline to change on actors containing multiple components.
+    return nullptr;
 }
 
-void SplineEditorCommands::CompareTracker(USplineAssetTrackerComponent* Tracker)
+void SplineEditorCommands::CompareComponent(USplineComponent* Spline)
 {
-    if (!IsValid(Tracker) || !IsValid(Tracker->AssignedSplineAsset) || !IsValid(Tracker->ResolveSpline())) { return; }
-    const USplineDataAsset* Asset = Tracker->AssignedSplineAsset;
-    const USplineComponent* Spline = Tracker->ResolveSpline();
+    const USplineDataAsset* Asset = UStrandSplineUserData::GetAssignedAsset(Spline);
+    if (!IsValid(Spline) || !IsValid(Asset)) { return; }
     const int32 Local = Spline->GetNumberOfSplinePoints();
     const int32 Saved = Asset->Points.Num();
+    const UStrandSplineUserData* Placement = UStrandSplineUserData::Get(Spline);
+    const FVector AnchorOffset = Placement && Placement->CoordinateMode == EStrandCoordinateMode::Relative
+        ? Asset->GetPlacementAnchor(Placement->AnchorMode, Placement->AnchorPointIndex) : FVector::ZeroVector;
     int32 DifferentPoints = 0;
     double LargestPosDelta = 0;
     int32 FirstDifferentIndex = INDEX_NONE;
@@ -125,7 +145,7 @@ void SplineEditorCommands::CompareTracker(USplineAssetTrackerComponent* Tracker)
     {
         const FSplinePoint Current = Spline->GetSplinePointAt(I, ESplineCoordinateSpace::Local);
         const FSplinePointData& Reference = Asset->Points[I];
-        const bool bDifferent = !Current.Position.Equals(Reference.LocalPosition, 0.01) ||
+        const bool bDifferent = !Current.Position.Equals(Reference.LocalPosition - AnchorOffset, 0.01) ||
             !Current.ArriveTangent.Equals(Reference.ArriveTangent, 0.01) ||
             !Current.LeaveTangent.Equals(Reference.LeaveTangent, 0.01) ||
             !Current.Rotation.Equals(Reference.LocalRotation, 0.01) ||
@@ -137,20 +157,13 @@ void SplineEditorCommands::CompareTracker(USplineAssetTrackerComponent* Tracker)
             if (FirstDifferentIndex == INDEX_NONE) { FirstDifferentIndex = I; }
         }
         LargestPosDelta = FMath::Max(LargestPosDelta,
-            FVector::Distance(Current.Position, Reference.LocalPosition));
+            FVector::Distance(Current.Position, Reference.LocalPosition - AnchorOffset));
     }
     const bool bLoopMismatch = Spline->IsClosedLoop() != Asset->bIsClosedLoop;
     Message(FString::Printf(TEXT("Strand comparison\n\nAsset points: %d\nLocal points: %d\nDiffering matched points: %d\nFirst different point index: %s\nLargest position delta: %.3f cm\nClosed loop differs: %s\n\nComparison only. No data was changed."),
         Saved, Local, DifferentPoints,
         FirstDifferentIndex == INDEX_NONE ? TEXT("None") : *FString::FromInt(FirstDifferentIndex),
         LargestPosDelta, bLoopMismatch ? TEXT("Yes") : TEXT("No")));
-}
-
-void SplineEditorCommands::BrowseTrackerAsset(USplineAssetTrackerComponent* Tracker)
-{
-    if (!IsValid(Tracker) || !IsValid(Tracker->AssignedSplineAsset) || !GEditor) { return; }
-    TArray<UObject*> Assets { Tracker->AssignedSplineAsset };
-    GEditor->SyncBrowserToObjects(Assets);
 }
 
 USplineDataAsset* SplineEditorCommands::SelectedSplineAsset()
@@ -185,7 +198,7 @@ void SplineEditorCommands::ConvertSelectedActors()
         USplineComponent* Spline = FindUnambiguousSpline(Actor);
         if (!Spline)
         {
-            Message(FString::Printf(TEXT("%s must have exactly one Spline Component. For actors with multiple splines, attach a Spline Asset Tracker and select its Tracked Spline explicitly."), *Actor->GetName()));
+            Message(FString::Printf(TEXT("%s must have exactly one Spline Component. For actors with multiple splines, use a named component action or select a specific Spline Component in Details."), *Actor->GetName()));
             continue;
         }
         USplineDataAssetFactory* Factory = NewObject<USplineDataAssetFactory>();
@@ -199,14 +212,9 @@ void SplineEditorCommands::ConvertSelectedActors()
         Spline->Modify();
         Asset->Modify();
         Asset->SerializeFromSplineComponent(Spline);
-        USplineAssetTrackerComponent* Tracker = FindOrCreateTracker(Actor);
-        if (Tracker)
-        {
-            Tracker->Modify();
-            Tracker->AssignedSplineAsset = Asset;
-            Tracker->TrackedSpline = Spline;
-            Tracker->MarkPackageDirty();
-        }
+        Asset->DefaultCoordinateMode = EStrandCoordinateMode::Absolute;
+        Asset->DefaultAnchorMode = EStrandAnchorMode::PointIndex;
+        UStrandSplineUserData::AssignAsset(Spline, Asset);
         SaveAsset(Asset);
         Actor->MarkPackageDirty();
     }
@@ -218,25 +226,40 @@ void SplineEditorCommands::ApplyAssetToSelectedActors(TWeakObjectPtr<USplineData
     USplineDataAsset* Asset = WeakAsset.Get();
     if (!Asset) { return; }
     const TArray<AActor*> Actors = SelectedActors();
-    if (Actors.IsEmpty()) { Message(TEXT("Select a level Actor containing one Spline Component first.")); return; }
-    if (!Confirm(LOCTEXT("InjectConfirm", "Replace the selected actors' local spline points with the Data Asset?")))
-    { return; }
-    const FScopedTransaction Transaction(LOCTEXT("Inject", "Apply Spline Data Asset"));
+    if (Actors.IsEmpty()) { Message(TEXT("Select one or more level Actors with native Spline Components.")); return; }
+    TArray<USplineComponent*> Targets;
+    TArray<FString> Skipped;
     for (AActor* Actor : Actors)
     {
-        USplineComponent* Spline = FindUnambiguousSpline(Actor);
-        if (!Spline) { continue; }
-        Actor->Modify();
-        Asset->ApplyToSplineComponent(Spline);
-        if (USplineAssetTrackerComponent* Tracker = FindOrCreateTracker(Actor))
+        if (USplineComponent* Spline = FindUnambiguousSpline(Actor))
         {
-            Tracker->Modify();
-            Tracker->AssignedSplineAsset = Asset;
-            Tracker->TrackedSpline = Spline;
+            Targets.Add(Spline);
         }
-        Actor->MarkPackageDirty();
+        else if (IsValid(Actor))
+        {
+            Skipped.Add(Actor->GetActorNameOrLabel());
+        }
+    }
+    if (Targets.IsEmpty())
+    {
+        Message(TEXT("No unambiguous spline targets. For multi-spline actors, right-click the actor and choose an individual named spline component."));
+        return;
+    }
+    const FString Prompt = FString::Printf(
+        TEXT("Apply Strand asset '%s' to %d native spline component(s)?\n\nThis replaces their local point data but preserves Actor/Component transforms.\n\n%d actor(s) cannot be targeted automatically and will be skipped."),
+        *Asset->GetName(), Targets.Num(), Skipped.Num());
+    if (!Confirm(FText::FromString(Prompt))) { return; }
+    const FScopedTransaction Transaction(LOCTEXT("Inject", "Apply Strand to Selected Native Splines"));
+    for (USplineComponent* Spline : Targets)
+    {
+        ApplyToExplicitComponent(Asset, Spline);
     }
     if (GEditor) { GEditor->RedrawAllViewports(); }
+    if (!Skipped.IsEmpty())
+    {
+        Message(FString::Printf(TEXT("Strand updated %d spline(s). Skipped ambiguous or unsupported actors:\n\n%s"),
+            Targets.Num(), *FString::Join(Skipped, TEXT("\n"))));
+    }
 }
 
 void SplineEditorCommands::ApplySelectedAssetToActors()
@@ -310,27 +333,235 @@ void SplineEditorCommands::ConvertSelectedLandscape()
     }
 }
 
-void SplineEditorCommands::ResetTracker(USplineAssetTrackerComponent* Tracker)
+void SplineEditorCommands::SetComponentPlacement(USplineComponent* Spline,
+    EStrandCoordinateMode Mode, EStrandAnchorMode AnchorMode, int32 AnchorPointIndex)
 {
-    if (!IsValid(Tracker) || !IsValid(Tracker->AssignedSplineAsset) || !Tracker->ResolveSpline()) { return; }
-    if (!Confirm(LOCTEXT("ResetConfirm", "Are you sure you want to revert local modifications to match the Data Asset?")))
+    if (!IsValid(Spline)) { return; }
+    UStrandSplineUserData* Placement = UStrandSplineUserData::Get(Spline);
+    USplineDataAsset* Asset = UStrandSplineUserData::GetAssignedAsset(Spline);
+    if (!Placement || !IsValid(Asset)) { return; }
+    const int32 SafeIndex = FMath::Clamp(AnchorPointIndex, 0, FMath::Max(0, Asset->Points.Num() - 1));
+    if (Placement->CoordinateMode == Mode && Placement->AnchorMode == AnchorMode &&
+        Placement->AnchorPointIndex == SafeIndex) { return; }
+
+    if (!Placement->IsInSync(Spline) && !Confirm(LOCTEXT("PlacementDiscard",
+        "Changing Strand placement will replace unsaved local spline edits with the asset's points. Continue?")))
+    {
+        return;
+    }
+    const FScopedTransaction Transaction(LOCTEXT("Placement", "Change Strand Spline Placement"));
+    if (AActor* Owner = Spline->GetOwner()) { Owner->Modify(); }
+    Spline->Modify();
+    Placement->Modify();
+    Placement->CoordinateMode = Mode;
+    Placement->AnchorMode = AnchorMode;
+    Placement->AnchorPointIndex = SafeIndex;
+    ApplyLinked(Asset, Spline);
+}
+
+void SplineEditorCommands::ResetComponent(USplineComponent* Spline)
+{
+    USplineDataAsset* Asset = UStrandSplineUserData::GetAssignedAsset(Spline);
+    if (!IsValid(Spline) || !IsValid(Asset)) { return; }
+    if (MatchesPlacement(Asset, Spline)) { return; }
+    if (!Confirm(LOCTEXT("ResetConfirm", "Are you sure you want to revert local modifications to match the Strand asset?")))
     { return; }
-    const FScopedTransaction Transaction(LOCTEXT("Reset", "Reset Spline to Spline Data Asset"));
-    if (AActor* Actor = Tracker->GetOwner()) { Actor->Modify(); }
-    Tracker->AssignedSplineAsset->ApplyToSplineComponent(Tracker->ResolveSpline());
+    const FScopedTransaction Transaction(LOCTEXT("Reset", "Apply Strand Asset to Native Spline"));
+    if (AActor* Actor = Spline->GetOwner()) { Actor->Modify(); }
+    ApplyLinked(Asset, Spline);
+}
+
+void SplineEditorCommands::UpdateComponentAsset(USplineComponent* Spline)
+{
+    USplineDataAsset* Asset = UStrandSplineUserData::GetAssignedAsset(Spline);
+    if (!IsValid(Spline) || !IsValid(Asset)) { return; }
+    if (MatchesPlacement(Asset, Spline))
+    {
+        Message(TEXT("Strand is already in sync. No asset update is necessary."));
+        return;
+    }
+    int32 LoadedUsers = 0;
+    if (GEditor)
+    {
+        if (UWorld* World = GEditor->GetEditorWorldContext().World())
+        {
+            for (TActorIterator<AActor> It(World); It; ++It)
+            {
+                TArray<USplineComponent*> Components;
+                It->GetComponents<USplineComponent>(Components);
+                for (USplineComponent* Other : Components)
+                {
+                    if (UStrandSplineUserData::GetAssignedAsset(Other) == Asset)
+                    {
+                        ++LoadedUsers;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    FString SourceWarning;
+#if WITH_EDITORONLY_DATA
+    if (!Asset->SourceImportFormat.IsEmpty())
+    {
+        SourceWarning = TEXT("\nThis asset was imported from a file; reimporting may overwrite your edits.\n");
+    }
+#endif
+    const FString Prompt = FString::Printf(
+        TEXT("Overwrite Strand asset '%s' with this spline and save it?\n\n%d loaded actor(s) reference this asset. Their local splines will NOT update automatically.%s\nUndo reverses the in-memory change; save again after Undo to persist it."),
+        *Asset->GetName(), LoadedUsers, *SourceWarning);
+    if (!Confirm(FText::FromString(Prompt))) { return; }
+    const FScopedTransaction Transaction(LOCTEXT("Update", "Update Strand Asset from Native Spline"));
+    Asset->Modify();
+    const UStrandSplineUserData* Placement = UStrandSplineUserData::Get(Spline);
+    if (Placement)
+    {
+        Asset->SerializeFromSplineComponentWithPlacement(Spline,
+            Placement->CoordinateMode, Placement->AnchorMode, Placement->AnchorPointIndex);
+    }
+    else { Asset->SerializeFromSplineComponent(Spline); }
+    SaveAsset(Asset);
+}
+
+void SplineEditorCommands::AssignAssetToComponent(TWeakObjectPtr<USplineComponent> WeakComponent,
+                                                 TWeakObjectPtr<USplineDataAsset> WeakAsset)
+{
+    USplineComponent* Spline = WeakComponent.Get();
+    if (!IsValid(Spline)) { return; }
+    USplineDataAsset* Asset = WeakAsset.Get();
+    const FScopedTransaction Transaction(LOCTEXT("Assign", "Assign Strand Asset to Native Spline"));
+    UStrandSplineUserData::AssignAsset(Spline, Asset);
+    if (IsValid(Asset) && !MatchesPlacement(Asset, Spline))
+    {
+        if (Confirm(LOCTEXT("AssignApply", "The assigned Strand asset differs from this spline. Apply its points now?\n\nChoosing No only links the asset; your local points are preserved.")))
+        {
+            ApplyLinked(Asset, Spline);
+        }
+    }
     if (GEditor) { GEditor->RedrawAllViewports(); }
 }
 
-void SplineEditorCommands::UpdateTracker(USplineAssetTrackerComponent* Tracker)
+void SplineEditorCommands::CreateNativeActorFromAsset(TWeakObjectPtr<USplineDataAsset> WeakAsset)
 {
-    if (!IsValid(Tracker) || !IsValid(Tracker->AssignedSplineAsset) || !Tracker->ResolveSpline()) { return; }
-    if (!Confirm(LOCTEXT("UpdateConfirm", "This will permanently overwrite the saved asset. Proceed?")))
-    { return; }
-    USplineDataAsset* Asset = Tracker->AssignedSplineAsset;
-    const FScopedTransaction Transaction(LOCTEXT("Update", "Update Spline Data Asset from Level"));
-    Asset->Modify();
-    Asset->SerializeFromSplineComponent(Tracker->ResolveSpline());
-    SaveAsset(Asset);
+    FString Error;
+    if (!StrandPlacement::CreateNativeSplineActor(WeakAsset.Get(), Error)) { Message(Error); }
 }
+
+void SplineEditorCommands::SelectActorsUsingAsset(TWeakObjectPtr<USplineDataAsset> WeakAsset)
+{
+    USplineDataAsset* Asset = WeakAsset.Get();
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+    if (!IsValid(Asset) || !IsValid(World)) { Message(TEXT("Open an editable level and choose a Strand asset.")); return; }
+    TArray<AActor*> Users;
+    for (TActorIterator<AActor> It(World); It; ++It)
+    {
+        AActor* Actor = *It;
+        TArray<USplineComponent*> Components;
+        Actor->GetComponents<USplineComponent>(Components);
+        for (USplineComponent* Spline : Components)
+        {
+            if (UStrandSplineUserData::GetAssignedAsset(Spline) == Asset)
+            {
+                Users.Add(Actor);
+                break;
+            }
+        }
+    }
+    if (Users.IsEmpty())
+    {
+        Message(TEXT("No loaded actors in this editor world reference the Strand asset through native spline components. Unloaded World Partition actors and Blueprint defaults are not included."));
+        return;
+    }
+    GEditor->SelectNone(false, true, false);
+    for (AActor* User : Users) { GEditor->SelectActor(User, true, false, true); }
+    GEditor->NoteSelectionChange();
+    Message(FString::Printf(TEXT("Selected %d loaded actor(s) using '%s'.\n\nThis only checks loaded level instances, not unloaded actors or Blueprint defaults."),
+        Users.Num(), *Asset->GetName()));
+}
+
+void SplineEditorCommands::ApplyAssetToComponent(TWeakObjectPtr<USplineDataAsset> WeakAsset,
+                                                  TWeakObjectPtr<USplineComponent> WeakComponent)
+{
+    USplineDataAsset* Asset = WeakAsset.Get();
+    USplineComponent* Spline = WeakComponent.Get();
+    if (!IsValid(Asset) || !IsValid(Spline))
+    {
+        Message(TEXT("Choose one Strand asset and one valid native spline component."));
+        return;
+    }
+    if (MatchesPlacement(Asset, Spline))
+    {
+        // Associate even if local geometry already matches.
+        const FScopedTransaction Transaction(LOCTEXT("BindEqual", "Link Strand Spline Asset"));
+        ApplyToExplicitComponent(Asset, Spline);
+        return;
+    }
+    if (!Confirm(FText::FromString(FString::Printf(
+        TEXT("Replace the local spline points on '%s' / '%s' with '%s'?\n\nActor and Component transforms stay unchanged."),
+        Spline->GetOwner() ? *Spline->GetOwner()->GetActorNameOrLabel() : TEXT("Blueprint"),
+        *Spline->GetName(), *Asset->GetName())))) { return; }
+    const FScopedTransaction Transaction(LOCTEXT("ApplyExplicit", "Apply Strand to Native Spline"));
+    ApplyToExplicitComponent(Asset, Spline);
+    if (GEditor) { GEditor->RedrawAllViewports(); }
+}
+
+void SplineEditorCommands::CaptureComponent(TWeakObjectPtr<USplineComponent> WeakComponent)
+{
+    USplineComponent* Spline = WeakComponent.Get();
+    AActor* Actor = IsValid(Spline) ? Spline->GetOwner() : nullptr;
+    if (!IsValid(Spline)) { Message(TEXT("The native spline component is no longer valid.")); return; }
+    USplineDataAssetFactory* Factory = NewObject<USplineDataAssetFactory>();
+    USplineDataAsset* Asset = Cast<USplineDataAsset>(FAssetToolsModule::GetModule().Get().CreateAssetWithDialog(
+        TEXT("SD_") + (Actor ? Actor->GetActorNameOrLabel() : TEXT("Blueprint")) + TEXT("_") + Spline->GetName(), TEXT("/Game"),
+        USplineDataAsset::StaticClass(), Factory, FName(TEXT("Strand")), false));
+    if (!Asset) { return; }
+    const FScopedTransaction Transaction(LOCTEXT("CaptureExplicit", "Save Native Spline as Strand Asset"));
+    if (Actor) { Actor->Modify(); }
+    Asset->Modify();
+    Asset->SerializeFromSplineComponent(Spline);
+    Asset->DefaultCoordinateMode = EStrandCoordinateMode::Absolute;
+    Asset->DefaultAnchorMode = EStrandAnchorMode::PointIndex;
+    UStrandSplineUserData::AssignAsset(Spline, Asset);
+    SaveAsset(Asset);
+    if (Actor) { Actor->MarkPackageDirty(); }
+    StrandSplineRefresh::NotifySplineChanged(Spline);
+}
+
+void SplineEditorCommands::AddNativeSplineAndApplyToSelected()
+{
+    USplineDataAsset* Asset = SelectedSplineAsset();
+    if (!Asset) { Message(TEXT("Select exactly one Strand Spline in the Content Browser first.")); return; }
+    TArray<AActor*> Eligible;
+    for (AActor* Actor : SelectedActors())
+    {
+        TArray<USplineComponent*> Splines;
+        Actor->GetComponents<USplineComponent>(Splines);
+        if (Splines.IsEmpty()) { Eligible.Add(Actor); }
+    }
+    if (Eligible.IsEmpty())
+    {
+        Message(TEXT("Select a level actor without any Spline Component, then try again."));
+        return;
+    }
+    if (!Confirm(FText::FromString(FString::Printf(TEXT("Add a native Spline Component to %d actor(s), using Strand asset '%s'?"),
+        Eligible.Num(), *Asset->GetName())))) { return; }
+    const FScopedTransaction Transaction(LOCTEXT("AddNative", "Add Native Spline Components from Strand"));
+    int32 Applied = 0;
+    for (AActor* Actor : Eligible)
+    {
+        if (USplineComponent* Spline = StrandPlacement::AddNativeSpline(Actor))
+        {
+            ApplyToExplicitComponent(Asset, Spline);
+            ++Applied;
+        }
+    }
+    if (GEditor) { GEditor->RedrawAllViewports(); }
+    if (Applied != Eligible.Num())
+    {
+        Message(FString::Printf(TEXT("Created %d of %d requested native splines. Check the Output Log for any actor restrictions."),
+            Applied, Eligible.Num()));
+    }
+}
+
 
 #undef LOCTEXT_NAMESPACE

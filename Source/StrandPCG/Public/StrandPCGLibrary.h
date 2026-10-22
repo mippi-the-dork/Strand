@@ -9,10 +9,10 @@ class USplineDataAsset;
 
 /** PCG adapter. Output is transient spatial data that can be supplied to PCG graph consumers. */
 UCLASS()
-class SPLINEASSETPIPELINEPCG_API UStrandPCGLibrary : public UBlueprintFunctionLibrary
+class STRANDPCG_API UStrandPCGLibrary : public UBlueprintFunctionLibrary
 {
     GENERATED_BODY()
 public:
-    UFUNCTION(BlueprintCallable, Category="Strand|PCG", )
+    UFUNCTION(BlueprintCallable, Category="Strand|PCG")
     static UPCGSplineData* ApplySplineDataAssetToPcg(UObject* Outer, const USplineDataAsset* Asset, FTransform Transform);
 };

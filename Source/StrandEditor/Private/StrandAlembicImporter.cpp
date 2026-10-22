@@ -342,7 +342,7 @@ bool SplineAssetImport::LoadAlembicCurves(const FString& Filename,
     {
         Alembic::AbcCoreFactory::IFactory Factory;
         const FTCHARToUTF8 Path(*Filename);
-        const Abc::IArchive Archive = Factory.getArchive(Path.Get()).first;
+        const Abc::IArchive Archive = Factory.getArchive(Path.Get());
         if (!Archive.valid()) { return false; }
         Walk(Archive.getTop(), Settings, Curves);
     }

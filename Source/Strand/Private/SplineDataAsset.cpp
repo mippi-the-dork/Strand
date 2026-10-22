@@ -35,16 +35,72 @@ void USplineDataAsset::SerializeFromSplineComponent(const USplineComponent* Sour
 void USplineDataAsset::ApplyToSplineComponent(USplineComponent* TargetComponent) const
 {
     if (!IsValid(TargetComponent)) { return; }
-    TargetComponent->Modify();
-    TargetComponent->ClearSplinePoints(false);
-    for (int32 I = 0; I < Points.Num(); ++I)
+    ApplyToSplineComponentWithPlacement(TargetComponent, EStrandCoordinateMode::Absolute, EStrandAnchorMode::PointIndex, 0);
+}
+
+FVector USplineDataAsset::GetPlacementAnchor(EStrandAnchorMode AnchorMode, int32 AnchorPointIndex) const
+{
+    if (Points.IsEmpty()) { return FVector::ZeroVector; }
+    if (AnchorMode == EStrandAnchorMode::PointCenter)
     {
-        TargetComponent->AddPoint(Points[I].ToSplinePoint(I), false);
+        FVector Sum = FVector::ZeroVector;
+        for (const FSplinePointData& Point : Points) { Sum += Point.LocalPosition; }
+        return Sum / static_cast<double>(Points.Num());
     }
-    TargetComponent->SetClosedLoop(bIsClosedLoop && Points.Num() >= 2, false);
-    TargetComponent->UpdateSpline();
-    TargetComponent->MarkRenderStateDirty();
-    TargetComponent->MarkPackageDirty();
+    return Points[FMath::Clamp(AnchorPointIndex, 0, Points.Num() - 1)].LocalPosition;
+}
+
+void USplineDataAsset::ApplyToSplineComponentWithPlacement(USplineComponent* Component,
+    EStrandCoordinateMode Mode, EStrandAnchorMode AnchorMode, int32 AnchorIndex) const
+{
+    if (!IsValid(Component)) { return; }
+    const FVector Offset = Mode == EStrandCoordinateMode::Relative
+        ? GetPlacementAnchor(AnchorMode, AnchorIndex) : FVector::ZeroVector;
+    Component->Modify();
+    Component->ClearSplinePoints(false);
+    for (int32 Index = 0; Index < Points.Num(); ++Index)
+    {
+        FSplinePoint Point = Points[Index].ToSplinePoint(Index);
+        Point.Position -= Offset;
+        Component->AddPoint(Point, false);
+    }
+    Component->SetClosedLoop(bIsClosedLoop && Points.Num() >= 2, false);
+    Component->UpdateSpline();
+    Component->MarkRenderStateDirty();
+    Component->MarkPackageDirty();
+}
+
+bool USplineDataAsset::MatchesSplineComponentWithPlacement(const USplineComponent* Component,
+    EStrandCoordinateMode Mode, EStrandAnchorMode AnchorMode, int32 AnchorIndex, float Tolerance) const
+{
+    if (!IsValid(Component) || Component->GetNumberOfSplinePoints() != Points.Num() ||
+        Component->IsClosedLoop() != bIsClosedLoop) { return false; }
+    const FVector Offset = Mode == EStrandCoordinateMode::Relative
+        ? GetPlacementAnchor(AnchorMode, AnchorIndex) : FVector::ZeroVector;
+    for (int32 Index = 0; Index < Points.Num(); ++Index)
+    {
+        const FSplinePoint Current = Component->GetSplinePointAt(Index, ESplineCoordinateSpace::Local);
+        const FSplinePointData& Saved = Points[Index];
+        if (!Current.Position.Equals(Saved.LocalPosition - Offset, Tolerance) ||
+            !Current.ArriveTangent.Equals(Saved.ArriveTangent, Tolerance) ||
+            !Current.LeaveTangent.Equals(Saved.LeaveTangent, Tolerance) ||
+            !Current.Rotation.Equals(Saved.LocalRotation, Tolerance) ||
+            !Current.Scale.Equals(Saved.LocalScale, Tolerance) ||
+            Component->GetSplinePointType(Index) != Saved.PointType.GetValue()) { return false; }
+    }
+    return true;
+}
+
+void USplineDataAsset::SerializeFromSplineComponentWithPlacement(const USplineComponent* Source,
+    EStrandCoordinateMode Mode, EStrandAnchorMode AnchorMode, int32 AnchorIndex)
+{
+    if (!IsValid(Source)) { return; }
+    // Use the PREVIOUS asset anchor to reverse an instance's existing placement.
+    // This preserves the source coordinate frame when one designer edits a shared asset.
+    const FVector Offset = Mode == EStrandCoordinateMode::Relative
+        ? GetPlacementAnchor(AnchorMode, AnchorIndex) : FVector::ZeroVector;
+    SerializeFromSplineComponent(Source);
+    for (FSplinePointData& Point : Points) { Point.LocalPosition += Offset; }
 }
 
 bool USplineDataAsset::MatchesSplineComponent(const USplineComponent* Component, float Tolerance) const

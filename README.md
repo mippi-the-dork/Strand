@@ -1,119 +1,90 @@
 # Strand
 
-**Spline data assets for Unreal Engine 5.5+**
+**Reusable spline assets for Unreal Engine 5.5+**
 
-Strand stores native Unreal spline point configurations as reusable Content Browser assets. It is **not** a new spline primitive, editor mode, rendering system or spline mesh generator. Existing `USplineComponent` actors, PCG and Landscape spline systems remain responsible for editing and using curves.
+Strand stores **native `USplineComponent` point data** as Content Browser assets (`USplineDataAsset`). It does not replace Unreal spline editing, introduce a competing spline component, or generate meshes. A Strand asset stores local positions, arrive/leave tangents, rotations, scales, point types and the closed-loop flag, **never the actor or component transform**.
 
-**Version:** 0.2.0 source candidate, editor build not yet validated. **Platform:** UE 5.5+ source candidate; UE 5.8.3 should be verified first. **Dependencies:** PCG and Unreal's Alembic Importer plugins, existing native engine FBX SDK (optional legacy importer). **Modules:** Strand (runtime), StrandPCG (PCG runtime), StrandEditor (editor).
+**Version:** 0.4.3 source candidate. **Validated against a live UE Editor build:** Not yet; first build target UE 5.8.3. **Modules:** Strand (runtime), StrandPCG (PCG runtime), StrandEditor (editor). Dependencies: Unreal PCG and Alembic Importer plugins.
 
-## Install
+## Quick start: drag directly into the Level Editor
 
-Copy the whole `Strand` folder to `<Project>/Plugins/Strand`, enable the plugin and PCG and Alembic Importer dependencies, regenerate project files and build your Editor target. The Alembic C++ SDK is accessed through Unreal's existing `AlembicLib` and `AlembicLibrary` modules; **do not bundle a second Alembic SDK**.
+1. Import an SVG/ABC using **Tools > Strand: Import SVG Curves...** or **Import Alembic Curves...**. Each disconnected curve receives its own **Strand Spline** asset.
+2. Drag one **Strand Spline** asset from the Content Browser into the **Level viewport**, and drop it where you want it.
+3. Strand's native `UActorFactory` integration creates an `AStrandSplineActor` (a lightweight normal Actor containing a stock `USplineComponent` as its root) and assigns the Strand asset to that component's Asset User Data.
+4. Select the new actor's **Spline Component**. Edit its curve normally with Unreal's viewport spline controls. No additional tracking component appears.
+5. In the **Spline Component Details > Strand** category, use the asset picker and the **Apply Asset**, **Update Asset**, **Save as New** or **Compare** buttons.
 
-The plugin package does not include prebuilt binaries. An Unreal Engine SDK/compiler is not present in this authoring environment, so the source is not yet compile-verified. See [TEST_PLAN.md](TEST_PLAN.md).
+**Quick Add:** In a Level Editor viewport choose **Quickly Add > Strand Spline Actor** (also available under Place Actors > Basic). This creates the exact same `AStrandSplineActor` class as a dropped Strand asset, but with an unlinked native spline to edit or assign later. The existing **Spline Test** entry is not part of Strand and remains untouched.
 
-## Key workflows
+The actor factory is explicitly registered with UE 5.8's `UPlacementSubsystem` as well as the legacy editor factory registry. It accepts only `USplineDataAsset` and does not intercept other Content Browser asset types. It uses Unreal's normal asset placement transform, so the actor should appear at the drop position. The right-click **Create Native Spline Actor at World Origin** command remains available as a fallback.
 
-### Create an asset from a native spline
+**Note:** Native spline components do not generate visible rendered meshes at runtime on their own. The spline is still a native component edited with Unreal's standard spline toolset.
 
-1. Select an Actor with a `USplineComponent`.
-2. Right-click the actor in the Level Editor, then choose **Convert Spline to Spline Data Asset**.
-3. Select the Content Browser asset path in Unreal's standard save dialog.
-4. Strand records points and closed-loop state and adds a **Spline Asset Tracker** to the actor, referencing the asset and source component.
-5. Keep editing the original spline in the standard Unreal viewport.
+## Native Spline Component Details
 
-For actors with multiple spline components, add a **Spline Asset Tracker** and select the intended **Tracked Spline** component explicitly. Never infer which of multiple splines was intended. Existing actor/component transforms are untouched.
+Strand adds a **Strand** category to existing `USplineComponent` Details with **Strand Actions** on the left and **four white, native-looking icon buttons** on the right (Apply, Update, Save as New, Compare), each with a descriptive tooltip:
 
-### Apply an asset to an existing spline
+| Control | Behavior |
+| --- | --- |
+| Strand Spline Asset | Assign, browse, or clear an asset reference. Assigning a different shape asks whether to apply the asset or preserve the local points. |
+| Sync Status | **In Sync**, **Modified Locally**, or **No Asset Assigned**, with point counts. |
+| Apply Asset | Confirm and restore the assigned asset's point data into the native spline. |
+| Update Asset | Confirm and save the spline's current points into the assigned `.uasset`; warns about other loaded users and imported source data. |
+| Save as New | Save current spline points to a new Strand asset through the standard Content Browser asset dialog and link it. |
+| Compare | Non-destructive point/count/tangent/rotation/scale/loop comparison. |
+| Coordinate Mode | **Absolute** preserves the asset's original spline-local coordinates. **Relative** translates spline-local positions around a selected anchor while preserving the actor/component transform. |
+| Use Center of Spline Points | In Relative mode, anchor the arithmetic average of all spline points at component local origin. |
+| Anchor Point Index | In Relative mode, select a zero-based spline point to position at component local origin instead. |
 
-1. Select a Strand **Spline Data Asset** in the Content Browser.
-2. Select a level actor with an unambiguous spline component, or a tracker with an explicitly configured target.
-3. Right-click the actor > **Apply Selected Spline Data Asset**. Alternatively right-click the asset > **Apply to Selected Level Spline Actor(s)**.
-4. Confirm the overwrite. The asset is assigned to the tracker so subsequent changes can be compared, reset and saved.
+**Coordinate behavior:** All stored Strand point positions remain local to the source spline, even when "Absolute" is selected. "Absolute" means *preserve the asset's local coordinates*, not world-space coordinates. "Relative" subtracts either an existing point's location or the average of all point locations; it never writes any Actor or Component transform. The anchor options live on each native spline, and asset-level defaults live on the asset itself. Imported SVG/ABC/FBX curves and manually created new assets default to **Relative + Center** for intuitive viewport drops, including assets made before placement options existed. Native spline assets captured from Unreal are explicitly set to **Absolute**, preserving original shape offsets. Updating an asset from an anchored instance reverses the placement offset, so the source coordinate frame isn't unintentionally erased.
 
-### Edit, compare, reset, update
+**Blueprint viewport:** Strand now invalidates the native spline render state and refreshes matching Blueprint preview spline components directly, even when the preview world is not in the normal engine world-context list after Apply/placement adjustments, without requiring a manual Compile to see open/closed curve changes. Construction scripts that independently overwrite spline points may still control their final shape.
 
-Select an actor's **Spline Asset Tracker** component in Details. It shows **Assigned Spline Asset** and **Tracked Spline** references and a read-only sync status:
+Asset assignment is serialized as a tiny **`UStrandSplineUserData : UAssetUserData`** instance owned by each native spline. It is *not* an actor component and does not require changing Unreal engine source or subclassing `USplineComponent`. Assignment alone does not silently replace local geometry. Apply and Update are explicit and confirmation-gated. Operations use `FScopedTransaction` for editor Undo/Redo. `Update Asset` also saves the `.uasset`; after undoing it, save again to persist that reversal.
 
-* **Compare Local vs Asset:** point counts, number of differing points, first difference, maximum positional delta and loop mismatch. No mutation.
-* **Browse to Data Asset:** locate the associated asset in the Content Browser.
-* **Reset to Spline Data Asset:** confirm and replace the local component's points with the asset's points.
-* **Update Spline Data Asset:** confirm and replace the asset's points with the component's local points, saving the `.uasset`.
+**Spline Mesh Components:** Strand also adds a Details category on native `USplineMeshComponent` (including loaded derived types). A spline mesh is one deformable two-endpoint section, *not* a multi-point USplineComponent. It can save its endpoint positions/tangents as a two-point Strand asset and apply a compatible two-point open asset. Multi-point and closed assets are explicitly rejected rather than truncated. Existing Static Mesh, materials, collision, mesh-specific roll/scale and other properties remain native. Update from a spline mesh replaces properties that the 2-point Strand representation does not carry (the confirmation warns).
 
-Reset and Update use `FScopedTransaction` for Undo/Redo. The current Update implementation explicitly saves the package after modification; after Undo, **save again** to persist the in-memory Undo state to disk. Project source control permissions are still respected by Unreal.
+**Compatibility detail:** Strand registers Details customization for currently loaded native spline subclasses, plus native Spline Mesh classes. This can interact with other plugins' own custom class layouts; test the relevant specialized components in the installed editor. Strand does not change Water/Cine/PCG-specific metadata.
 
-No automatic synchronization occurs when an artist moves a spline handle. There is no hidden live-binding that could unexpectedly modify other actors or shared assets.
+## Existing actors and multiple splines
 
-### Runtime and PCG
+- Select a Strand asset, right-click an actor with one spline and choose **Apply Selected Spline Data Asset**. It overwrites points after confirmation and assigns the asset to that component.
+- Right-click an actor with no spline and choose **Add Native Spline Component from Selected Strand**. Strand adds an ordinary `USplineComponent`, respecting the existing actor root.
+- Actors containing several splines offer individually named **Save [Component] as Strand Spline** and **Apply Selected Strand to [Component]** actions. Strand never arbitrarily targets one of several splines.
+- Right-click a Strand asset and choose **Apply to Selected Level Spline Actor(s)** or **Select Loaded Actors Using This Strand**. The latter scans native spline Asset User Data, but does not include unloaded World Partition cells or Blueprint class defaults.
+- Select an existing actor with a spline and choose **Convert Spline to Spline Data Asset** to create a new linked Strand asset.
 
-The runtime C++/Blueprint library, `UStrandLibrary::ApplySplineDataAsset`, explicitly applies a Strand asset to an existing `USplineComponent` and preserves target transforms. `UStrandPCGLibrary::ApplySplineDataAssetToPcg` creates a transient `UPCGSplineData` using the stored native `FSplinePoint` values and a **caller-provided** transform. A PCG graph integration can consume that object; Strand does not override native graph behavior. Both libraries operate on native spline data.
+## Import and reimport
 
-### Landscape Splines
+- **SVG (.svg):** 2D paths/lines/polylines/polygons, Bezier curves, quadratic curves, smooth commands, elliptical arcs, closed paths and nested transforms. Stored in local XY with Z=0.
+- **Alembic (.abc):** `ICurves` geometry with supported linear, Bezier, Catmull-Rom, B-spline and NURBS forms; nested curve identities preserved for source-aware reimport. Alembic units must be configured for the source application.
+- **Legacy FBX (.fbx):** optional explicit importer for native FBX curve nodes. Strand does not replace normal FBX mesh import.
+- Import each distinct curve into its own Strand asset. Reimport updates the *asset*, **not every placed instance automatically**; that choice remains with the designer.
 
-The Landscape context actions import an existing Landscape connected path into a data asset or apply an asset to a **topology-compatible** path, preserving existing segment references, meshes, widths and terrain settings. This is not identical to `USplineComponent`: Landscape curves expose scalar tangent handles and topological connections. Multi-branching or mismatched paths are deliberately refused rather than destroyed/recreated. Save a backup before converting important road/terrain networks.
+All format readers and their behavior are inherited from Strand v0.3.0 and have not been engine-tested in this pass.
 
-## Import files
+## Runtime, PCG, Landscape
 
-Use **Tools > Strand: Import Alembic Curves...**, **Import SVG Curves...**, or **Import Legacy FBX Curves...**. Strand uses a dedicated factory for each format with a low default priority to avoid hijacking the engine's regular `.abc` Groom/mesh and `.fbx` mesh importers. Selected curves are imported to the active single selected Content Browser folder, or `/Game` if no valid folder is selected.
+- `UStrandLibrary::ApplySplineDataAsset` applies point data to any existing native `USplineComponent`, preserving its transform.
+- `UStrandPCGLibrary::ApplySplineDataAssetToPcg` produces transient PCG spline spatial data from asset points plus a caller-supplied transform.
+- Landscape context commands convert or apply topology-compatible connected spline paths; branched networks and mismatched paths are rejected rather than rebuilt arbitrarily. Landscape mesh/terrain settings remain native. In UE 5.8 binary builds, `ULandscapeSplinesComponent::ModifySplines` and `RequestSplineLayerUpdate` aren't linkable; automatic Landscape Edit Layer deformation refresh is not guaranteed. Test Landscape workflows in a disposable level.
 
-Each **disconnected curve** becomes its own `USplineDataAsset`. The first is returned to Unreal's import system, while sibling assets are separately registered; save all newly imported siblings with **Save All**.
+## Appearance
 
-### SVG 2D
+Content Browser type name: **Strand Spline**. Type color: **`#00B4A7`**. Original supplied `Resources/StrandSplineAsset_64.svg` is used for the small icon and asset thumbnail.
 
-Supports `<path>`, `<line>`, `<polyline>` and `<polygon>`; `M/m L/l H/h V/v C/c S/s Q/q T/t A/a Z/z`, nested transforms, Bezier handles and ellipse arcs. Projects to local XY with Z=0 and inverts the downward-positive SVG Y axis. One SVG unit is treated as one centimeter. The importer does not interpret CSS, strokes, `<use>` references or `viewBox` presentation sizing.
+## Install and testing
 
-### Alembic ABC 3D
+Copy `Strand/` to `<Project>/Plugins/Strand/`, enable PCG and Alembic Importer, regenerate the Editor solution and compile. **If updating over Strand 0.3.x or an earlier installation, run `RemoveLegacyTracker.bat` once to delete obsolete tracker source left behind by a folder overlay.** Otherwise UnrealBuildTool will still compile those removed files. No engine source modifications are required. The zip contains complete C++ source, not binaries. Run `Automation RunTests Strand.Data.RoundTripPointData` in Unreal's console after loading the Editor.
 
-Traverses native `Alembic::AbcGeom::ICurves` objects recursively, using the sample at `ImportSampleSeconds` (default zero). Recognizes:
+**Build validation is pending against UE 5.8.3.** In particular, verify native viewport drag/drop actor factory registration, full Spline Component Details, and asset-user-data persistence after saving/reopening maps or Blueprint instances. See [TEST_PLAN.md](TEST_PLAN.md).
 
-* **Linear** curves: exact native spline point chains.
-* **Cubic Bezier**: exact cubic control handles converted to Unreal Hermite derivatives (`3 * (handle - anchor)`).
-* **Catmull-Rom**: smoothed Hermite interpretation (not guaranteed parameterization-identical across DCC applications).
-* **Cubic uniform B-spline**: evaluated into bounded Hermite samples. This is an approximation.
-* **Variable order NURBS:** rational de Boor evaluator for consistent knot/weight layouts, then approximated as Hermite samples.
+## Version 0.4.3 verification priorities
 
-Unsupported basis functions, malformed knot layouts and missing curves produce Output Log warnings; Strand never deliberately replaces them with unrelated geometry silently.
+1. **Quickly Add > Strand Spline Actor** creates the native-root Actor class. Drag-drop of a Strand asset creates the **same class**, prepopulated and linked.
+2. **Spline Mesh Actor** / any `USplineMeshComponent`: Strand panel visible, two-point asset works. Multi-point and closed assets cannot be applied to the mesh segment.
+3. **Strand Actions** are in the right Details column, with four **white** SVG icons; Unreal's usual disabled-state styling applies.
+4. Blueprint editor: change Coordinate Mode, Center/Point Index, Apply, closed-loop state. Spline visuals update immediately in the Blueprint preview without Compile. Construction scripts may still override values.
+5. Test existing subclass property customization; manually report if native specialized controls disappear.
 
-Alembic has **no standard scene unit**. The default import is **one Alembic coordinate unit equals one Unreal centimeter**, and `SourceUnitsToCentimeters` on the asset can be changed before Reimport (for example, `100` if exported in meters). `bAlembicYUp` defaults to true and remaps source Y-up to Unreal Z-up. Parent Alembic `IXform` transforms are **not baked** into local curve points, avoiding scene placement leaking into reusable spline data. If a DCC stores shape-defining scale/rotation in `IXform`, bake/apply those transforms to the source curves before export. Frame animation is not stored: one configured static time sample is imported.
-
-**Collision note:** Unreal's native Alembic importer is intended for other content (mesh caches and Grooms). Use Strand's named Tools command to explicitly select its curve importer instead of relying on generic `.abc` import auto-selection. Unreal's Groom importer itself uses the `ICurves` schema, but Strand does not create Groom assets.
-
-### FBX legacy compatibility
-
-An explicit **Tools > Strand: Import Legacy FBX Curves...** command and low-priority **Strand Legacy Curves (FBX)** factory remain for exported `FbxNurbsCurve` and `FbxLine` data. This is a fallback for DCCs that actually emit those FBX curve node types, **not the recommended primary source format**. Standard FBX mesh/skeletal workflows should remain with Unreal's default factory. FBX assets imported through this legacy path do not currently participate in the SVG/Alembic reimport handler.
-
-### Reimport behavior
-
-SVG and Alembic assets record a source filename and deterministic `SourceCurveId`. Using the Content Browser's standard **Reimport** feature loads that file, finds the matching source curve and replaces **only that asset's stored points**. Reimport:
-
-* Shows confirmation before overwriting the shared asset.
-* Does **not** automatically overwrite level actors or active Blueprint spline components.
-* Preserves the asset and fails if the expected curve is missing, renamed or reordered.
-* Retains edited Alembic conversion settings in the Strand asset (unit scale, Y-axis mapping and static sample time).
-* Records the import source in `UAssetImportData`.
-
-Review any tracked spline instances and intentionally Reset/Apply when you want them updated. Reimport does not perform a three-way merge of local viewport edits with external DCC edits.
-
-## Representation and compatibility
-
-`USplineDataAsset` derives from `UPrimaryDataAsset` and stores `Points: TArray<FSplinePointData>` plus `bIsClosedLoop`. Each point holds `LocalPosition`, `ArriveTangent`, `LeaveTangent`, `LocalRotation`, `LocalScale` and `PointType`. Actor and component placement are **never stored**. Stored spline input keys are normalized to point indices (0, 1, 2, ...).
-
-| Existing Unreal system | Strand handling | Limitations |
-|---|---|---|
-| `USplineComponent` | Native read/write, exact stored fields | Additional component settings and custom spline metadata not captured |
-| Blueprint classes containing `USplineComponent` | Same native component adapter | Construction Scripts can regenerate and overwrite points; integrate explicitly |
-| `UPCGSplineData` | Runtime adapter with explicit transform | Not an automatically installed PCG graph node |
-| Landscape Splines | Editor path export/apply | Only validated compatible nonbranching paths; tangent handle approximation |
-| Specialized `USplineComponent` subclasses, including Water | Inherits standard geometry operations | Does not capture system-specific width/depth/metadata fields |
-| `USplineMeshComponent` | Can continue consuming positions/tangents from a parent spline | Spline Mesh stores endpoints, not a full spline; native mesh rebuild remains its owner's job |
-| Native spline editing tools | Unchanged | Strand adds asset tracking rather than overriding spline interaction |
-
-The architecture is intentionally built around adapters and the standard engine spline data representation, not a custom spline runtime. The proposed next-stage adapter API, status overlays, mass operations and metadata schema are specified in [FEATURE_ROADMAP.md](FEATURE_ROADMAP.md).
-
-## Source migration from the original prototype
-
-Previous prototype package name: `SplineAssetPipeline`; new plugin and module names: `Strand`, `StrandPCG`, `StrandEditor`. Unreal class and struct references may require Core Redirects when loading assets created using an old compiled plugin. A suggested migration checklist and redirects are in [MIGRATION.md](MIGRATION.md). Keep backups before migration.
-
-## Current verification status
-
-The ZIP has been checked for expected file structure and descriptor integrity, but **it has not been compiled against real Unreal Engine 5.5 through 5.8 headers or run in-editor**. The engine-version API boundaries most likely to require a local correction pass are Alembic's engine-bundled libraries, PCG, Landscape and Content Browser ToolMenus. Do not use in a shipping project before running [TEST_PLAN.md](TEST_PLAN.md) on an actual engine install.
+This is a source candidate only. Build and viewport checks against UE 5.8.3 are still required.

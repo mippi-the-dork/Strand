@@ -109,9 +109,13 @@ bool SplineLandscapeAdapter::Apply(const USplineDataAsset* Asset,
         Segment->UpdateSplinePoints(true, true);
     }
     for (const FStep& Step : Path) { Step.Control->UpdateSplinePoints(true, true, true); }
-    Component->ModifySplines(true);
+    // ULandscapeSplinesComponent is MinimalAPI in installed UE builds.
+    // ModifySplines() and RequestSplineLayerUpdate() are not exported here and
+    // cannot be called directly from an external editor module (LNK2019).
+    // Component/point/segment Modify() calls above record the transaction.
+    // Use the existing virtual native rebuild path for splines and meshes.
     Component->RebuildAllSplines(true);
-    Component->RequestSplineLayerUpdate();
+    Component->MarkRenderStateDirty();
     Component->MarkPackageDirty();
     return true;
 }
