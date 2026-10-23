@@ -1,9 +1,9 @@
 {
   "FileVersion": 3,
-  "Version": 13,
-  "VersionName": "0.4.3",
+  "Version": 21,
+  "VersionName": "0.4.10",
   "FriendlyName": "Strand",
-  "Description": "Strand Spline assets for native Unreal splines: matching Quick Add/viewport actor placement, white editor actions, live Blueprint preview, and spline-mesh adapters.",
+  "Description": "Strand spline assets for Unreal native splines, SVG/Alembic interchange, source-accurate wrapped SVG path importing, viewport placement, and synchronization.",
   "Category": "Editor",
   "CreatedBy": "Strand",
   "CanContainContent": false,

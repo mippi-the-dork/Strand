@@ -380,23 +380,30 @@ void SplineEditorCommands::UpdateComponentAsset(USplineComponent* Spline)
         Message(TEXT("Strand is already in sync. No asset update is necessary."));
         return;
     }
-    int32 LoadedUsers = 0;
+    int32 LoadedActors = 0;
+    int32 LinkedComponents = 0;
+    int32 OtherDifferingComponents = 0;
     if (GEditor)
     {
         if (UWorld* World = GEditor->GetEditorWorldContext().World())
         {
             for (TActorIterator<AActor> It(World); It; ++It)
             {
+                bool bActorLinked = false;
                 TArray<USplineComponent*> Components;
                 It->GetComponents<USplineComponent>(Components);
                 for (USplineComponent* Other : Components)
                 {
-                    if (UStrandSplineUserData::GetAssignedAsset(Other) == Asset)
+                    if (UStrandSplineUserData::GetAssignedAsset(Other) != Asset) { continue; }
+                    bActorLinked = true;
+                    ++LinkedComponents;
+                    if (Other != Spline)
                     {
-                        ++LoadedUsers;
-                        break;
+                        const UStrandSplineUserData* OtherData = UStrandSplineUserData::Get(Other);
+                        if (!OtherData || !OtherData->IsInSync(Other)) { ++OtherDifferingComponents; }
                     }
                 }
+                if (bActorLinked) { ++LoadedActors; }
             }
         }
     }
@@ -408,8 +415,8 @@ void SplineEditorCommands::UpdateComponentAsset(USplineComponent* Spline)
     }
 #endif
     const FString Prompt = FString::Printf(
-        TEXT("Overwrite Strand asset '%s' with this spline and save it?\n\n%d loaded actor(s) reference this asset. Their local splines will NOT update automatically.%s\nUndo reverses the in-memory change; save again after Undo to persist it."),
-        *Asset->GetName(), LoadedUsers, *SourceWarning);
+        TEXT("Update shared Strand asset '%s' with this spline and save it?\n\n%d loaded actor(s) use %d linked spline component(s).\n%d OTHER linked component(s) currently differ from this asset.\n\nUpdating the asset does NOT update any linked level or Blueprint instances automatically. Instances that were previously in sync may show as Modified until you Apply Asset.%s\n\nUndo restores the in-memory asset state. To persist an undone change, save the asset again."),
+        *Asset->GetName(), LoadedActors, LinkedComponents, OtherDifferingComponents, *SourceWarning);
     if (!Confirm(FText::FromString(Prompt))) { return; }
     const FScopedTransaction Transaction(LOCTEXT("Update", "Update Strand Asset from Native Spline"));
     Asset->Modify();
@@ -445,6 +452,74 @@ void SplineEditorCommands::CreateNativeActorFromAsset(TWeakObjectPtr<USplineData
 {
     FString Error;
     if (!StrandPlacement::CreateNativeSplineActor(WeakAsset.Get(), Error)) { Message(Error); }
+}
+
+void SplineEditorCommands::InspectAssetUsage(TWeakObjectPtr<USplineDataAsset> WeakAsset)
+{
+    const USplineDataAsset* Asset = WeakAsset.Get();
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+    if (!IsValid(Asset) || !IsValid(World))
+    {
+        Message(TEXT("Open a level and choose a valid Strand Spline asset."));
+        return;
+    }
+
+    int32 ActorCount = 0;
+    int32 SplineCount = 0;
+    int32 MatchingCount = 0;
+    int32 ModifiedCount = 0;
+    TArray<FString> Details;
+    // Treat each spline component independently. An actor can contain several
+    // components linked to the same asset, some modified and some not.
+    for (TActorIterator<AActor> It(World); It; ++It)
+    {
+        AActor* Actor = *It;
+        if (!IsValid(Actor)) { continue; }
+        TArray<USplineComponent*> Components;
+        Actor->GetComponents<USplineComponent>(Components);
+        bool bActorUsesAsset = false;
+        for (USplineComponent* Spline : Components)
+        {
+            if (!IsValid(Spline) || UStrandSplineUserData::GetAssignedAsset(Spline) != Asset)
+            {
+                continue;
+            }
+            bActorUsesAsset = true;
+            ++SplineCount;
+            const UStrandSplineUserData* Metadata = UStrandSplineUserData::Get(Spline);
+            const bool bMatching = Metadata && Metadata->IsInSync(Spline);
+            if (bMatching) { ++MatchingCount; } else { ++ModifiedCount; }
+            Details.Add(FString::Printf(TEXT("%s / %s: %s (%d points)"),
+                *Actor->GetActorNameOrLabel(), *Spline->GetName(),
+                bMatching ? TEXT("In Sync") : TEXT("Different from asset"),
+                Spline->GetNumberOfSplinePoints()));
+        }
+        if (bActorUsesAsset) { ++ActorCount; }
+    }
+    Details.Sort();
+    const int32 DisplayLimit = 25;
+    FString Report = FString::Printf(
+        TEXT("Strand Usage: %s\n\nLoaded actors: %d\nLinked spline components: %d\nIn sync: %d\nModified locally: %d"),
+        *Asset->GetName(), ActorCount, SplineCount, MatchingCount, ModifiedCount);
+    if (SplineCount == 0)
+    {
+        Report += TEXT("\n\nNo loaded level instances use this asset.");
+    }
+    else
+    {
+        Report += TEXT("\n\nLinked components:\n");
+        for (int32 Index = 0; Index < FMath::Min(Details.Num(), DisplayLimit); ++Index)
+        {
+            Report += TEXT("\n");
+            Report += Details[Index];
+        }
+        if (Details.Num() > DisplayLimit)
+        {
+            Report += FString::Printf(TEXT("\n...and %d more."), Details.Num() - DisplayLimit);
+        }
+    }
+    Report += TEXT("\n\nOnly loaded actors in the current editor world are checked. Unloaded World Partition actors and Blueprint class defaults are not included. This report changes nothing.");
+    Message(Report);
 }
 
 void SplineEditorCommands::SelectActorsUsingAsset(TWeakObjectPtr<USplineDataAsset> WeakAsset)

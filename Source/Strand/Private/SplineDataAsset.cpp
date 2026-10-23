@@ -57,6 +57,27 @@ void USplineDataAsset::ApplyToSplineComponentWithPlacement(USplineComponent* Com
     const FVector Offset = Mode == EStrandCoordinateMode::Relative
         ? GetPlacementAnchor(AnchorMode, AnchorIndex) : FVector::ZeroVector;
     Component->Modify();
+#if WITH_EDITORONLY_DATA
+    // SVG can join a straight segment to a cubic arc with INDEPENDENT arrive
+    // and leave handles. Unreal's native spline editor defaults to continuous
+    // tangents, which can make corners appear curled or open after editing.
+    // Enable its built-in split-handle editing only when the saved data requires
+    // it. Never turn an existing user's discontinuous-spline preference off.
+    bool bNeedsSplitHandles = false;
+    for (const FSplinePointData& Saved : Points)
+    {
+        if (Saved.PointType.GetValue() == ESplinePointType::CurveCustomTangent &&
+            !Saved.ArriveTangent.Equals(Saved.LeaveTangent, 0.0001))
+        {
+            bNeedsSplitHandles = true;
+            break;
+        }
+    }
+    if (bNeedsSplitHandles)
+    {
+        Component->bAllowDiscontinuousSpline = true;
+    }
+#endif
     Component->ClearSplinePoints(false);
     for (int32 Index = 0; Index < Points.Num(); ++Index)
     {
@@ -64,8 +85,23 @@ void USplineDataAsset::ApplyToSplineComponentWithPlacement(USplineComponent* Com
         Point.Position -= Offset;
         Component->AddPoint(Point, false);
     }
-    Component->SetClosedLoop(bIsClosedLoop && Points.Num() >= 2, false);
+    // The source assets use one-unit input keys (0..Num-1). When applying a
+    // closed asset, explicitly put the wrap key at Num rather than inheriting a
+    // potentially stale loop-position override from an existing component.
+    // This is especially important when replacing a spline that was previously
+    // edited as an open curve or used a custom loop key.
+    const bool bShouldClose = bIsClosedLoop && Points.Num() >= 2;
+    if (bShouldClose)
+    {
+        Component->SetClosedLoopAtPosition(true, static_cast<float>(Points.Num()), false);
+    }
+    else
+    {
+        Component->SetClosedLoop(false, false);
+    }
     Component->UpdateSpline();
+    ensureMsgf(Component->IsClosedLoop() == bShouldClose,
+        TEXT("Strand failed to set the native spline's expected closed-loop state."));
     Component->MarkRenderStateDirty();
     Component->MarkPackageDirty();
 }

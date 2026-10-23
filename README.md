@@ -4,7 +4,7 @@
 
 Strand stores **native `USplineComponent` point data** as Content Browser assets (`USplineDataAsset`). It does not replace Unreal spline editing, introduce a competing spline component, or generate meshes. A Strand asset stores local positions, arrive/leave tangents, rotations, scales, point types and the closed-loop flag, **never the actor or component transform**.
 
-**Version:** 0.4.3 source candidate. **Validated against a live UE Editor build:** Not yet; first build target UE 5.8.3. **Modules:** Strand (runtime), StrandPCG (PCG runtime), StrandEditor (editor). Dependencies: Unreal PCG and Alembic Importer plugins.
+**Version:** 0.4.10 source candidate. **Validated against a live UE Editor build:** Not yet; first build target UE 5.8.3. **Modules:** Strand (runtime), StrandPCG (PCG runtime), StrandEditor (editor). Dependencies: Unreal PCG and Alembic Importer plugins.
 
 ## Quick start: drag directly into the Level Editor
 
@@ -14,9 +14,13 @@ Strand stores **native `USplineComponent` point data** as Content Browser assets
 4. Select the new actor's **Spline Component**. Edit its curve normally with Unreal's viewport spline controls. No additional tracking component appears.
 5. In the **Spline Component Details > Strand** category, use the asset picker and the **Apply Asset**, **Update Asset**, **Save as New** or **Compare** buttons.
 
+**Icon roles:** The Strand Spline Content Browser asset keeps its existing SVG and teal asset color `#00B4A7`. The placeable **Strand Spline Actor** uses the new white `StrandSplineActor_16.svg` icon for its Outliner/class and placement presentation. An editor-only billboard attached to the actor's native spline root displays a PNG rendering of the ORIGINAL Strand asset SVG in the viewport. This icon does not render in gameplay and does not create a mesh.
+
+**Billboard controls:** Select a Strand Spline Actor itself (rather than its Spline Component) and look under **Strand > Viewport**. `Show Strand Billboard` toggles the icon and `Billboard Scale` adjusts its size. These settings never modify spline point data or actor transforms. The billboard is a native `UBillboardComponent` marked editor-only.
+
 **Quick Add:** In a Level Editor viewport choose **Quickly Add > Strand Spline Actor** (also available under Place Actors > Basic). This creates the exact same `AStrandSplineActor` class as a dropped Strand asset, but with an unlinked native spline to edit or assign later. The existing **Spline Test** entry is not part of Strand and remains untouched.
 
-The actor factory is explicitly registered with UE 5.8's `UPlacementSubsystem` as well as the legacy editor factory registry. It accepts only `USplineDataAsset` and does not intercept other Content Browser asset types. It uses Unreal's normal asset placement transform, so the actor should appear at the drop position. The right-click **Create Native Spline Actor at World Origin** command remains available as a fallback.
+The actor factory is explicitly registered with UE 5.8's `UPlacementSubsystem` as well as the legacy editor factory registry. It accepts only `USplineDataAsset` and does not intercept other Content Browser asset types. It uses Unreal's normal asset placement transform, so the actor should appear at the drop position. The right-click **Create Strand Spline Actor** command offers a fallback and reuses the same native root spline rather than creating an extra spline component.
 
 **Note:** Native spline components do not generate visible rendered meshes at runtime on their own. The spline is still a native component edited with Unreal's standard spline toolset.
 
@@ -51,12 +55,12 @@ Asset assignment is serialized as a tiny **`UStrandSplineUserData : UAssetUserDa
 - Select a Strand asset, right-click an actor with one spline and choose **Apply Selected Spline Data Asset**. It overwrites points after confirmation and assigns the asset to that component.
 - Right-click an actor with no spline and choose **Add Native Spline Component from Selected Strand**. Strand adds an ordinary `USplineComponent`, respecting the existing actor root.
 - Actors containing several splines offer individually named **Save [Component] as Strand Spline** and **Apply Selected Strand to [Component]** actions. Strand never arbitrarily targets one of several splines.
-- Right-click a Strand asset and choose **Apply to Selected Level Spline Actor(s)** or **Select Loaded Actors Using This Strand**. The latter scans native spline Asset User Data, but does not include unloaded World Partition cells or Blueprint class defaults.
+- Right-click a Strand asset and choose **Create Strand Spline Actor**, **Apply to Selected Splines**, **Select Actors Using This Asset**, or **Inspect Strand Usage...**. Create uses a point in front of the current level viewport camera, while direct viewport drag-and-drop uses the mouse drop location. Apply is disabled when no unambiguous native spline target is selected. The two usage actions scan native spline Asset User Data for loaded level instances, not unloaded World Partition cells or Blueprint class defaults. Inspect reports per-component sync and mismatch status without modifying selections.
 - Select an existing actor with a spline and choose **Convert Spline to Spline Data Asset** to create a new linked Strand asset.
 
 ## Import and reimport
 
-- **SVG (.svg):** 2D paths/lines/polylines/polygons, Bezier curves, quadratic curves, smooth commands, elliptical arcs, closed paths and nested transforms. Stored in local XY with Z=0.
+- **SVG (.svg):** native 2D paths/lines/polylines/polygons/rectangles/circles/ellipses, in-file `<use>` references, cubic and quadratic Bezier curves, smooth commands, elliptical arcs, closed paths and nested transforms. Mixed straight/curved segments retain independent incoming and outgoing tangents with geometrically straight Hermite segments. Stored in local XY with Z=0.
 - **Alembic (.abc):** `ICurves` geometry with supported linear, Bezier, Catmull-Rom, B-spline and NURBS forms; nested curve identities preserved for source-aware reimport. Alembic units must be configured for the source application.
 - **Legacy FBX (.fbx):** optional explicit importer for native FBX curve nodes. Strand does not replace normal FBX mesh import.
 - Import each distinct curve into its own Strand asset. Reimport updates the *asset*, **not every placed instance automatically**; that choice remains with the designer.
@@ -79,6 +83,24 @@ Copy `Strand/` to `<Project>/Plugins/Strand/`, enable PCG and Alembic Importer, 
 
 **Build validation is pending against UE 5.8.3.** In particular, verify native viewport drag/drop actor factory registration, full Spline Component Details, and asset-user-data persistence after saving/reopening maps or Blueprint instances. See [TEST_PLAN.md](TEST_PLAN.md).
 
+## Version 0.4.5 changes and verification priorities
+
+- Editor billboard uses `UBillboardComponent::bIsScreenSizeScaled` and `ScreenSize` so it behaves like stock editor sprites while moving the camera. Actor Details exposes only **Show Strand Billboard** and **Billboard Size** (a view-size multiplier); the internal `StrandBillboard` component pointer is no longer an editable/visible actor property. Billboard remains editor-only, not gameplay geometry.
+- Right-click Strand asset menu has four actions in a dedicated **Strand** section: **Create Strand Spline Actor**, **Apply to Selected Splines**, **Select Actors Using This Asset**, **Inspect Strand Usage...**. Applying is disabled when no valid level target is selected. Exactly one Strand asset must be selected. The engine-owned `Convert to Different Data Asset Type` remains available in general **Asset Actions**, separate from the **Strand** section. Strand does not override the conversion command.
+- Create from right-click positions the actor in front of the current level viewport camera, falling back to world origin only when no editor viewport camera is available; viewport drag-and-drop still respects the actual drop point.
+- Confirm that viewport orbit/zoom keeps the billboard readable, its Size slider changes screen presence immediately, and edits to the actor's spline or transform have no unexpected effect on the sprite's screen size.
+- Verify that actor Details no longer exposes the raw `StrandBillboard` property/texture and that Blueprint inheritance doesn't expose an editable sprite component. The two intended Strand > Viewport controls remain.
+- Confirm the asset SVG, actor SVG, `Strand Spline` Content Browser label, and `#00B4A7` color have not changed.
+
+## Version 0.4.4 verification priorities
+
+1. Confirm the Strand Spline asset keeps its original Content Browser artwork, teal type color and `Strand Spline` label.
+2. Confirm Strand Spline Actor Outliner and Quick Add use the NEW white actor SVG, not the asset icon.
+3. Confirm Quick Add, asset viewport drag/drop, and the asset right-click Create Strand Spline Actor action all create `AStrandSplineActor` with exactly one native `USplineComponent`, used as root.
+4. Confirm the original Strand asset artwork appears as an editor viewport billboard at the spline origin, with `Show Strand Billboard` and `Billboard Scale` working immediately.
+5. Save/reopen a level, duplicate an actor, derive a Blueprint from the actor and reload it. Verify the billboard returns correctly and never renders in PIE or a packaged game.
+6. Confirm Strand operations on the root spline, including assigned asset, Undo/Redo, placement modes, and closed-loop behavior remain intact.
+
 ## Version 0.4.3 verification priorities
 
 1. **Quickly Add > Strand Spline Actor** creates the native-root Actor class. Drag-drop of a Strand asset creates the **same class**, prepopulated and linked.
@@ -88,3 +110,35 @@ Copy `Strand/` to `<Project>/Plugins/Strand/`, enable PCG and Alembic Importer, 
 5. Test existing subclass property customization; manually report if native specialized controls disappear.
 
 This is a source candidate only. Build and viewport checks against UE 5.8.3 are still required.
+
+## Shared-asset review (v0.4.6)
+
+A Strand asset is reusable across many native spline components. Each reference is stored on the component as `UStrandSplineUserData`; editing the shape on one component never changes other instances unless you explicitly choose **Update Asset** and subsequently apply that asset to those instances.
+
+- **Inspect Strand Usage...** reports each linked component in loaded level actors and whether its current point data matches the asset (after per-instance anchoring). It does not alter selection or geometry. Lists are capped at 25 entries; the totals remain complete.
+- **Select Actors Using This Asset** selects loaded level actors containing linked native spline components. It is separate from the read-only usage report.
+- **Update Asset** now shows linked actor/component counts and how many other loaded components currently differ from the asset. Other instances are never automatically overwritten.
+- The Spline Component Details status is **In Sync** or **Different from asset**. A mismatch does not prove which side was edited most recently, so Strand does not label it as definitely a local modification.
+- Unreal's own **Convert to Different Data Asset Type** is still available under general asset operations, not Strand-specific actions.
+
+The Content Browser menu builds from asset metadata and loads the selected Strand asset only when an action is executed, reducing work caused by opening menus in large projects.
+
+## Version 0.4.7 SVG fidelity update
+
+The SVG importer now preserves split tangents on mixed straight/curved segments, explicit and implicit closing handles, compact arc flags, rounded rectangles, SVG ellipses/circles and internal `<use>` references. The original source file must be reimported to update old imported Strand assets, and actors must explicitly Apply the updated asset. **Absolute** places the original source coordinates in the spline component local space; to align multiple assets from one SVG, all actors must share the same actor/component transforms. Run `Automation RunTests Strand.Editor.Svg.ExactSegmentsAndClosures` and see [TEST_SVG_0.4.7.md](TEST_SVG_0.4.7.md).
+
+## Version 0.4.10: Complete wrapped SVG paths
+
+SVG exporters often line-wrap a long `d="..."` attribute. In UE 5.8.3 testing, Strand v0.4.9 imported only the commands on the first physical line of the original Illustrator SVG, causing missing portions of its S-shaped curve and open rounded-square paths. v0.4.10 normalizes XML attribute whitespace before passing the SVG to Unreal's XML parser, allowing all commands, including `Z` closures, to be read.
+
+The supplied original Illustrator fixture should import as **5 independent curves** with **9, 8, 8, 2, 2 segments**, and closed flags **open, closed, closed, open, open**. Follow [TEST_SVG_0.4.10.md](TEST_SVG_0.4.10.md). After installing the new plugin, reimport the SVG source and **Apply Asset** to existing level splines, or create fresh actors from fresh imports. Previously imported `.uasset` files retain their incomplete geometry until reimported.
+
+## Version 0.4.9: SVG shape preservation
+
+Strand's SVG importer stores exact per-segment cubic control derivatives. To allow native spline editing without forcing sharp joins to share one handle, Strand now enables the built-in **Allow Discontinuous Spline** property when an applied asset has differing custom arrive and leave tangents. Blueprint preview components inherit this editor setting. No custom spline type is created.
+
+The importer logs the name, point count, segment count, and open/closed state of the first 32 curves. The supplied Illustrator logo has **five curves, 29 segments, two closed rounded squares and three intentionally open strokes**. Do not automatically close or join its center and outer arc strokes.
+
+The independent `Tests/Fixtures/Strand_Illustrator_Logo_CubicReference.csv` file records the original SVG's 29 authored Bézier or line segments. Run `Automation RunTests Strand.Editor.Svg.IllustratorAnalyticGeometry` to sample the native Unreal spline at seven parametric positions along **every segment**, including the two closing curves, and to check the shapes under center-relative placement. This detects missing or distorted segments even when all native control points and loop flags appear correct.
+
+See [TEST_SVG_0.4.9.md](TEST_SVG_0.4.9.md) for steps. Reimport after upgrading; existing placed actors do not update themselves automatically and require **Apply Asset**.

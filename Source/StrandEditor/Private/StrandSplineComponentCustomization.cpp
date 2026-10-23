@@ -78,9 +78,35 @@ void FStrandSplineComponentCustomization::CustomizeDetails(IDetailLayoutBuilder&
             const UStrandSplineUserData* Data = UStrandSplineUserData::Get(Component);
             return Data && Data->IsInSync(Component)
                 ? FText::Format(LOCTEXT("InSync", "In sync | {0} points"), FText::AsNumber(Component->GetNumberOfSplinePoints()))
-                : FText::Format(LOCTEXT("Modified", "Modified locally | {0} local / {1} asset points"),
+                : FText::Format(LOCTEXT("Different", "Different from asset | {0} local / {1} asset points"),
                     FText::AsNumber(Component->GetNumberOfSplinePoints()), FText::AsNumber(Asset->Points.Num()));
         })
+    ];
+
+    // The saved asset's closure flag and the native instance's closure flag
+    // are independent when the source asset has been reimported. Show both
+    // values so stale actors are distinguishable from import problems.
+    Category.AddCustomRow(LOCTEXT("TopologySearch", "Strand Spline Topology Closed Open"))
+    .NameContent()[SNew(STextBlock).Text(LOCTEXT("TopologyLabel", "Spline Closure"))]
+    .ValueContent().MinDesiredWidth(260.0f)
+    [
+        SNew(STextBlock)
+        .Text_Lambda([Weak = Spline]() -> FText
+        {
+            const USplineComponent* Component = Weak.Get();
+            if (!IsValid(Component)) { return FText::GetEmpty(); }
+            const USplineDataAsset* Asset = UStrandSplineUserData::GetAssignedAsset(Component);
+            if (!IsValid(Asset))
+            {
+                return Component->IsClosedLoop()
+                    ? LOCTEXT("OnlyNativeClosed", "Native: Closed | No asset")
+                    : LOCTEXT("OnlyNativeOpen", "Native: Open | No asset");
+            }
+            return FText::FromString(FString::Printf(TEXT("Asset: %s | Native: %s"),
+                Asset->bIsClosedLoop ? TEXT("Closed") : TEXT("Open"),
+                Component->IsClosedLoop() ? TEXT("Closed") : TEXT("Open")));
+        })
+        .ToolTipText(LOCTEXT("TopologyTooltip", "These are the stored Strand asset closure state and the actual native USplineComponent closed-loop state. Reimport changes the asset but deliberately does not overwrite already placed instances. Apply Asset to update an instance."))
     ];
 
     // Placement changes affect only local point positions. These choices are stored on

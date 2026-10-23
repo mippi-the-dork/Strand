@@ -10,6 +10,7 @@
 #include "GameFramework/Actor.h"
 #include "Editor.h"
 #include "ScopedTransaction.h"
+#include "Subsystems/UnrealEditorSubsystem.h"
 
 #define LOCTEXT_NAMESPACE "StrandPlacement"
 
@@ -53,7 +54,23 @@ AActor* StrandPlacement::CreateNativeSplineActor(USplineDataAsset* Asset, FStrin
     Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
     Params.ObjectFlags |= RF_Transactional;
     Params.OverrideLevel = World->GetCurrentLevel();
-    AActor* Actor = World->SpawnActor<AStrandSplineActor>(AStrandSplineActor::StaticClass(), FVector::ZeroVector, FRotator::ZeroRotator, Params);
+    // Unlike a viewport drop (whose factory already receives the drop location),
+    // the Content Browser context menu has no mouse hit location. Prefer an
+    // immediately visible point in front of the active Level viewport camera.
+    FVector SpawnLocation = FVector::ZeroVector;
+    if (GEditor)
+    {
+        if (UUnrealEditorSubsystem* EditorSubsystem = GEditor->GetEditorSubsystem<UUnrealEditorSubsystem>())
+        {
+            FVector ViewLocation;
+            FRotator ViewRotation;
+            if (EditorSubsystem->GetLevelViewportCameraInfo(ViewLocation, ViewRotation))
+            {
+                SpawnLocation = ViewLocation + ViewRotation.Vector() * 500.0;
+            }
+        }
+    }
+    AActor* Actor = World->SpawnActor<AStrandSplineActor>(AStrandSplineActor::StaticClass(), SpawnLocation, FRotator::ZeroRotator, Params);
     if (!IsValid(Actor))
     {
         OutError = TEXT("Unable to spawn an actor in the current editor level.");
@@ -61,7 +78,10 @@ AActor* StrandPlacement::CreateNativeSplineActor(USplineDataAsset* Asset, FStrin
     }
     Actor->Modify();
     Actor->SetActorLabel(FString::Printf(TEXT("Strand_%s"), *Asset->GetName()));
-    USplineComponent* Spline = AddNativeSpline(Actor);
+    // AStrandSplineActor already owns its native spline as its root. Reuse it;
+    // adding another component silently made Command-created actors differ from
+    // Quick Add and drag/drop actors.
+    USplineComponent* Spline = Actor->FindComponentByClass<USplineComponent>();
     if (!Spline)
     {
         World->DestroyActor(Actor);

@@ -30,6 +30,8 @@ namespace SplineEditorCommands
     // Native, editor-only creation and assignment workflows.
     void CreateNativeActorFromAsset(TWeakObjectPtr<USplineDataAsset> Asset);
     void SelectActorsUsingAsset(TWeakObjectPtr<USplineDataAsset> Asset);
+    // Read-only overview of loaded level users and divergence from the source asset.
+    void InspectAssetUsage(TWeakObjectPtr<USplineDataAsset> Asset);
     void ApplyAssetToComponent(TWeakObjectPtr<USplineDataAsset> Asset, TWeakObjectPtr<USplineComponent> Component);
     void CaptureComponent(TWeakObjectPtr<USplineComponent> Component);
     void AddNativeSplineAndApplyToSelected();

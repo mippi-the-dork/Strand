@@ -37,12 +37,27 @@ namespace
 
     void CopySplineGeometry(const USplineComponent* Source, USplineComponent* Target)
     {
+        // Keep the preview's native split-handle behavior consistent with its
+        // Blueprint component template. Otherwise compiled and live shapes can
+        // disagree at SVG corners with independent incoming/outgoing tangents.
+#if WITH_EDITORONLY_DATA
+        Target->bAllowDiscontinuousSpline = Source->bAllowDiscontinuousSpline;
+#endif
         Target->ClearSplinePoints(false);
         for (int32 Index = 0; Index < Source->GetNumberOfSplinePoints(); ++Index)
         {
             Target->AddPoint(Source->GetSplinePointAt(Index, ESplineCoordinateSpace::Local), false);
         }
-        Target->SetClosedLoop(Source->IsClosedLoop(), false);
+        // Match the source's loop key explicitly. Preview archetypes can retain
+        // an older loop-position override between Blueprint compiles.
+        if (Source->IsClosedLoop())
+        {
+            Target->SetClosedLoopAtPosition(true, static_cast<float>(Source->GetNumberOfSplinePoints()), false);
+        }
+        else
+        {
+            Target->SetClosedLoop(false, false);
+        }
         Target->UpdateSpline();
         Target->UpdateBounds();
         Target->MarkRenderStateDirty();

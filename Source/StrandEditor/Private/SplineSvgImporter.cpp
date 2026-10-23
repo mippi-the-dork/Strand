@@ -9,6 +9,75 @@ DEFINE_LOG_CATEGORY_STATIC(LogSplineSvg, Log, All);
 
 namespace
 {
+    // FXmlFile's attribute tokenization can stop a quoted attribute at a physical
+    // line break. Illustrator and other DCC exporters frequently wrap long SVG
+    // path data (d="...") over several lines. That previously discarded every
+    // path command after the first newline, including closing Z/z commands.
+    //
+    // XML 1.0 attribute normalization treats literal CR/LF/TAB as spaces, so
+    // perform that normalization before handing the document to FXmlFile.
+    // Keep everything outside quoted XML attributes unchanged, including
+    // comments, CDATA, and text node contents.
+    void NormalizeMultilineXmlAttributes(FString& Xml)
+    {
+        bool bInsideTag = false;
+        TCHAR Quote = 0;
+        const int32 Count = Xml.Len();
+        for (int32 I = 0; I < Count; ++I)
+        {
+            if (!bInsideTag)
+            {
+                // Skip comments and CDATA without altering their text. Check
+                // characters directly instead of allocating a substring for
+                // every character in large imported SVG documents.
+                if (Xml[I] == '<')
+                {
+                    if (I + 3 < Count && Xml[I + 1] == '!' &&
+                        Xml[I + 2] == '-' && Xml[I + 3] == '-')
+                    {
+                        const int32 End = Xml.Find(TEXT("-->"), ESearchCase::CaseSensitive,
+                            ESearchDir::FromStart, I + 4);
+                        if (End == INDEX_NONE) { return; } // Malformed XML is reported below.
+                        I = End + 2;
+                        continue;
+                    }
+                    if (I + 8 < Count && Xml[I + 1] == '!' && Xml[I + 2] == '[' &&
+                        Xml[I + 3] == 'C' && Xml[I + 4] == 'D' &&
+                        Xml[I + 5] == 'A' && Xml[I + 6] == 'T' &&
+                        Xml[I + 7] == 'A' && Xml[I + 8] == '[')
+                    {
+                        const int32 End = Xml.Find(TEXT("]]>"), ESearchCase::CaseSensitive,
+                            ESearchDir::FromStart, I + 9);
+                        if (End == INDEX_NONE) { return; }
+                        I = End + 2;
+                        continue;
+                    }
+                    bInsideTag = true;
+                }
+                continue;
+            }
+            if (Quote != 0)
+            {
+                if (Xml[I] == Quote)
+                {
+                    Quote = 0;
+                }
+                else if (Xml[I] == '\r' || Xml[I] == '\n' || Xml[I] == '\t')
+                {
+                    Xml[I] = ' ';
+                }
+            }
+            else if (Xml[I] == '\"' || Xml[I] == '\'')
+            {
+                Quote = Xml[I];
+            }
+            else if (Xml[I] == '>')
+            {
+                bInsideTag = false;
+            }
+        }
+    }
+
     struct FNumScanner
     {
         FString Source;
@@ -47,6 +116,18 @@ namespace
             }
             Result = FCString::Atod(*Source.Mid(Start, At - Start));
             return FMath::IsFinite(Result);
+        }
+        // Arc flags are *single characters*. SVG permits compact notation,
+        // for example "A 5 5 0 0110 10" (flags 0,1 then X=10).
+        bool Flag(bool& OutFlag)
+        {
+            Skip();
+            if (At >= Source.Len() || (Source[At] != '0' && Source[At] != '1'))
+            {
+                return false;
+            }
+            OutFlag = Source[At++] == '1';
+            return true;
         }
         bool Pair(FVector2D& V)
         {
@@ -116,6 +197,11 @@ namespace
         return Total;
     }
 
+    // Each SVG segment is represented by its exact cubic Hermite equivalent.
+    // We intentionally use CurveCustomTangent for both curved and straight
+    // segments. A straight segment has both tangents equal to its chord; it
+    // remains geometrically linear without overwriting a shared endpoint's
+    // independent incoming or outgoing handle.
     struct FContour
     {
         FAffine Transform;
@@ -131,41 +217,47 @@ namespace
         FVector Position(FVector2D P) const
         {
             const FVector2D Q = Transform.Apply(P);
-            // SVG is y-down. Convert to local right-handed XY (z-up).
+            // SVG uses downward-positive Y. Unreal spline data is Z-up.
             return FVector(Q.X, -Q.Y, 0.0);
         }
         void BeginAt(FVector2D P)
         {
             Begin = Current = P;
-            Points.Reset(); bClosed = false; bCubic = bQuad = false;
+            Points.Reset();
+            bClosed = bCubic = bQuad = false;
             FSplinePointData& Pt = Points.AddDefaulted_GetRef();
             Pt.LocalPosition = Position(P);
-            Pt.PointType = ESplinePointType::Linear;
+            Pt.PointType = ESplinePointType::CurveCustomTangent;
         }
         void Line(FVector2D End)
         {
             if (Points.IsEmpty()) { BeginAt(End); return; }
-            Points.Last().PointType = ESplinePointType::Linear;
+            const FVector EndPosition = Position(End);
+            const FVector Chord = EndPosition - Points.Last().LocalPosition;
+            Points.Last().LeaveTangent = Chord;
             FSplinePointData& Pt = Points.AddDefaulted_GetRef();
-            Pt.LocalPosition = Position(End);
-            Pt.PointType = ESplinePointType::Linear;
+            Pt.LocalPosition = EndPosition;
+            Pt.ArriveTangent = Chord;
+            Pt.PointType = ESplinePointType::CurveCustomTangent;
             Current = End;
             bCubic = bQuad = false;
         }
         void Cubic(FVector2D C1, FVector2D C2, FVector2D End)
         {
             if (Points.IsEmpty()) { BeginAt(End); return; }
-            const FVector P0 = Points.Last().LocalPosition;
+            const FVector StartPosition = Points.Last().LocalPosition;
             const FVector EndPosition = Position(End);
-            Points.Last().LeaveTangent = 3.0 * (Position(C1) - P0);
-            Points.Last().PointType = ESplinePointType::CurveCustomTangent;
+            // Hermite keys are spaced by one. Cubic Bezier derivatives at the
+            // endpoints are 3 * (C1 - P0) and 3 * (P3 - C2), respectively.
+            Points.Last().LeaveTangent = 3.0 * (Position(C1) - StartPosition);
             FSplinePointData& Pt = Points.AddDefaulted_GetRef();
             Pt.LocalPosition = EndPosition;
             Pt.ArriveTangent = 3.0 * (EndPosition - Position(C2));
             Pt.PointType = ESplinePointType::CurveCustomTangent;
             CubicControl = C2;
             Current = End;
-            bCubic = true; bQuad = false;
+            bCubic = true;
+            bQuad = false;
         }
         void Quadratic(FVector2D Q, FVector2D End)
         {
@@ -173,18 +265,40 @@ namespace
             const FVector2D C2 = End + (Q - End) * (2.0 / 3.0);
             Cubic(C1, C2, End);
             QuadControl = Q;
-            bQuad = true; bCubic = false;
+            bQuad = true;
+            bCubic = false;
         }
         void Close()
         {
             if (Points.Num() < 2) { return; }
-            if (!Current.Equals(Begin, 0.0001)) { Line(Begin); }
-            if (Points.Num() > 2 && Points.Last().LocalPosition.Equals(Points[0].LocalPosition, 0.001))
+            // Endpoints may match after a transform even if their source-space
+            // coordinates differ slightly. Test the transformed points so the
+            // choice of whether to remove a redundant point is consistent with
+            // the actual geometry stored in the asset.
+            const FVector FirstPosition = Points[0].LocalPosition;
+            const FVector LastPosition = Points.Last().LocalPosition;
+            if (LastPosition.Equals(FirstPosition, 0.00001))
             {
-                const FSplinePointData Last = Points.Pop(EAllowShrinking::No);
-                Points[0].ArriveTangent = Last.ArriveTangent;
+                // If the SVG already draws a final segment back to M, the
+                // duplicate endpoint is not a new point of the native loop.
+                // Preserve its incoming handle as the first point's arrival;
+                // the first point's original departure must remain untouched.
+                if (Points.Num() > 2)
+                {
+                    const FSplinePointData Repeated = Points.Pop(EAllowShrinking::No);
+                    Points[0].ArriveTangent = Repeated.ArriveTangent;
+                }
             }
-            bClosed = Points.Num() > 2;
+            else
+            {
+                // SVG Z/z creates a STRAIGHT closing edge when the path has not
+                // already reached M. Write both endpoint derivatives for that
+                // edge, preserving any separate tangents for adjacent edges.
+                const FVector ClosingChord = FirstPosition - LastPosition;
+                Points.Last().LeaveTangent = ClosingChord;
+                Points[0].ArriveTangent = ClosingChord;
+            }
+            bClosed = Points.Num() >= 2;
             Current = Begin;
             bCubic = bQuad = false;
         }
@@ -197,7 +311,8 @@ namespace
                 Curve.Points = MoveTemp(Points);
                 Curve.bClosedLoop = bClosed;
             }
-            Points.Reset(); bClosed = false;
+            Points.Reset();
+            bClosed = false;
         }
     };
 
@@ -334,11 +449,14 @@ namespace
             }
             else if (Upper == 'A')
             {
-                double RX, RY, Rotation, Large, Sweep;
+                double RX, RY, Rotation;
+                bool bLarge = false, bSweep = false;
                 if (!S.Number(RX) || !S.Number(RY) || !S.Number(Rotation) ||
-                    !S.Number(Large) || !S.Number(Sweep) || !S.Pair(P)) { return false; }
+                    !S.Flag(bLarge) || !S.Flag(bSweep) || !S.Pair(P)) { return false; }
                 if (bRelative) { P += Shape.Current; }
-                Arc(Shape, RX, RY, Rotation, Large != 0.0, Sweep != 0.0, P);
+                Arc(Shape, RX, RY, Rotation, bLarge, bSweep, P);
+                // A/a does not count as a cubic for S/s control reflection.
+                Shape.bCubic = Shape.bQuad = false;
             }
             else { UE_LOG(LogSplineSvg, Error, TEXT("Unsupported SVG path command %c in %s"), Cmd, *Id); return false; }
             if (S.At <= BeforeArgs || Shape.Points.Num() > 100000) { return false; }
@@ -349,16 +467,73 @@ namespace
         return true;
     }
 
-    void ReadElements(const FXmlNode* Node, FAffine Parent,
-                      TArray<FSplineImportedCurve>& Out, int32& Ordinal)
+    FString SvgTag(const FXmlNode* Node)
     {
-        if (!Node || Out.Num() >= 4096) { return; }
-        const FAffine Transform = Parent * ReadTransform(Node->GetAttribute(TEXT("transform")));
         FString Tag = Node->GetTag().ToLower();
         int32 Colon;
         if (Tag.FindLastChar(':', Colon)) { Tag = Tag.Mid(Colon + 1); }
+        return Tag;
+    }
+
+    double SvgNumber(const FXmlNode* Node, const TCHAR* Attribute, double Fallback = 0.0)
+    {
+        const FString Value = Node->GetAttribute(Attribute);
+        return Value.IsEmpty() ? Fallback : FCString::Atod(*Value);
+    }
+
+    void IndexIds(const FXmlNode* Node, TMap<FString, const FXmlNode*>& Ids)
+    {
+        if (!Node) { return; }
+        const FString Id = Node->GetAttribute(TEXT("id"));
+        if (!Id.IsEmpty() && !Ids.Contains(Id)) { Ids.Add(Id, Node); }
+        for (const FXmlNode* Child : Node->GetChildrenNodes()) { IndexIds(Child, Ids); }
+    }
+
+    // bReferenced controls whether render-suppressed containers (<defs>, <symbol>)
+    // can be visited through <use>. Never render their definitions by default.
+    void ReadElements(const FXmlNode* Node, const FAffine& Parent,
+                      const TMap<FString, const FXmlNode*>& Ids,
+                      TSet<const FXmlNode*>& ActiveReferences,
+                      TArray<FSplineImportedCurve>& Out, int32& Ordinal,
+                      bool bReferenced = false, int32 Depth = 0)
+    {
+        if (!Node || Out.Num() >= 4096 || Depth >= 64) { return; }
+        const FString Tag = SvgTag(Node);
+        if ((Tag == TEXT("defs") || Tag == TEXT("symbol") ||
+             Tag == TEXT("clippath") || Tag == TEXT("mask") ||
+             Tag == TEXT("marker") || Tag == TEXT("pattern") ||
+             Tag == TEXT("filter")) && !bReferenced)
+        {
+            return;
+        }
+        const FAffine Transform = Parent * ReadTransform(Node->GetAttribute(TEXT("transform")));
         FString Name = Node->GetAttribute(TEXT("id"));
         if (Name.IsEmpty()) { Name = FString::Printf(TEXT("Curve_%04d"), ++Ordinal); }
+
+        if (Tag == TEXT("use"))
+        {
+            FString Href = Node->GetAttribute(TEXT("href"));
+            if (Href.IsEmpty()) { Href = Node->GetAttribute(TEXT("xlink:href")); }
+            if (!Href.StartsWith(TEXT("#")))
+            {
+                UE_LOG(LogSplineSvg, Warning, TEXT("Skipping unsupported external SVG <use> href: %s"), *Href);
+                return;
+            }
+            const FXmlNode* const* Referenced = Ids.Find(Href.Mid(1));
+            if (!Referenced || ActiveReferences.Contains(*Referenced))
+            {
+                UE_LOG(LogSplineSvg, Warning, TEXT("Unresolved or recursive SVG <use>: %s"), *Href);
+                return;
+            }
+            FAffine Offset;
+            Offset.E = SvgNumber(Node, TEXT("x"));
+            Offset.F = SvgNumber(Node, TEXT("y"));
+            ActiveReferences.Add(*Referenced);
+            ReadElements(*Referenced, Transform * Offset, Ids, ActiveReferences,
+                         Out, Ordinal, true, Depth + 1);
+            ActiveReferences.Remove(*Referenced);
+            return;
+        }
 
         if (Tag == TEXT("path"))
         {
@@ -374,37 +549,96 @@ namespace
             TArray<FVector2D> Vectors;
             if (Tag == TEXT("line"))
             {
-                auto Attribute = [&](const TCHAR* Key) { return FCString::Atod(*Node->GetAttribute(Key)); };
-                Vectors.Add(FVector2D(Attribute(TEXT("x1")), Attribute(TEXT("y1"))));
-                Vectors.Add(FVector2D(Attribute(TEXT("x2")), Attribute(TEXT("y2"))));
+                Vectors.Add(FVector2D(SvgNumber(Node, TEXT("x1")), SvgNumber(Node, TEXT("y1"))));
+                Vectors.Add(FVector2D(SvgNumber(Node, TEXT("x2")), SvgNumber(Node, TEXT("y2"))));
             }
             else
             {
                 FNumScanner Scanner(Node->GetAttribute(TEXT("points")));
                 FVector2D P;
-                while (Scanner.HasNumber() && Vectors.Num() < 100000 && Scanner.Pair(P)) { Vectors.Add(P); }
+                while (Scanner.HasNumber() && Vectors.Num() < 100000 && Scanner.Pair(P))
+                {
+                    Vectors.Add(P);
+                }
             }
             if (Vectors.Num() >= 2)
             {
-                FSplineImportedCurve& Curve = Out.AddDefaulted_GetRef();
-                Curve.Name = Name;
-                Curve.bClosedLoop = Tag == TEXT("polygon");
-                if (Curve.bClosedLoop && Vectors.Num() > 2 && Vectors[0].Equals(Vectors.Last(), 1e-8))
-                { Vectors.Pop(); }
-                for (const FVector2D& P : Vectors)
+                FContour Contour;
+                Contour.Name = Name;
+                Contour.Transform = Transform;
+                Contour.BeginAt(Vectors[0]);
+                for (int32 Index = 1; Index < Vectors.Num(); ++Index) { Contour.Line(Vectors[Index]); }
+                if (Tag == TEXT("polygon")) { Contour.Close(); }
+                Contour.Emit(Out);
+            }
+        }
+        else if (Tag == TEXT("rect"))
+        {
+            const double X = SvgNumber(Node, TEXT("x"));
+            const double Y = SvgNumber(Node, TEXT("y"));
+            const double W = SvgNumber(Node, TEXT("width"));
+            const double H = SvgNumber(Node, TEXT("height"));
+            if (W > 0.0 && H > 0.0)
+            {
+                const FString RXText = Node->GetAttribute(TEXT("rx"));
+                const FString RYText = Node->GetAttribute(TEXT("ry"));
+                double RX = RXText.IsEmpty() ? SvgNumber(Node, TEXT("ry")) : SvgNumber(Node, TEXT("rx"));
+                double RY = RYText.IsEmpty() ? RX : SvgNumber(Node, TEXT("ry"));
+                RX = FMath::Clamp(RX, 0.0, W * 0.5);
+                RY = FMath::Clamp(RY, 0.0, H * 0.5);
+                FContour Contour;
+                Contour.Name = Name;
+                Contour.Transform = Transform;
+                if (RX > 0.0 && RY > 0.0)
                 {
-                    const FVector2D A = Transform.Apply(P);
-                    FSplinePointData& Point = Curve.Points.AddDefaulted_GetRef();
-                    Point.LocalPosition = FVector(A.X, -A.Y, 0.0);
-                    Point.PointType = ESplinePointType::Linear;
+                    Contour.BeginAt(FVector2D(X + RX, Y));
+                    Contour.Line(FVector2D(X + W - RX, Y));
+                    Arc(Contour, RX, RY, 0.0, false, true, FVector2D(X + W, Y + RY));
+                    Contour.Line(FVector2D(X + W, Y + H - RY));
+                    Arc(Contour, RX, RY, 0.0, false, true, FVector2D(X + W - RX, Y + H));
+                    Contour.Line(FVector2D(X + RX, Y + H));
+                    Arc(Contour, RX, RY, 0.0, false, true, FVector2D(X, Y + H - RY));
+                    Contour.Line(FVector2D(X, Y + RY));
+                    Arc(Contour, RX, RY, 0.0, false, true, FVector2D(X + RX, Y));
                 }
+                else
+                {
+                    Contour.BeginAt(FVector2D(X, Y));
+                    Contour.Line(FVector2D(X + W, Y));
+                    Contour.Line(FVector2D(X + W, Y + H));
+                    Contour.Line(FVector2D(X, Y + H));
+                }
+                Contour.Close();
+                Contour.Emit(Out);
+            }
+        }
+        else if (Tag == TEXT("circle") || Tag == TEXT("ellipse"))
+        {
+            const double CX = SvgNumber(Node, TEXT("cx"));
+            const double CY = SvgNumber(Node, TEXT("cy"));
+            const double RX = Tag == TEXT("circle") ? SvgNumber(Node, TEXT("r")) : SvgNumber(Node, TEXT("rx"));
+            const double RY = Tag == TEXT("circle") ? RX : SvgNumber(Node, TEXT("ry"));
+            if (RX > 0.0 && RY > 0.0)
+            {
+                FContour Contour;
+                Contour.Name = Name;
+                Contour.Transform = Transform;
+                Contour.BeginAt(FVector2D(CX + RX, CY));
+                Arc(Contour, RX, RY, 0.0, false, true, FVector2D(CX, CY + RY));
+                Arc(Contour, RX, RY, 0.0, false, true, FVector2D(CX - RX, CY));
+                Arc(Contour, RX, RY, 0.0, false, true, FVector2D(CX, CY - RY));
+                Arc(Contour, RX, RY, 0.0, false, true, FVector2D(CX + RX, CY));
+                Contour.Close();
+                Contour.Emit(Out);
             }
         }
         for (const FXmlNode* Child : Node->GetChildrenNodes())
         {
-            ReadElements(Child, Transform, Out, Ordinal);
+            ReadElements(Child, Transform, Ids, ActiveReferences,
+                         Out, Ordinal, bReferenced, Depth + 1);
         }
     }
+
 }
 
 bool SplineAssetImport::LoadSvgCurves(const FString& Filename, TArray<FSplineImportedCurve>& Curves)
@@ -416,6 +650,9 @@ bool SplineAssetImport::LoadSvgCurves(const FString& Filename, TArray<FSplineImp
     }
     FString XML;
     if (!FFileHelper::LoadFileToString(XML, *Filename)) { return false; }
+    // Normalize wrapped attribute values before FXmlFile tokenizes them. This
+    // is essential for SVG <path d="..."> data split over physical lines.
+    NormalizeMultilineXmlAttributes(XML);
     FXmlFile Document(XML, EConstructMethod::ConstructFromBuffer);
     if (!Document.IsValid() || !Document.GetRootNode())
     {
@@ -423,11 +660,37 @@ bool SplineAssetImport::LoadSvgCurves(const FString& Filename, TArray<FSplineImp
         return false;
     }
     int32 Ordinal = 0;
-    ReadElements(Document.GetRootNode(), FAffine(), Curves, Ordinal);
+    TMap<FString, const FXmlNode*> Ids;
+    IndexIds(Document.GetRootNode(), Ids);
+    TSet<const FXmlNode*> ActiveReferences;
+    ReadElements(Document.GetRootNode(), FAffine(), Ids, ActiveReferences, Curves, Ordinal);
+    int32 ClosedCount = 0;
+    for (const FSplineImportedCurve& Curve : Curves)
+    {
+        ClosedCount += Curve.bClosedLoop ? 1 : 0;
+    }
+    UE_LOG(LogSplineSvg, Display,
+        TEXT("Strand SVG '%s': %d independent path(s): %d closed, %d open. Open SVG strokes are not implicitly connected."),
+        *Filename, Curves.Num(), ClosedCount, Curves.Num() - ClosedCount);
     for (int32 I = 0; I < Curves.Num(); ++I)
     {
         // Numeric order handles duplicate SVG IDs without collapsing source curves.
         Curves[I].SourceId = Curves[I].Name + FString::Printf(TEXT("#%d"), I);
+        // Report topology and segment counts so import/reimport and applied
+        // component mismatches can be diagnosed without reading a .uasset.
+        if (I < 32)
+        {
+            const int32 Segments = Curves[I].bClosedLoop
+                ? Curves[I].Points.Num() : Curves[I].Points.Num() - 1;
+            UE_LOG(LogSplineSvg, Display, TEXT("  Contour %d '%s': %d points, %d segments, %s"),
+                I, *Curves[I].Name, Curves[I].Points.Num(), Segments,
+                Curves[I].bClosedLoop ? TEXT("closed") : TEXT("open"));
+        }
+    }
+    if (Curves.Num() > 32)
+    {
+        UE_LOG(LogSplineSvg, Display, TEXT("  ... %d additional contours omitted from summary"),
+            Curves.Num() - 32);
     }
     return !Curves.IsEmpty();
 }

@@ -3,6 +3,8 @@
 #include "ToolMenu.h"
 #include "ToolMenuSection.h"
 #include "AssetTypeActions_Base.h"
+#include "ContentBrowserMenuContexts.h"
+#include "UObject/SoftObjectPath.h"
 #include "AssetToolsModule.h"
 #include "IAssetTools.h"
 #include "PropertyEditorModule.h"
@@ -58,44 +60,10 @@ public:
     }
     virtual UClass* GetSupportedClass() const override { return USplineDataAsset::StaticClass(); }
     virtual uint32 GetCategories() override { return static_cast<uint32>(Category); }
-    virtual bool HasActions(const TArray<UObject*>& InObjects) const override { return !InObjects.IsEmpty(); }
-    virtual void GetActions(const TArray<UObject*>& InObjects, FToolMenuSection& Section) override
-    {
-        for (UObject* Object : InObjects)
-        {
-            if (USplineDataAsset* Asset = Cast<USplineDataAsset>(Object))
-            {
-                const TWeakObjectPtr<USplineDataAsset> Weak(Asset);
-                Section.AddMenuEntry(
-                    TEXT("SplineAsset_ApplyToSelectedActors"),
-                    LOCTEXT("ApplyAsset", "Apply to Selected Level Spline Actor(s)"),
-                    LOCTEXT("ApplyAssetTip", "Replace the points on selected level actors containing one Spline Component."),
-                    FSlateIcon(),
-                    FUIAction(FExecuteAction::CreateLambda([Weak]()
-                    {
-                        SplineEditorCommands::ApplyAssetToSelectedActors(Weak);
-                    })));
-                Section.AddMenuEntry(
-                    TEXT("Strand_CreateNativeActor"),
-                    LOCTEXT("CreateNative", "Create Native Spline Actor at World Origin"),
-                    LOCTEXT("CreateNativeTip", "Create and select an ordinary Actor containing a native Spline Component linked to this asset."),
-                    FSlateIcon(),
-                    FUIAction(FExecuteAction::CreateLambda([Weak]()
-                    {
-                        SplineEditorCommands::CreateNativeActorFromAsset(Weak);
-                    })));
-                Section.AddMenuEntry(
-                    TEXT("Strand_FindLevelUsers"),
-                    LOCTEXT("FindUsers", "Select Loaded Actors Using This Strand"),
-                    LOCTEXT("FindUsersTip", "Select native spline components using this asset in the open editor world. Unloaded actors and Blueprint defaults are not searched."),
-                    FSlateIcon(),
-                    FUIAction(FExecuteAction::CreateLambda([Weak]()
-                    {
-                        SplineEditorCommands::SelectActorsUsingAsset(Weak);
-                    })));
-            }
-        }
-    }
+    // Actions live in their own ToolMenus section below. Keeping the legacy
+    // asset type actions strictly for icon, label, and color avoids folding
+    // engine-provided Data Asset commands into a misleading Strand group.
+    virtual bool HasActions(const TArray<UObject*>& InObjects) const override { return false; }
 private:
     EAssetTypeCategories::Type Category;
 };
@@ -228,15 +196,28 @@ private:
             return;
         }
 
+        const FString ActorSvgPath = FPaths::Combine(ResourceDirectory, TEXT("StrandSplineActor_16.svg"));
+        if (!FPaths::FileExists(ActorSvgPath))
+        {
+            UE_LOG(LogTemp, Warning, TEXT("Strand: Actor icon not found: %s"), *ActorSvgPath);
+        }
+
         AssetStyle = MakeShared<FSlateStyleSet>(StrandEditorStyle::StyleSetName);
         AssetStyle->SetContentRoot(ResourceDirectory);
         AssetStyle->Set(StrandEditorStyle::ClassIconName,
             new FSlateVectorImageBrush(SvgPath, FVector2D(16.0f, 16.0f),
                 FLinearColor::White, ESlateBrushTileType::NoTile));
-        AssetStyle->Set(TEXT("ClassIcon.StrandSplineActor"),
-            new FSlateVectorImageBrush(SvgPath, FVector2D(16.0f, 16.0f), FLinearColor::White, ESlateBrushTileType::NoTile));
-        AssetStyle->Set(TEXT("ClassThumbnail.StrandSplineActor"),
-            new FSlateVectorImageBrush(SvgPath, FVector2D(64.0f, 64.0f), FLinearColor::White, ESlateBrushTileType::NoTile));
+        // The actor has its OWN white 16px artwork for Outliner and placement menus.
+        // The Content Browser asset icon/thumbnail continue to use the original SVG.
+        if (FPaths::FileExists(ActorSvgPath))
+        {
+            AssetStyle->Set(TEXT("ClassIcon.StrandSplineActor"),
+                new FSlateVectorImageBrush(ActorSvgPath, FVector2D(16.0f, 16.0f),
+                    FLinearColor::White, ESlateBrushTileType::NoTile));
+            AssetStyle->Set(TEXT("ClassThumbnail.StrandSplineActor"),
+                new FSlateVectorImageBrush(ActorSvgPath, FVector2D(64.0f, 64.0f),
+                    FLinearColor::White, ESlateBrushTileType::NoTile));
+        }
         AssetStyle->Set(StrandEditorStyle::ClassThumbnailName,
             new FSlateVectorImageBrush(SvgPath, FVector2D(64.0f, 64.0f),
                 FLinearColor::White, ESlateBrushTileType::NoTile));
@@ -256,6 +237,91 @@ private:
     void RegisterMenus()
     {
         FToolMenuOwnerScoped OwnerScoped(this);
+
+        // UE 5.5+ Content Browser actions are registered against the asset class,
+        // not the legacy GetActions section. Keep native Data Asset operations
+        // (including "Convert to Different Data Asset Type") in their own
+        // general-purpose category. Only Strand commands go in "Strand".
+        if (UToolMenu* AssetMenu = UE::ContentBrowser::ExtendToolMenu_AssetContextMenu(USplineDataAsset::StaticClass()))
+        {
+            FToolMenuSection& GeneralAssetActions = AssetMenu->FindOrAddSection(TEXT("GetAssetActions"));
+            GeneralAssetActions.Label = LOCTEXT("GeneralAssetActions", "Asset Actions");
+
+            FToolMenuSection& StrandActions = AssetMenu->AddSection(
+                TEXT("StrandAssetActions"), LOCTEXT("StrandAssetMenuTitle", "Strand"),
+                FToolMenuInsert(TEXT("GetAssetActions"), EToolMenuInsertType::Before));
+            StrandActions.AddDynamicEntry(TEXT("StrandAssetMenuEntries"),
+                FNewToolMenuSectionDelegate::CreateLambda([](FToolMenuSection& DynamicSection)
+                {
+                    const UContentBrowserAssetContextMenuContext* Context =
+                        UContentBrowserAssetContextMenuContext::FindContextWithAssets(DynamicSection);
+                    if (!Context || Context->SelectedAssets.Num() != 1 ||
+                        Context->SelectedAssets[0].AssetClassPath != USplineDataAsset::StaticClass()->GetClassPathName())
+                    {
+                        return;
+                    }
+                    // Do not load the selected asset to build a context menu.
+                    // Loading occurs only when the designer clicks an action.
+                    const FSoftObjectPath AssetPath = Context->SelectedAssets[0].ToSoftObjectPath();
+                    const auto ResolveAsset = [AssetPath]() -> USplineDataAsset*
+                    {
+                        return Cast<USplineDataAsset>(AssetPath.TryLoad());
+                    };
+                    DynamicSection.AddMenuEntry(
+                        TEXT("Strand_CreateActor"),
+                        LOCTEXT("CreateActor", "Create Strand Spline Actor"),
+                        LOCTEXT("CreateActorTip", "Place a native Strand Spline Actor in front of the active level viewport camera. Drag this asset into the viewport for precise placement."),
+                        FSlateIcon(StrandEditorStyle::StyleSetName, TEXT("ClassIcon.StrandSplineActor")),
+                        FUIAction(FExecuteAction::CreateLambda([ResolveAsset]()
+                        {
+                            SplineEditorCommands::CreateNativeActorFromAsset(ResolveAsset());
+                        }), FCanExecuteAction::CreateLambda([]()
+                        {
+                            return GEditor && GEditor->GetEditorWorldContext().World();
+                        })));
+                    DynamicSection.AddMenuEntry(
+                        TEXT("Strand_ApplyToSelection"),
+                        LOCTEXT("ApplyToSelection", "Apply to Selected Splines"),
+                        LOCTEXT("ApplyToSelectionTip", "Replace point data on selected actors that have exactly one native Spline Component. Actors containing multiple splines are skipped."),
+                        FSlateIcon(StrandEditorStyle::StyleSetName, TEXT("Strand.Action.Apply")),
+                        FUIAction(FExecuteAction::CreateLambda([ResolveAsset]()
+                        {
+                            SplineEditorCommands::ApplyAssetToSelectedActors(ResolveAsset());
+                        }), FCanExecuteAction::CreateLambda([]()
+                        {
+                            for (AActor* Actor : SplineEditorCommands::SelectedActors())
+                            {
+                                if (IsValid(SplineEditorCommands::FindUnambiguousSpline(Actor))) { return true; }
+                            }
+                            return false;
+                        })));
+                    DynamicSection.AddMenuEntry(
+                        TEXT("Strand_SelectActorsUsingAsset"),
+                        LOCTEXT("SelectUsers", "Select Actors Using This Asset"),
+                        LOCTEXT("SelectUsersTip", "Select loaded level actors that have native spline components linked to this asset."),
+                        FSlateIcon(StrandEditorStyle::StyleSetName, TEXT("Strand.Action.Compare")),
+                        FUIAction(FExecuteAction::CreateLambda([ResolveAsset]()
+                        {
+                            SplineEditorCommands::SelectActorsUsingAsset(ResolveAsset());
+                        }), FCanExecuteAction::CreateLambda([]()
+                        {
+                            return GEditor && GEditor->GetEditorWorldContext().World();
+                        })));
+                    DynamicSection.AddMenuEntry(
+                        TEXT("Strand_InspectUsage"),
+                        LOCTEXT("InspectUsage", "Inspect Strand Usage..."),
+                        LOCTEXT("InspectUsageTip", "Report loaded spline components using this asset, including synchronized and locally modified instances. Does not modify or select anything."),
+                        FSlateIcon(StrandEditorStyle::StyleSetName, TEXT("Strand.Action.Compare")),
+                        FUIAction(FExecuteAction::CreateLambda([ResolveAsset]()
+                        {
+                            SplineEditorCommands::InspectAssetUsage(ResolveAsset());
+                        }), FCanExecuteAction::CreateLambda([]()
+                        {
+                            return GEditor && GEditor->GetEditorWorldContext().World();
+                        })));
+                }));
+        }
+
         UToolMenu* ToolsMenu = UToolMenus::Get()->ExtendMenu(TEXT("LevelEditor.MainMenu.Tools"));
         FToolMenuSection& ImportSection = ToolsMenu->FindOrAddSection(TEXT("StrandImport"));
         ImportSection.AddMenuEntry(TEXT("StrandImportAlembic"),

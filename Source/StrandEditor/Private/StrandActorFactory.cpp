@@ -72,7 +72,12 @@ void UStrandActorFactory::PostSpawnActor(UObject* Asset, AActor* NewActor)
     // No custom spline representation: this is a plain actor and native spline component.
     TArray<USplineComponent*> Splines;
     NewActor->GetComponents<USplineComponent>(Splines);
-    USplineComponent* Spline = Splines.IsEmpty() ? StrandPlacement::AddNativeSpline(NewActor) : Splines[0];
+    USplineComponent* Spline = Cast<USplineComponent>(NewActor->GetRootComponent());
+    if (!Spline)
+    {
+        // Only for non-Strand actors that explicitly use this factory.
+        Spline = Splines.IsEmpty() ? StrandPlacement::AddNativeSpline(NewActor) : Splines[0];
+    }
     if (!Spline) { return; }
     Strand->ApplyToSplineComponentWithPlacement(Spline,
         Strand->DefaultCoordinateMode, Strand->DefaultAnchorMode, Strand->DefaultAnchorPointIndex);
