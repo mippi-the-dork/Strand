@@ -28,12 +28,20 @@ public:
         FFeedbackContext* Warn, bool& bOutOperationCanceled) override;
 };
 
+/**
+ * Interactive Alembic import selector for editor file-drop and Import workflows.
+ * Only routes interactive .abc imports; explicitly selected Strand and automated
+ * import factories bypass the chooser.
+ */
 UCLASS()
-class USplineFbxFactory : public UFactory
+class UStrandAlembicImportRouterFactory : public UFactory
 {
     GENERATED_BODY()
 public:
-    USplineFbxFactory();
+    UStrandAlembicImportRouterFactory();
+    // Pure routing decision, independent of the editor's current import context.
+    // Exposed for deterministic tests of interactive versus automated imports.
+    static bool ShouldRouteAlembic(const FString& Filename, bool bAutomatedImport);
     virtual bool FactoryCanImport(const FString& Filename) override;
     virtual UObject* FactoryCreateFile(UClass* InClass, UObject* InParent, FName InName,
         EObjectFlags Flags, const FString& Filename, const TCHAR* Parms,

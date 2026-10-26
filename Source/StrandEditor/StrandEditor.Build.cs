@@ -13,7 +13,5 @@ public class StrandEditor : ModuleRules
             "AssetRegistry", "ContentBrowser", "PlacementMode", "PropertyEditor", "ToolMenus", "LevelEditor",
             "EditorFramework", "Landscape", "Projects", "ApplicationCore", "DesktopPlatform", "AlembicLib", "AlembicLibrary"
         });
-        // FBX is shipped with Unreal as an engine ThirdParty static library, not a normal module.
-        AddEngineThirdPartyPrivateStaticDependencies(Target, "FBX");
     }
 }

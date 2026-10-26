@@ -1,6 +1,7 @@
 #include "StrandActorFactory.h"
 #include "StrandPlacement.h"
 #include "StrandSplineActor.h"
+#include "StrandMultiSplineActor.h"
 #include "StrandSplineRefresh.h"
 #include "StrandSplineUserData.h"
 #include "SplineDataAsset.h"
@@ -83,12 +84,46 @@ void UStrandActorFactory::PostSpawnActor(UObject* Asset, AActor* NewActor)
         Strand->DefaultCoordinateMode, Strand->DefaultAnchorMode, Strand->DefaultAnchorPointIndex);
     UStrandSplineUserData::AssignAsset(Spline, Strand);
     StrandSplineRefresh::NotifySplineChanged(Spline);
-    NewActor->MarkPackageDirty();
+    // Editor viewport drag previews are also spawned through this callback.
+    // Never retain, delete, group or dirty preview actors from the factory.
+    // The editor finalizes placements and broadcasts OnNewActorsDropped later.
+    if (!NewActor->HasAnyFlags(RF_Transient | RF_NewerVersionExists | RF_BeginDestroyed))
+    {
+        NewActor->MarkPackageDirty();
+    }
 }
 
 FString UStrandActorFactory::GetDefaultActorLabel(UObject* Asset) const
 {
     return IsValid(Asset) ? FString::Printf(TEXT("Strand_%s"), *Asset->GetName()) : TEXT("Strand Spline Actor");
+}
+
+UStrandMultiActorFactory::UStrandMultiActorFactory(const FObjectInitializer& ObjectInitializer)
+    : Super(ObjectInitializer)
+{
+    DisplayName = LOCTEXT("MultiDisplay", "Strand Multi Spline Actor");
+    NewActorClass = AStrandMultiSplineActor::StaticClass();
+    bUseSurfaceOrientation = false;
+    bShowInEditorQuickMenu = true;
+    MenuPriority = 2;
+    bShouldAutoRegister = false;
+}
+
+bool UStrandMultiActorFactory::CanCreateActorFrom(const FAssetData& AssetData, FText& OutError)
+{
+    if (!AssetData.IsValid()) { return true; }
+    OutError = LOCTEXT("MultiNoAsset", "Use a Strand Spline asset for individual placement or the grouped drag option.");
+    return false;
+}
+
+bool UStrandMultiActorFactory::CanPlaceElementsFromAssetData(const FAssetData& AssetData)
+{
+    return !AssetData.IsValid();
+}
+
+UClass* UStrandMultiActorFactory::GetDefaultActorClass(const FAssetData& AssetData)
+{
+    return !AssetData.IsValid() ? AStrandMultiSplineActor::StaticClass() : nullptr;
 }
 
 #undef LOCTEXT_NAMESPACE

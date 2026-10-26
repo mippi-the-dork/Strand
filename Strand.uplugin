@@ -1,9 +1,9 @@
 {
   "FileVersion": 3,
-  "Version": 21,
-  "VersionName": "0.4.10",
+  "Version": 35,
+  "VersionName": "0.6.2",
   "FriendlyName": "Strand",
-  "Description": "Strand spline assets for Unreal native splines, SVG/Alembic interchange, source-accurate wrapped SVG path importing, viewport placement, and synchronization.",
+  "Description": "Native 2D and 3D Strand spline authoring and editing, with SVG and Alembic import/export, editor 3D viewport, point controls, and component synchronization.",
   "Category": "Editor",
   "CreatedBy": "Strand",
   "CanContainContent": false,

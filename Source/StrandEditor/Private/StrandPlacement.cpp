@@ -1,5 +1,6 @@
 #include "StrandPlacement.h"
 #include "StrandSplineActor.h"
+#include "StrandMultiSplineActor.h"
 #include "StrandSplineUserData.h"
 #include "StrandSplineRefresh.h"
 #include "SplineDataAsset.h"
@@ -99,6 +100,61 @@ AActor* StrandPlacement::CreateNativeSplineActor(USplineDataAsset* Asset, FStrin
         GEditor->SelectActor(Actor, true, true, true);
         GEditor->RedrawAllViewports();
     }
+    return Actor;
+}
+
+AActor* StrandPlacement::CreateMultiSplineActor(const TArray<USplineDataAsset*>& Assets, FString& OutError,
+                                                const FTransform* RequestedTransform)
+{
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+    if (!IsValid(World) || World->WorldType != EWorldType::Editor || !World->GetCurrentLevel())
+    {
+        OutError = TEXT("Open an editable level first.");
+        return nullptr;
+    }
+    for (const USplineDataAsset* Asset : Assets)
+    {
+        if (!IsValid(Asset)) { OutError = TEXT("A selected Strand asset was invalid."); return nullptr; }
+    }
+    const FScopedTransaction Transaction(LOCTEXT("CreateMulti", "Create Strand Multi Spline Actor"));
+    World->GetCurrentLevel()->Modify();
+    FTransform Transform = RequestedTransform ? *RequestedTransform : FTransform::Identity;
+    if (!RequestedTransform && GEditor)
+    {
+        if (UUnrealEditorSubsystem* Subsystem = GEditor->GetEditorSubsystem<UUnrealEditorSubsystem>())
+        {
+            FVector CameraLocation; FRotator CameraRotation;
+            if (Subsystem->GetLevelViewportCameraInfo(CameraLocation, CameraRotation))
+            {
+                Transform.SetLocation(CameraLocation + CameraRotation.Vector() * 500.0);
+            }
+        }
+    }
+    FActorSpawnParameters Params;
+    Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+    Params.ObjectFlags |= RF_Transactional;
+    Params.OverrideLevel = World->GetCurrentLevel();
+    AStrandMultiSplineActor* Actor = World->SpawnActor<AStrandMultiSplineActor>(
+        AStrandMultiSplineActor::StaticClass(), Transform, Params);
+    if (!IsValid(Actor)) { OutError = TEXT("Could not create Strand Multi Spline Actor."); return nullptr; }
+    Actor->Modify();
+    Actor->SetActorLabel(TEXT("Strand Multi Spline Actor"));
+    USplineComponent* RootSpline = Actor->Spline;
+    for (int32 I = 0; I < Assets.Num(); ++I)
+    {
+        USplineComponent* Spline = I == 0 ? RootSpline : StrandPlacement::AddNativeSpline(Actor);
+        if (!IsValid(Spline)) { OutError = TEXT("Could not create all spline components."); World->DestroyActor(Actor); return nullptr; }
+        Spline->Modify();
+        USplineDataAsset* Asset = Assets[I];
+        Asset->ApplyToSplineComponentWithPlacement(Spline, Asset->DefaultCoordinateMode,
+            Asset->DefaultAnchorMode, Asset->DefaultAnchorPointIndex);
+        UStrandSplineUserData::AssignAsset(Spline, Asset);
+        StrandSplineRefresh::NotifySplineChanged(Spline);
+    }
+    Actor->MarkPackageDirty();
+    GEditor->SelectNone(false, true, false);
+    GEditor->SelectActor(Actor, true, true, true);
+    GEditor->RedrawAllViewports();
     return Actor;
 }
 

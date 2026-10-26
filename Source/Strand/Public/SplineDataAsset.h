@@ -54,6 +54,15 @@ public:
     UPROPERTY(VisibleAnywhere, Category="Strand|Source")
     FString SourceImportFormat;
 
+    /**
+     * Mirror the source SVG X coordinates in Unreal's XY plane. Enabled by default
+     * so the source artwork reads left-to-right in the standard top-down level view.
+     * This setting is used on REIMPORT; reimport does not automatically update instances.
+     * Disable to use the historical Strand SVG mapping (X, -Y, 0).
+     */
+    UPROPERTY(EditAnywhere, Category="Strand|Import", meta=(DisplayName="Mirror SVG X on Import"))
+    bool bMirrorSvgXOnImport = true;
+
     /** Source coordinate units to Unreal centimeters; Alembic does not standardize units. */
     UPROPERTY(EditAnywhere, Category="Strand|Import", meta=(ClampMin="0.000001"))
     float SourceUnitsToCentimeters = 1.0f;

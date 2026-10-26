@@ -21,7 +21,17 @@ uint32 USplineDataAssetFactory::GetMenuCategories() const
 UObject* USplineDataAssetFactory::FactoryCreateNew(UClass* InClass, UObject* InParent, FName InName,
     EObjectFlags Flags, UObject* Context, FFeedbackContext* Warn)
 {
-    return NewObject<USplineDataAsset>(InParent, InClass, InName, Flags | RF_Transactional);
+    USplineDataAsset* Asset = NewObject<USplineDataAsset>(InParent, InClass, InName, Flags | RF_Transactional);
+    // A new authored spline is immediately visible/editable in its dedicated
+    // 2D/3D viewport, rather than presenting an empty generic data array.
+    FSplinePointData First;
+    First.LocalPosition = FVector::ZeroVector;
+    First.PointType = ESplinePointType::Curve;
+    FSplinePointData Second = First;
+    Second.LocalPosition = FVector(100.0, 0.0, 0.0);
+    Asset->Points.Add(First);
+    Asset->Points.Add(Second);
+    return Asset;
 }
 
 USplineSvgFactory::USplineSvgFactory()
@@ -37,21 +47,6 @@ USplineSvgFactory::USplineSvgFactory()
 bool USplineSvgFactory::FactoryCanImport(const FString& Filename)
 {
     return FPaths::GetExtension(Filename).Equals(TEXT("svg"), ESearchCase::IgnoreCase);
-}
-
-USplineFbxFactory::USplineFbxFactory()
-{
-    SupportedClass = USplineDataAsset::StaticClass();
-    bCreateNew = false;
-    bEditorImport = true;
-    bText = false;
-    Formats.Add(TEXT("fbx;Strand Legacy Curves (FBX)"));
-    ImportPriority = -200; // Explicit legacy compatibility: do not take over ordinary FBX imports.
-}
-
-bool USplineFbxFactory::FactoryCanImport(const FString& Filename)
-{
-    return FPaths::GetExtension(Filename).Equals(TEXT("fbx"), ESearchCase::IgnoreCase);
 }
 
 UStrandAlembicFactory::UStrandAlembicFactory()

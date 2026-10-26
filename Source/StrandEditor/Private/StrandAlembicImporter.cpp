@@ -201,6 +201,64 @@ namespace
         return Samples.Num() >= 2;
     }
 
+    /**
+     * A number of exporters (including Blender 5.2's periodic NURBS circles)
+     * write order, rational weights and periodic vertices without a knot array.
+     * In this underspecified case we can make a continuous periodic uniform
+     * rational spline, but cannot claim to reproduce unknown nonuniform knots.
+     * This conservative fallback is used ONLY for periodic, knotless curves.
+     */
+    bool SamplePeriodicUniformRational(const TArray<FVector>& CV,
+        const TArray<double>& Weights, int32 Order, TArray<FVector>& Out)
+    {
+        const int32 N = CV.Num();
+        if (Order < 2 || Order > 16 || N < Order || N > MaxGeneratedPoints ||
+            (!Weights.IsEmpty() && Weights.Num() != N))
+        {
+            return false;
+        }
+        const int32 Degree = Order - 1;
+        const int32 SamplesPerSpan = FMath::Min(4, MaxGeneratedPoints / N);
+        if (N * SamplesPerSpan < 2) { return false; }
+        Out.Reserve(N * SamplesPerSpan);
+        for (int32 SpanIndex = 0; SpanIndex < N; ++SpanIndex)
+        {
+            const int32 Span = Degree + SpanIndex;
+            for (int32 Substep = 0; Substep < SamplesPerSpan; ++Substep)
+            {
+                const double T = Span + static_cast<double>(Substep) / SamplesPerSpan;
+                TArray<FWeighted> D;
+                D.Reserve(Order);
+                for (int32 J = 0; J <= Degree; ++J)
+                {
+                    const int32 At = (SpanIndex + J) % N;
+                    const double W = Weights.IsValidIndex(At) ? Weights[At] : 1.0;
+                    if (!FMath::IsFinite(W) || W <= 0.0) { return false; }
+                    D.Add({CV[At].X * W, CV[At].Y * W, CV[At].Z * W, W});
+                }
+                for (int32 R = 1; R <= Degree; ++R)
+                {
+                    for (int32 J = Degree; J >= R; --J)
+                    {
+                        const double A = (T - (Span - Degree + J)) / (Degree - R + 1);
+                        const FWeighted& Previous = D[J-1];
+                        FWeighted& Current = D[J];
+                        Current = {FMath::Lerp(Previous.X, Current.X, A),
+                                   FMath::Lerp(Previous.Y, Current.Y, A),
+                                   FMath::Lerp(Previous.Z, Current.Z, A),
+                                   FMath::Lerp(Previous.W, Current.W, A)};
+                    }
+                }
+                const FWeighted& V = D[Degree];
+                if (FMath::Abs(V.W) < 1e-12) { return false; }
+                const FVector Point(V.X / V.W, V.Y / V.W, V.Z / V.W);
+                if (Point.ContainsNaN()) { return false; }
+                if (Out.IsEmpty() || !Out.Last().Equals(Point, 0.000001)) { Out.Add(Point); }
+            }
+        }
+        return Out.Num() >= 2;
+    }
+
     bool ParseSchema(const G::ICurves& Curves, const FString& ObjectName,
                      const FReadSettings& Settings, TArray<FSplineImportedCurve>& Out)
     {
@@ -255,7 +313,7 @@ namespace
                 AddLinearOrSmooth(Curve, Evaluated, bClosed, false);
                 UE_LOG(LogStrandAlembic, Display, TEXT("Approximated B-spline curve %s with sampled Hermite points"), *Curve.SourceId);
             }
-            else if (Sample.getType() == G::kVariableOrder && AllOrders && CurveIndex < AllOrders->size() && AllKnots)
+            else if (Sample.getType() == G::kVariableOrder && AllOrders && CurveIndex < AllOrders->size())
             {
                 const int32 Order = (*AllOrders)[CurveIndex];
                 // Determine whole-file knot layout before consuming any individual curve.
@@ -266,8 +324,8 @@ namespace
                     FullTotal += (*Counts)[C] + (*AllOrders)[C];
                     TrimmedTotal += (*Counts)[C] + (*AllOrders)[C] - 2;
                 }
-                const bool bFull = AllOrders->size() == Counts->size() && AllKnots->size() == FullTotal;
-                const bool bTrimmed = AllOrders->size() == Counts->size() && AllKnots->size() == TrimmedTotal;
+                const bool bFull = AllKnots && AllOrders->size() == Counts->size() && AllKnots->size() == FullTotal;
+                const bool bTrimmed = AllKnots && AllOrders->size() == Counts->size() && AllKnots->size() == TrimmedTotal;
                 const size_t ThisCount = bFull ? size_t(N + Order) :
                     (bTrimmed ? size_t(N + Order - 2) : 0);
                 TArray<double> Knots, Weights;
@@ -278,9 +336,30 @@ namespace
                     for (int32 I = 0; I < N; ++I) { Weights.Add((*AllWeights)[Offset+I]); }
                 }
                 TArray<FVector> Evaluated;
-                bSupported = ThisCount > 0 && SampleVariableOrder(CV, Knots, Weights, Order, Evaluated);
+                const bool bKnotlessPeriodic = bClosed && (!AllKnots || AllKnots->size() == 0);
+                if (ThisCount > 0)
+                {
+                    bSupported = SampleVariableOrder(CV, Knots, Weights, Order, Evaluated);
+                }
+                else if (bKnotlessPeriodic)
+                {
+                    bSupported = SamplePeriodicUniformRational(CV, Weights, Order, Evaluated);
+                    if (bSupported)
+                    {
+                        UE_LOG(LogStrandAlembic, Warning,
+                            TEXT("Periodic NURBS %s has no knot vector (sourcePoints=%d, order=%d). "
+                                 "Imported using a uniform periodic rational basis; original nonuniform parameterization cannot be recovered."),
+                            *Curve.SourceId, N, Order);
+                    }
+                }
+                else { bSupported = false; }
                 if (bSupported) { AddLinearOrSmooth(Curve, Evaluated, bClosed, false); }
-                UE_LOG(LogStrandAlembic, Display, TEXT("NURBS %s evaluated as sampled Unreal Hermite spline"), *Curve.SourceId);
+                if (bSupported)
+                {
+                    UE_LOG(LogStrandAlembic, Display,
+                        TEXT("NURBS %s evaluated as sampled Unreal Hermite spline (sourcePoints=%d, order=%d, importedPoints=%d)"),
+                        *Curve.SourceId, N, Order, Curve.Points.Num());
+                }
             }
             else
             {
@@ -288,7 +367,22 @@ namespace
             }
             if (!bSupported || Curve.Points.Num() < 2)
             {
-                UE_LOG(LogStrandAlembic, Warning, TEXT("Unsupported or malformed interpolation in %s. Curve left out."), *Curve.SourceId);
+                // Alembic exporters differ in their basis/knots for circles and
+                // periodic NURBS. Report the actual schema so a rejected curve can
+                // be diagnosed without guessing or silently changing its geometry.
+                const int32 ReportedOrder = (AllOrders && CurveIndex < AllOrders->size())
+                    ? static_cast<int32>((*AllOrders)[CurveIndex]) : -1;
+                const long long ReportedKnots = AllKnots
+                    ? static_cast<long long>(AllKnots->size()) : -1;
+                const long long ReportedOrders = AllOrders
+                    ? static_cast<long long>(AllOrders->size()) : -1;
+                UE_LOG(LogStrandAlembic, Warning,
+                    TEXT("Unsupported or malformed interpolation in %s. Curve left out. "
+                         "Schema: type=%d, basis=%d, wrap=%d, sourcePoints=%d, "
+                         "order=%d, totalKnots=%lld, totalOrders=%lld, generatedPoints=%d."),
+                    *Curve.SourceId, static_cast<int32>(Sample.getType()),
+                    static_cast<int32>(Sample.getBasis()), static_cast<int32>(Sample.getWrap()),
+                    N, ReportedOrder, ReportedKnots, ReportedOrders, Curve.Points.Num());
             }
             else { Out.Add(MoveTemp(Curve)); }
             Offset += N;

@@ -14,7 +14,7 @@ namespace SplineEditorCommands
     USplineComponent* FindUnambiguousSpline(AActor* Actor);
     USplineDataAsset* SelectedSplineAsset();
     bool SaveAsset(USplineDataAsset* Asset);
-    void ImportCurves(bool bAlembic, bool bLegacyFbx = false);
+    void ImportCurves(bool bAlembic);
     void ConvertSelectedActors();
     void ApplySelectedAssetToActors();
     void ApplyAssetToSelectedActors(TWeakObjectPtr<USplineDataAsset> Asset);
@@ -35,5 +35,11 @@ namespace SplineEditorCommands
     void ApplyAssetToComponent(TWeakObjectPtr<USplineDataAsset> Asset, TWeakObjectPtr<USplineComponent> Component);
     void CaptureComponent(TWeakObjectPtr<USplineComponent> Component);
     void AddNativeSplineAndApplyToSelected();
+    TArray<USplineDataAsset*> SelectedSplineAssets();
+    void AddSplineComponentsAndAssign(const TArray<USplineDataAsset*>& Assets);
+    void CreateMultiActorFromAssets(const TArray<USplineDataAsset*>& Assets);
+    void ApplyPlacementToComponents(const TArray<TWeakObjectPtr<USplineComponent>>& Splines,
+        EStrandCoordinateMode Mode, EStrandAnchorMode AnchorMode, int32 AnchorPointIndex);
+    void AssignAssetToComponents(const TArray<TWeakObjectPtr<USplineComponent>>& Splines, USplineDataAsset* Asset);
 
 }

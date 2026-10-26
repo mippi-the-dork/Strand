@@ -1,5 +1,6 @@
 #include "SplineDataAssetFactory.h"
 #include "SplineImportHelpers.h"
+#include "StrandProjectSettings.h"
 #include "HAL/FileManager.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
@@ -205,6 +206,7 @@ namespace
     struct FContour
     {
         FAffine Transform;
+        bool bMirrorSvgX = true;
         FString Name;
         FVector2D Current = FVector2D::ZeroVector;
         FVector2D Begin = FVector2D::ZeroVector;
@@ -217,8 +219,12 @@ namespace
         FVector Position(FVector2D P) const
         {
             const FVector2D Q = Transform.Apply(P);
-            // SVG uses downward-positive Y. Unreal spline data is Z-up.
-            return FVector(Q.X, -Q.Y, 0.0);
+            // SVG uses downward-positive Y. Keep it on native Unreal's XY plane.
+            // The standard level Top-view projection reverses X relative to SVG
+            // artwork. Mirror X by default so text and asymmetric geometry read
+            // correctly when viewed from above. The legacy mapping remains a
+            // per-asset reimport option, for projects relying on old coordinates.
+            return FVector(bMirrorSvgX ? -Q.X : Q.X, -Q.Y, 0.0);
         }
         void BeginAt(FVector2D P)
         {
@@ -365,10 +371,11 @@ namespace
     }
 
     bool PathToCurves(const FString& Text, const FString& Id, FAffine Matrix,
-                      TArray<FSplineImportedCurve>& Out)
+                      TArray<FSplineImportedCurve>& Out, bool bMirrorSvgX)
     {
         FNumScanner S(Text);
         FContour Shape; Shape.Transform = Matrix; Shape.Name = Id;
+        Shape.bMirrorSvgX = bMirrorSvgX;
         TCHAR Cmd = 0;
         int32 CurveIndex = 0;
         int32 Guard = 0;
@@ -495,7 +502,7 @@ namespace
                       const TMap<FString, const FXmlNode*>& Ids,
                       TSet<const FXmlNode*>& ActiveReferences,
                       TArray<FSplineImportedCurve>& Out, int32& Ordinal,
-                      bool bReferenced = false, int32 Depth = 0)
+                      bool bMirrorSvgX, bool bReferenced = false, int32 Depth = 0)
     {
         if (!Node || Out.Num() >= 4096 || Depth >= 64) { return; }
         const FString Tag = SvgTag(Node);
@@ -530,7 +537,7 @@ namespace
             Offset.F = SvgNumber(Node, TEXT("y"));
             ActiveReferences.Add(*Referenced);
             ReadElements(*Referenced, Transform * Offset, Ids, ActiveReferences,
-                         Out, Ordinal, true, Depth + 1);
+                         Out, Ordinal, bMirrorSvgX, true, Depth + 1);
             ActiveReferences.Remove(*Referenced);
             return;
         }
@@ -538,7 +545,7 @@ namespace
         if (Tag == TEXT("path"))
         {
             TArray<FSplineImportedCurve> Shapes;
-            if (!PathToCurves(Node->GetAttribute(TEXT("d")), Name, Transform, Shapes))
+            if (!PathToCurves(Node->GetAttribute(TEXT("d")), Name, Transform, Shapes, bMirrorSvgX))
             {
                 UE_LOG(LogSplineSvg, Warning, TEXT("Invalid path %s skipped."), *Name);
             }
@@ -566,6 +573,7 @@ namespace
                 FContour Contour;
                 Contour.Name = Name;
                 Contour.Transform = Transform;
+                Contour.bMirrorSvgX = bMirrorSvgX;
                 Contour.BeginAt(Vectors[0]);
                 for (int32 Index = 1; Index < Vectors.Num(); ++Index) { Contour.Line(Vectors[Index]); }
                 if (Tag == TEXT("polygon")) { Contour.Close(); }
@@ -589,6 +597,7 @@ namespace
                 FContour Contour;
                 Contour.Name = Name;
                 Contour.Transform = Transform;
+                Contour.bMirrorSvgX = bMirrorSvgX;
                 if (RX > 0.0 && RY > 0.0)
                 {
                     Contour.BeginAt(FVector2D(X + RX, Y));
@@ -623,6 +632,7 @@ namespace
                 FContour Contour;
                 Contour.Name = Name;
                 Contour.Transform = Transform;
+                Contour.bMirrorSvgX = bMirrorSvgX;
                 Contour.BeginAt(FVector2D(CX + RX, CY));
                 Arc(Contour, RX, RY, 0.0, false, true, FVector2D(CX, CY + RY));
                 Arc(Contour, RX, RY, 0.0, false, true, FVector2D(CX - RX, CY));
@@ -635,13 +645,14 @@ namespace
         for (const FXmlNode* Child : Node->GetChildrenNodes())
         {
             ReadElements(Child, Transform, Ids, ActiveReferences,
-                         Out, Ordinal, bReferenced, Depth + 1);
+                         Out, Ordinal, bMirrorSvgX, bReferenced, Depth + 1);
         }
     }
 
 }
 
-bool SplineAssetImport::LoadSvgCurves(const FString& Filename, TArray<FSplineImportedCurve>& Curves)
+bool SplineAssetImport::LoadSvgCurves(const FString& Filename, TArray<FSplineImportedCurve>& Curves,
+    bool bMirrorX)
 {
     if (IFileManager::Get().FileSize(*Filename) > 20 * 1024 * 1024)
     {
@@ -663,7 +674,51 @@ bool SplineAssetImport::LoadSvgCurves(const FString& Filename, TArray<FSplineImp
     TMap<FString, const FXmlNode*> Ids;
     IndexIds(Document.GetRootNode(), Ids);
     TSet<const FXmlNode*> ActiveReferences;
-    ReadElements(Document.GetRootNode(), FAffine(), Ids, ActiveReferences, Curves, Ordinal);
+    ReadElements(Document.GetRootNode(), FAffine(), Ids, ActiveReferences, Curves, Ordinal, bMirrorX);
+    // All subpaths from the same SVG share the SOURCE canvas origin. Never
+    // normalize each contour separately or their original layout is lost.
+    // viewBox values are SVG document coordinates BEFORE Unreal axis conversion.
+    const FXmlNode* Root = Document.GetRootNode();
+    FString BoundsString = Root->GetAttribute(TEXT("viewBox"));
+    BoundsString.ReplaceInline(TEXT(","), TEXT(" "));
+    TArray<FString> Values;
+    BoundsString.ParseIntoArrayWS(Values);
+    double MinX = 0.0, MinY = 0.0, Width = 0.0, Height = 0.0;
+    if (Values.Num() == 4)
+    {
+        MinX = FCString::Atod(*Values[0]);
+        MinY = FCString::Atod(*Values[1]);
+        Width = FCString::Atod(*Values[2]);
+        Height = FCString::Atod(*Values[3]);
+    }
+    else
+    {
+        // The width/height attributes can include units; Atod reads their
+        // numeric prefix. This fallback is appropriate for untransformed SVGs.
+        Width = FCString::Atod(*Root->GetAttribute(TEXT("width")));
+        Height = FCString::Atod(*Root->GetAttribute(TEXT("height")));
+    }
+    if (Width > 0.0 && Height > 0.0)
+    {
+        const EStrandSvgCanvasOrigin Origin = GetDefault<UStrandProjectSettings>()->SvgCanvasOrigin;
+        const double FX = (Origin == EStrandSvgCanvasOrigin::TopRight || Origin == EStrandSvgCanvasOrigin::BottomRight)
+            ? 1.0 : (Origin == EStrandSvgCanvasOrigin::Center ? 0.5 : 0.0);
+        const double FY = (Origin == EStrandSvgCanvasOrigin::BottomLeft || Origin == EStrandSvgCanvasOrigin::BottomRight)
+            ? 1.0 : (Origin == EStrandSvgCanvasOrigin::Center ? 0.5 : 0.0);
+        const FVector OriginInUnreal(bMirrorX ? -(MinX + Width * FX) : MinX + Width * FX,
+                                    -(MinY + Height * FY), 0.0);
+        for (FSplineImportedCurve& Curve : Curves)
+        {
+            for (FSplinePointData& Point : Curve.Points)
+            {
+                Point.LocalPosition -= OriginInUnreal;
+            }
+        }
+    }
+    else
+    {
+        UE_LOG(LogSplineSvg, Warning, TEXT("SVG has no usable canvas bounds; Strand canvas origin remains the SVG coordinate origin: %s"), *Filename);
+    }
     int32 ClosedCount = 0;
     for (const FSplineImportedCurve& Curve : Curves)
     {

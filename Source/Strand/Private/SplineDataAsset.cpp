@@ -78,6 +78,10 @@ void USplineDataAsset::ApplyToSplineComponentWithPlacement(USplineComponent* Com
         Component->bAllowDiscontinuousSpline = true;
     }
 #endif
+    // Reset any previous loop override before replacing spline keys. This is
+    // especially important for a component reused after a different path shape
+    // or an explicit SetClosedLoopAtPosition() with unrelated input keys.
+    Component->SetClosedLoop(false, false);
     Component->ClearSplinePoints(false);
     for (int32 Index = 0; Index < Points.Num(); ++Index)
     {

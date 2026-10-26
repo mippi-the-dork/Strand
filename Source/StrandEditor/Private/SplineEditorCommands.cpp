@@ -25,6 +25,12 @@
 #include "IDesktopPlatform.h"
 #include "Framework/Application/SlateApplication.h"
 #include "Misc/Paths.h"
+#include "Widgets/SWindow.h"
+#include "Widgets/SBoxPanel.h"
+#include "Widgets/Layout/SBox.h"
+#include "Widgets/Text/STextBlock.h"
+#include "Widgets/Input/SCheckBox.h"
+#include "Widgets/Input/SButton.h"
 
 #define LOCTEXT_NAMESPACE "SplineAssetEditorCommands"
 
@@ -38,6 +44,44 @@ namespace
     {
         FMessageDialog::Open(EAppMsgType::Ok, FText::FromString(Detail));
     }
+    // Intentionally process-local: no ini/config persistence across editor sessions.
+    bool bSuppressPlacementDiscardPromptThisSession = false;
+
+    bool ConfirmPlacementDiscard()
+    {
+        if (bSuppressPlacementDiscardPromptThisSession) { return true; }
+        bool bAccepted = false;
+        bool bDontShowAgain = false;
+        TSharedRef<SWindow> Dialog = SNew(SWindow)
+            .Title(LOCTEXT("PlacementDiscardTitle", "Strand Placement"))
+            .SizingRule(ESizingRule::Autosized)
+            .SupportsMinimize(false).SupportsMaximize(false);
+        Dialog->SetContent(
+            SNew(SBox).WidthOverride(440).Padding(18)
+            [
+                SNew(SVerticalBox)
+                + SVerticalBox::Slot().AutoHeight().Padding(0,0,0,14)
+                [SNew(STextBlock).AutoWrapText(true).Text(LOCTEXT("PlacementDiscardQuestion",
+                    "Changing Strand placement will replace unsaved local spline edits with the asset's points. Continue?"))]
+                + SVerticalBox::Slot().AutoHeight().Padding(0,0,0,16)
+                [ SNew(SCheckBox)
+                    .OnCheckStateChanged_Lambda([&bDontShowAgain](ECheckBoxState State) { bDontShowAgain = State == ECheckBoxState::Checked; })
+                    [SNew(STextBlock).Text(LOCTEXT("SkipPlacementPrompt", "Don't show this again during this session"))] ]
+                + SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Right)
+                [SNew(SHorizontalBox)
+                    + SHorizontalBox::Slot().AutoWidth().Padding(0,0,8,0)
+                    [SNew(SButton).Text(LOCTEXT("CancelPlacement", "Cancel"))
+                        .OnClicked_Lambda([Dialog]() { Dialog->RequestDestroyWindow(); return FReply::Handled(); })]
+                    + SHorizontalBox::Slot().AutoWidth()
+                    [SNew(SButton).Text(LOCTEXT("AcceptPlacement", "Continue"))
+                        .OnClicked_Lambda([Dialog, &bAccepted]() { bAccepted = true; Dialog->RequestDestroyWindow(); return FReply::Handled(); })]
+                ]
+            ]);
+        FSlateApplication::Get().AddModalWindow(Dialog, FSlateApplication::Get().GetActiveTopLevelWindow());
+        if (bAccepted && bDontShowAgain) { bSuppressPlacementDiscardPromptThisSession = true; }
+        return bAccepted;
+    }
+
     bool MatchesPlacement(const USplineDataAsset* Asset, const USplineComponent* Spline)
     {
         if (!IsValid(Asset) || !IsValid(Spline)) { return false; }
@@ -75,7 +119,7 @@ namespace
     }
 }
 
-void SplineEditorCommands::ImportCurves(bool bAlembic, bool bLegacyFbx)
+void SplineEditorCommands::ImportCurves(bool bAlembic)
 {
     IDesktopPlatform* Desktop = FDesktopPlatformModule::Get();
     if (!Desktop) { Message(TEXT("Desktop file dialogs are unavailable.")); return; }
@@ -83,9 +127,9 @@ void SplineEditorCommands::ImportCurves(bool bAlembic, bool bLegacyFbx)
     int32 Filter = 0;
     const bool bChosen = Desktop->OpenFileDialog(
         FSlateApplication::Get().FindBestParentWindowHandleForDialogs(nullptr),
-        bLegacyFbx ? TEXT("Import Legacy FBX Curves into Strand") : (bAlembic ? TEXT("Import Alembic Curves into Strand") : TEXT("Import SVG Curves into Strand")),
+        bAlembic ? TEXT("Import Alembic Curves into Strand") : TEXT("Import SVG Curves into Strand"),
         FPaths::ProjectContentDir(), TEXT(""),
-        bLegacyFbx ? TEXT("Legacy FBX Curves (*.fbx)|*.fbx") : (bAlembic ? TEXT("Alembic Curves (*.abc)|*.abc") : TEXT("SVG Vectors (*.svg)|*.svg")),
+        bAlembic ? TEXT("Alembic Curves (*.abc)|*.abc") : TEXT("SVG Vectors (*.svg)|*.svg"),
         EFileDialogFlags::Multiple, Filenames, Filter);
     if (!bChosen || Filenames.IsEmpty()) { return; }
 
@@ -95,9 +139,8 @@ void SplineEditorCommands::ImportCurves(bool bAlembic, bool bLegacyFbx)
     Browser.GetSelectedFolders(Folders);
     const FString Destination = Folders.Num() == 1 && Folders[0].StartsWith(TEXT("/Game"))
         ? Folders[0] : TEXT("/Game");
-    UFactory* Factory = bLegacyFbx ? static_cast<UFactory*>(NewObject<USplineFbxFactory>()) :
-        (bAlembic ? static_cast<UFactory*>(NewObject<UStrandAlembicFactory>())
-                  : static_cast<UFactory*>(NewObject<USplineSvgFactory>()));
+    UFactory* Factory = bAlembic ? static_cast<UFactory*>(NewObject<UStrandAlembicFactory>())
+                                : static_cast<UFactory*>(NewObject<USplineSvgFactory>());
     const TArray<UObject*> Imported = FAssetToolsModule::GetModule().Get().ImportAssets(
         Filenames, Destination, Factory, true, nullptr, false, false);
     if (Imported.IsEmpty())
@@ -127,6 +170,109 @@ USplineComponent* SplineEditorCommands::FindUnambiguousSpline(AActor* Actor)
     if (Components.Num() == 1) { return Components[0]; }
     // Never guess which spline to change on actors containing multiple components.
     return nullptr;
+}
+
+TArray<USplineDataAsset*> SplineEditorCommands::SelectedSplineAssets()
+{
+    TArray<FAssetData> Selected;
+    FModuleManager::LoadModuleChecked<FContentBrowserModule>("ContentBrowser").Get().GetSelectedAssets(Selected);
+    TArray<USplineDataAsset*> Assets;
+    for (const FAssetData& Data : Selected)
+    {
+        if (Data.AssetClassPath != USplineDataAsset::StaticClass()->GetClassPathName()) { continue; }
+        if (USplineDataAsset* Asset = Cast<USplineDataAsset>(Data.GetAsset())) { Assets.AddUnique(Asset); }
+    }
+    return Assets;
+}
+
+void SplineEditorCommands::AddSplineComponentsAndAssign(const TArray<USplineDataAsset*>& Assets)
+{
+    const TArray<AActor*> Actors = SelectedActors();
+    if (Actors.IsEmpty() || Assets.IsEmpty())
+    {
+        Message(TEXT("Select one or more actors and one or more Strand Spline assets.")); return;
+    }
+    if (Actors.Num() * Assets.Num() > 256)
+    {
+        Message(TEXT("This operation is limited to 256 new spline components at once.")); return;
+    }
+    const FString Description = FString::Printf(TEXT("Add %d native spline component(s) to each of %d selected actor(s), assigning the chosen Strand assets?"), Assets.Num(), Actors.Num());
+    if (!Confirm(FText::FromString(Description))) { return; }
+    const FScopedTransaction Transaction(LOCTEXT("AddAndAssign", "Add Native Splines and Assign Strand Assets"));
+    int32 Added = 0;
+    for (AActor* Actor : Actors)
+    {
+        if (!IsValid(Actor) || Actor->IsTemplate()) { continue; }
+        Actor->Modify();
+        for (USplineDataAsset* Asset : Assets)
+        {
+            if (!IsValid(Asset)) { continue; }
+            if (USplineComponent* Component = StrandPlacement::AddNativeSpline(Actor))
+            {
+                Asset->ApplyToSplineComponentWithPlacement(Component, Asset->DefaultCoordinateMode,
+                    Asset->DefaultAnchorMode, Asset->DefaultAnchorPointIndex);
+                UStrandSplineUserData::AssignAsset(Component, Asset);
+                StrandSplineRefresh::NotifySplineChanged(Component);
+                ++Added;
+            }
+        }
+        Actor->MarkPackageDirty();
+    }
+    if (GEditor) { GEditor->RedrawAllViewports(); }
+    UE_LOG(LogTemp, Display, TEXT("Strand added %d native spline components and assigned assets."), Added);
+}
+
+void SplineEditorCommands::CreateMultiActorFromAssets(const TArray<USplineDataAsset*>& Assets)
+{
+    FString Error;
+    if (!StrandPlacement::CreateMultiSplineActor(Assets, Error)) { Message(Error); }
+}
+
+void SplineEditorCommands::ApplyPlacementToComponents(const TArray<TWeakObjectPtr<USplineComponent>>& Splines,
+    EStrandCoordinateMode Mode, EStrandAnchorMode AnchorMode, int32 AnchorPointIndex)
+{
+    if (Splines.IsEmpty()) { return; }
+    // Ask once for the whole operation. Only components with an assigned asset are processed.
+    bool bDiscarding = false;
+    for (const TWeakObjectPtr<USplineComponent>& Weak : Splines)
+    {
+        const UStrandSplineUserData* Data = UStrandSplineUserData::Get(Weak.Get());
+        bDiscarding |= Data && IsValid(Data->AssignedSplineAsset) && !Data->IsInSync(Weak.Get());
+    }
+    if (bDiscarding && !ConfirmPlacementDiscard()) { return; }
+    const FScopedTransaction Transaction(LOCTEXT("BatchPlacement", "Change Strand Placement on Selected Splines"));
+    for (const TWeakObjectPtr<USplineComponent>& Weak : Splines)
+    {
+        USplineComponent* Component = Weak.Get();
+        UStrandSplineUserData* Data = UStrandSplineUserData::Get(Component);
+        if (!Data || !IsValid(Data->AssignedSplineAsset)) { continue; }
+        Component->Modify();
+        Data->Modify();
+        if (AActor* Owner = Component->GetOwner()) { Owner->Modify(); }
+        Data->CoordinateMode = Mode;
+        Data->AnchorMode = AnchorMode;
+        Data->AnchorPointIndex = FMath::Clamp(AnchorPointIndex, 0, FMath::Max(0, Data->AssignedSplineAsset->Points.Num() - 1));
+        Data->AssignedSplineAsset->ApplyToSplineComponentWithPlacement(Component, Mode, AnchorMode, Data->AnchorPointIndex);
+        StrandSplineRefresh::NotifySplineChanged(Component);
+    }
+}
+
+void SplineEditorCommands::AssignAssetToComponents(const TArray<TWeakObjectPtr<USplineComponent>>& Splines, USplineDataAsset* Asset)
+{
+    if (!IsValid(Asset) || Splines.IsEmpty()) { return; }
+    if (!Confirm(FText::Format(LOCTEXT("BatchAssignConfirm", "Assign and apply {0} to {1} selected spline components? Existing local points will be replaced."),
+            FText::FromString(Asset->GetName()), FText::AsNumber(Splines.Num())))) { return; }
+    const FScopedTransaction Transaction(LOCTEXT("BatchAssign", "Assign Strand Asset to Selected Splines"));
+    for (const TWeakObjectPtr<USplineComponent>& Weak : Splines)
+    {
+        USplineComponent* Component = Weak.Get();
+        if (!IsValid(Component)) { continue; }
+        if (AActor* Owner = Component->GetOwner()) { Owner->Modify(); }
+        UStrandSplineUserData::AssignAsset(Component, Asset);
+        Asset->ApplyToSplineComponentWithPlacement(Component, Asset->DefaultCoordinateMode,
+            Asset->DefaultAnchorMode, Asset->DefaultAnchorPointIndex);
+        StrandSplineRefresh::NotifySplineChanged(Component);
+    }
 }
 
 void SplineEditorCommands::CompareComponent(USplineComponent* Spline)
@@ -344,8 +490,7 @@ void SplineEditorCommands::SetComponentPlacement(USplineComponent* Spline,
     if (Placement->CoordinateMode == Mode && Placement->AnchorMode == AnchorMode &&
         Placement->AnchorPointIndex == SafeIndex) { return; }
 
-    if (!Placement->IsInSync(Spline) && !Confirm(LOCTEXT("PlacementDiscard",
-        "Changing Strand placement will replace unsaved local spline edits with the asset's points. Continue?")))
+    if (!Placement->IsInSync(Spline) && !ConfirmPlacementDiscard())
     {
         return;
     }

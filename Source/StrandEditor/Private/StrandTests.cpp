@@ -1,3 +1,6 @@
+#include "StrandProjectSettings.h"
+#include "Misc/FileHelper.h"
+#include "HAL/FileManager.h"
 #if WITH_DEV_AUTOMATION_TESTS
 #include "Misc/AutomationTest.h"
 #include "SplineDataAsset.h"
@@ -182,7 +185,7 @@ bool FStrandSvgGeometryTest::RunTest(const FString& Parameters)
     // The <use> of a rounded rect is the first visible geometry.
     TestTrue(TEXT("Referenced rounded rect forms a closed loop"), Curves[0].bClosedLoop);
     TestTrue(TEXT("Rounded rect retains multiple corner tangent pairs"), Curves[0].Points.Num() >= 8);
-    TestTrue(TEXT("<use> translation is applied"), Curves[0].Points[0].LocalPosition.X > 40.0);
+    TestTrue(TEXT("<use> translation is applied with SVG X mirror"), Curves[0].Points[0].LocalPosition.X < -40.0);
 
     const FSplineImportedCurve& Mixed = Curves[1];
     TestTrue(TEXT("Implicit Z makes a closed loop"), Mixed.bClosedLoop);
@@ -190,10 +193,10 @@ bool FStrandSvgGeometryTest::RunTest(const FString& Parameters)
     if (Mixed.Points.Num() == 3)
     {
         TestTrue(TEXT("Straight segment has exact chord derivative"),
-            Mixed.Points[0].LeaveTangent.Equals(FVector(100, 0, 0), 0.0001));
+            Mixed.Points[0].LeaveTangent.Equals(FVector(-100, 0, 0), 0.0001));
         TestTrue(TEXT("Incoming and outgoing handles are independent at mixed corner"),
-            Mixed.Points[1].ArriveTangent.Equals(FVector(100, 0, 0), 0.0001) &&
-            Mixed.Points[1].LeaveTangent.Equals(FVector(90, 0, 0), 0.0001));
+            Mixed.Points[1].ArriveTangent.Equals(FVector(-100, 0, 0), 0.0001) &&
+            Mixed.Points[1].LeaveTangent.Equals(FVector(-90, 0, 0), 0.0001));
         const FVector ClosingChord = Mixed.Points[0].LocalPosition - Mixed.Points.Last().LocalPosition;
         TestTrue(TEXT("Implicit closing edge has exact start/end derivatives"),
             Mixed.Points.Last().LeaveTangent.Equals(ClosingChord, 0.0001) &&
@@ -240,7 +243,8 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStrandSvgWrappedAttributeTest,
 bool FStrandSvgWrappedAttributeTest::RunTest(const FString& Parameters)
 {
     const FString Xml =
-        TEXT("<?xml version=\"1.0\"?><svg xmlns=\"http://www.w3.org/2000/svg\">")
+        TEXT("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n")
+        TEXT("<svg xmlns=\"http://www.w3.org/2000/svg\">\n")
         TEXT("<path id=\"wrapped\" d=\"M 0 0 C 10 0 10 10 0 10\r\n")
         TEXT(" C -10 10 -10 0 0 0\t Z\"/>")
         TEXT("<path id=\"open\" d=\"M 0 0 L 10 0\n L 10 10\"/>")
@@ -304,8 +308,40 @@ bool FStrandIllustratorLogoTest::RunTest(const FString& Parameters)
             Component->IsClosedLoop(), ExpectedClosed[Index]);
         TestEqual(FString::Printf(TEXT("Contour %d point count"), Index),
             Component->GetNumberOfSplinePoints(), Curve.Points.Num());
-        TestTrue(FString::Printf(TEXT("Contour %d source/native geometry exact"), Index),
-            Asset->MatchesSplineComponent(Component, 0.001f));
+        const bool bExact = Asset->MatchesSplineComponent(Component, 0.001f);
+        if (!bExact)
+        {
+            // Keep this strict, even when the analytic curve matches. Print the
+            // first differing field so the engine's representation can be
+            // diagnosed without weakening point/tangent/rotation/scale tests.
+            for (int32 PointIndex = 0; PointIndex < Curve.Points.Num(); ++PointIndex)
+            {
+                const FSplinePoint Actual = Component->GetSplinePointAt(
+                    PointIndex, ESplineCoordinateSpace::Local);
+                const FSplinePointData& Wanted = Curve.Points[PointIndex];
+                const bool bPosition = Actual.Position.Equals(Wanted.LocalPosition, 0.001);
+                const bool bArrive = Actual.ArriveTangent.Equals(Wanted.ArriveTangent, 0.001);
+                const bool bLeave = Actual.LeaveTangent.Equals(Wanted.LeaveTangent, 0.001);
+                const bool bRotation = Actual.Rotation.Equals(Wanted.LocalRotation, 0.001);
+                const bool bScale = Actual.Scale.Equals(Wanted.LocalScale, 0.001);
+                const bool bType = Component->GetSplinePointType(PointIndex) == Wanted.PointType.GetValue();
+                if (!(bPosition && bArrive && bLeave && bRotation && bScale && bType))
+                {
+                    AddWarning(FString::Printf(
+                        TEXT("Contour %d point %d: Position=%d (delta=%.8g), Arrive=%d (delta=%.8g), ")
+                        TEXT("Leave=%d (delta=%.8g), Rotation=%d, Scale=%d (delta=%.8g), Type=%d (native=%d asset=%d)."),
+                        Index, PointIndex, bPosition ? 1 : 0,
+                        (Actual.Position - Wanted.LocalPosition).Size(), bArrive ? 1 : 0,
+                        (Actual.ArriveTangent - Wanted.ArriveTangent).Size(), bLeave ? 1 : 0,
+                        (Actual.LeaveTangent - Wanted.LeaveTangent).Size(), bRotation ? 1 : 0,
+                        bScale ? 1 : 0, (Actual.Scale - Wanted.LocalScale).Size(), bType ? 1 : 0,
+                        static_cast<int32>(Component->GetSplinePointType(PointIndex)),
+                        static_cast<int32>(Wanted.PointType.GetValue())));
+                    break;
+                }
+            }
+        }
+        TestTrue(FString::Printf(TEXT("Contour %d source/native point data exact"), Index), bExact);
 #if WITH_EDITORONLY_DATA
         // Both Illustrator squares contain hard corners with split handles.
         if (Index == 1 || Index == 2)
@@ -381,8 +417,8 @@ bool FStrandIllustratorAnalyticGeometryTest::RunTest(const FString& Parameters)
 
         const auto SvgPoint = [&Cells](int32 Offset) -> FVector
         {
-            // Strand intentionally maps SVG +Y (down) to Unreal -Y (up).
-            return FVector(FCString::Atod(*Cells[Offset]), -FCString::Atod(*Cells[Offset + 1]), 0.0);
+            // Default Strand SVG reorientation maps (-X, -Y) on XY.
+            return FVector(-FCString::Atod(*Cells[Offset]), -FCString::Atod(*Cells[Offset + 1]), 0.0);
         };
         FReferenceSegment& Segment = Expected[ContourIndex].AddDefaulted_GetRef();
         Segment.P0 = SvgPoint(2);
@@ -464,6 +500,309 @@ bool FStrandIllustratorAnalyticGeometryTest::RunTest(const FString& Parameters)
                 PlacedMidpoint.Equals(ExpectedMidpoint, 0.005));
         }
     }
+    return true;
+}
+#endif
+
+// Regression for viewport left-to-right reading order, using the original
+// Illustrator Digit icon supplied by the author. Its three glyph paths are
+// ordered 1, 2, 3 from left to right in the SVG source.
+#if WITH_DEV_AUTOMATION_TESTS
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStrandSvgOrientationTest,
+    "Strand.Editor.Svg.DigitIconOrientation",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FStrandSvgOrientationTest::RunTest(const FString& Parameters)
+{
+    const TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(TEXT("Strand"));
+    if (!TestTrue(TEXT("Strand plugin found"), Plugin.IsValid())) { return false; }
+    const FString Fixture = FPaths::Combine(Plugin->GetBaseDir(),
+        TEXT("Tests/Fixtures/Strand_Digit_Icon.svg"));
+    TArray<FSplineImportedCurve> Mirrored;
+    TArray<FSplineImportedCurve> Legacy;
+    if (!TestTrue(TEXT("Import Digit SVG using default top-view orientation"),
+            SplineAssetImport::LoadSvgCurves(Fixture, Mirrored, true)) ||
+        !TestTrue(TEXT("Import Digit SVG using legacy orientation"),
+            SplineAssetImport::LoadSvgCurves(Fixture, Legacy, false)) ||
+        !TestEqual(TEXT("Digit icon has five independent contours"), Mirrored.Num(), 5) ||
+        !TestEqual(TEXT("Legacy orientation contains matching contour count"),
+            Legacy.Num(), Mirrored.Num()))
+    {
+        return false;
+    }
+    const auto MeanX = [](const FSplineImportedCurve& Curve) -> double
+    {
+        double X = 0.0;
+        for (const FSplinePointData& Pt : Curve.Points) { X += Pt.LocalPosition.X; }
+        return Curve.Points.IsEmpty() ? 0.0 : X / Curve.Points.Num();
+    };
+    // Digit glyphs are paths 2..4; positive SVG X places 1 left of 2 left of 3.
+    TestTrue(TEXT("Legacy imports glyphs with increasing X"),
+        MeanX(Legacy[2]) < MeanX(Legacy[3]) && MeanX(Legacy[3]) < MeanX(Legacy[4]));
+    TestTrue(TEXT("Default native orientation mirrors glyph X"),
+        MeanX(Mirrored[2]) > MeanX(Mirrored[3]) && MeanX(Mirrored[3]) > MeanX(Mirrored[4]));
+    for (int32 I = 0; I < Mirrored.Num(); ++I)
+    {
+        if (!TestEqual(FString::Printf(TEXT("Contour %d point count"), I),
+                Mirrored[I].Points.Num(), Legacy[I].Points.Num())) { return false; }
+        TestEqual(FString::Printf(TEXT("Contour %d closure unchanged"), I),
+            Mirrored[I].bClosedLoop, Legacy[I].bClosedLoop);
+        for (int32 P = 0; P < Mirrored[I].Points.Num(); ++P)
+        {
+            const FSplinePointData& A = Mirrored[I].Points[P];
+            const FSplinePointData& B = Legacy[I].Points[P];
+            TestTrue(TEXT("X mirror preserves local positions with sign reversal"),
+                FMath::IsNearlyEqual(A.LocalPosition.X, -B.LocalPosition.X, 0.0001));
+            TestTrue(TEXT("X mirror leaves Y/Z unchanged"),
+                FMath::IsNearlyEqual(A.LocalPosition.Y, B.LocalPosition.Y, 0.0001) &&
+                FMath::IsNearlyEqual(A.LocalPosition.Z, B.LocalPosition.Z, 0.0001));
+            TestTrue(TEXT("X mirror reflects incoming and outgoing handles"),
+                FMath::IsNearlyEqual(A.ArriveTangent.X, -B.ArriveTangent.X, 0.0001) &&
+                FMath::IsNearlyEqual(A.LeaveTangent.X, -B.LeaveTangent.X, 0.0001) &&
+                FMath::IsNearlyEqual(A.ArriveTangent.Y, B.ArriveTangent.Y, 0.0001) &&
+                FMath::IsNearlyEqual(A.LeaveTangent.Y, B.LeaveTangent.Y, 0.0001));
+        }
+    }
+    return true;
+}
+#endif
+
+#if WITH_DEV_AUTOMATION_TESTS
+// The five project-level SVG origins must move all subpaths within the same
+// source canvas by the same translation, while preserving their geometry.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStrandSvgCanvasOriginTest,
+    "Strand.Editor.Svg.ProjectCanvasOrigin",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FStrandSvgCanvasOriginTest::RunTest(const FString& Parameters)
+{
+    const FString File = FPaths::Combine(FPaths::ProjectIntermediateDir(), TEXT("StrandTests"), TEXT("CanvasOrigin.svg"));
+    IFileManager::Get().MakeDirectory(*FPaths::GetPath(File), true);
+    if (!FFileHelper::SaveStringToFile(TEXT("<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 100 50\"><path d=\"M0 0 L100 50\" /></svg>"), *File))
+    { AddError(TEXT("Unable to write temporary SVG origin test fixture.")); return false; }
+    UStrandProjectSettings* Settings = GetMutableDefault<UStrandProjectSettings>();
+    const EStrandSvgCanvasOrigin Before = Settings->SvgCanvasOrigin;
+    struct FCase { EStrandSvgCanvasOrigin Origin; FVector First; FVector Last; };
+    const FCase Cases[] = {
+        {EStrandSvgCanvasOrigin::TopLeft, FVector(0,0,0), FVector(-100,-50,0)},
+        {EStrandSvgCanvasOrigin::TopRight, FVector(100,0,0), FVector(0,-50,0)},
+        {EStrandSvgCanvasOrigin::BottomLeft, FVector(0,50,0), FVector(-100,0,0)},
+        {EStrandSvgCanvasOrigin::BottomRight, FVector(100,50,0), FVector(0,0,0)},
+        {EStrandSvgCanvasOrigin::Center, FVector(50,25,0), FVector(-50,-25,0)}
+    };
+    for (const FCase& Case : Cases)
+    {
+        Settings->SvgCanvasOrigin = Case.Origin;
+        TArray<FSplineImportedCurve> Curves;
+        const bool bLoaded = SplineAssetImport::LoadSvgCurves(File, Curves, true);
+        TestTrue(TEXT("SVG load with custom canvas origin"), bLoaded);
+        if (bLoaded && Curves.Num() == 1 && Curves[0].Points.Num() == 2)
+        {
+            TestTrue(TEXT("First point uses source canvas origin"), Curves[0].Points[0].LocalPosition.Equals(Case.First, 0.001));
+            TestTrue(TEXT("Second point uses source canvas origin"), Curves[0].Points[1].LocalPosition.Equals(Case.Last, 0.001));
+        }
+        else { AddError(TEXT("Origin test: expected one two-point curve.")); }
+    }
+    Settings->SvgCanvasOrigin = Before;
+    IFileManager::Get().Delete(*File);
+    return true;
+}
+#endif
+
+#if WITH_DEV_AUTOMATION_TESTS
+#include "SplineDataAssetFactory.h"
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStrandAlembicFactoryRoutingTest,
+    "Strand.Editor.Import.AlembicFactoryRouting",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FStrandAlembicFactoryRoutingTest::RunTest(const FString& Parameters)
+{
+    UStrandAlembicImportRouterFactory* Router = NewObject<UStrandAlembicImportRouterFactory>();
+    UStrandAlembicFactory* Direct = NewObject<UStrandAlembicFactory>();
+    TestNotNull(TEXT("Interactive Alembic router factory exists"), Router);
+    TestNotNull(TEXT("Explicit Strand Alembic factory exists"), Direct);
+    if (!Router || !Direct) { return false; }
+    // The automation runner can mark factories as non-interactive. Testing
+    // FactoryCanImport("Curve.abc") against an unconditional 'true' would then
+    // reject the exact safeguard we need for unattended asset imports.
+    TestTrue(TEXT("Interactive router recognizes Alembic"),
+        UStrandAlembicImportRouterFactory::ShouldRouteAlembic(TEXT("Curve.abc"), false));
+    TestTrue(TEXT("Interactive router recognizes uppercase Alembic extension"),
+        UStrandAlembicImportRouterFactory::ShouldRouteAlembic(TEXT("Curve.ABC"), false));
+    TestFalse(TEXT("Automated import bypasses interactive Alembic chooser"),
+        UStrandAlembicImportRouterFactory::ShouldRouteAlembic(TEXT("Curve.abc"), true));
+    TestFalse(TEXT("Router does not intercept FBX"),
+        UStrandAlembicImportRouterFactory::ShouldRouteAlembic(TEXT("Curve.fbx"), false));
+    TestFalse(TEXT("Router does not intercept SVG"),
+        UStrandAlembicImportRouterFactory::ShouldRouteAlembic(TEXT("Curve.svg"), false));
+    TestFalse(TEXT("Router does not intercept another extension after .abc"),
+        UStrandAlembicImportRouterFactory::ShouldRouteAlembic(TEXT("Curve.abc.bak"), false));
+
+    const bool bAutomatedImport = Router->IsAutomatedImport();
+    AddInfo(FString::Printf(TEXT("Alembic router test environment: %s"),
+        bAutomatedImport ? TEXT("automated import") : TEXT("interactive import")));
+    TestEqual(TEXT("Live router respects its current import context"),
+        Router->FactoryCanImport(TEXT("Curve.abc")), !bAutomatedImport);
+    TestFalse(TEXT("Live router rejects FBX"), Router->FactoryCanImport(TEXT("Curve.fbx")));
+    TestTrue(TEXT("Direct Strand importer accepts Alembic"), Direct->FactoryCanImport(TEXT("Curve.abc")));
+    TestTrue(TEXT("Router has priority over explicit curve factory"), Router->ImportPriority > Direct->ImportPriority);
+    return true;
+}
+#endif
+
+#if WITH_DEV_AUTOMATION_TESTS
+#include "StrandDropLogic.h"
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStrandMultiAssetDropEligibilityTest,
+    "Strand.Editor.Placement.MultiAssetDropEligibility",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FStrandMultiAssetDropEligibilityTest::RunTest(const FString& Parameters)
+{
+    USplineDataAsset* A = NewObject<USplineDataAsset>(GetTransientPackage());
+    USplineDataAsset* B = NewObject<USplineDataAsset>(GetTransientPackage());
+    UObject* Unrelated = NewObject<UObject>(GetTransientPackage());
+
+    TArray<UObject*> Assets;
+    Assets.Add(A);
+    TestFalse(TEXT("One Strand asset cannot trigger a multi-spline dialog"),
+        StrandDropLogic::HasMultipleDistinctStrandAssets(Assets));
+    Assets.Add(A);
+    TestFalse(TEXT("Repeated previews of the same asset never trigger grouping"),
+        StrandDropLogic::HasMultipleDistinctStrandAssets(Assets));
+    Assets.Add(B);
+    TestTrue(TEXT("A completed drop with two distinct Strand assets can offer grouping"),
+        StrandDropLogic::HasMultipleDistinctStrandAssets(Assets));
+    Assets.Add(Unrelated);
+    TestFalse(TEXT("Mixed types must use normal editor placement"),
+        StrandDropLogic::HasMultipleDistinctStrandAssets(Assets));
+    return true;
+}
+#endif
+
+#if WITH_DEV_AUTOMATION_TESTS
+#include "Interfaces/IPluginManager.h"
+#include "SplineImportHelpers.h"
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStrandBlenderNurbsMissingKnotsTest,
+    "Strand.Editor.Alembic.BlenderPeriodicNurbsWithoutKnots",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FStrandBlenderNurbsMissingKnotsTest::RunTest(const FString& Parameters)
+{
+    const TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(TEXT("Strand"));
+    if (!TestTrue(TEXT("Strand plugin is installed"), Plugin.IsValid())) { return false; }
+    const FString Filename = FPaths::Combine(Plugin->GetBaseDir(),
+        TEXT("Tests/Fixtures/Alembic/Blender_5.2.3_BezierAndPeriodicNurbs.abc"));
+    if (!TestTrue(TEXT("Blender Alembic regression fixture is packaged"), FPaths::FileExists(Filename)))
+    { return false; }
+    TArray<FSplineImportedCurve> Curves;
+    if (!TestTrue(TEXT("Blender Bézier and knotless periodic NURBS both import"),
+        SplineAssetImport::LoadAlembicCurves(Filename, nullptr, Curves)))
+    { return false; }
+    TestEqual(TEXT("Both Blender curve objects are represented"), Curves.Num(), 2);
+    bool bFoundBezier = false;
+    bool bFoundNurbs = false;
+    for (const FSplineImportedCurve& Curve : Curves)
+    {
+        if (Curve.SourceId.Contains(TEXT("NurbsCircle")))
+        {
+            bFoundNurbs = true;
+            TestTrue(TEXT("Periodic NURBS is closed"), Curve.bClosedLoop);
+            TestTrue(TEXT("Periodic NURBS yields editable samples"), Curve.Points.Num() >= 8);
+        }
+        else
+        {
+            bFoundBezier = true;
+            TestTrue(TEXT("Blender Bézier source has native spline anchors"), Curve.Points.Num() >= 2);
+        }
+        USplineDataAsset* Asset = NewObject<USplineDataAsset>(GetTransientPackage());
+        Asset->Points = Curve.Points;
+        Asset->bIsClosedLoop = Curve.bClosedLoop;
+        USplineComponent* Preview = NewObject<USplineComponent>(GetTransientPackage());
+        Asset->ApplyToSplineComponent(Preview);
+        TestTrue(TEXT("Curve can be evaluated by a native spline component"),
+            Preview->GetSplineLength() > 0.0f);
+    }
+    TestTrue(TEXT("NURBS exists in output"), bFoundNurbs);
+    TestTrue(TEXT("Bézier exists in output"), bFoundBezier);
+    return true;
+}
+#endif
+
+#if WITH_DEV_AUTOMATION_TESTS
+#include "StrandSplineExport.h"
+#include "Misc/Paths.h"
+#include "Misc/FileHelper.h"
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStrandSplineAuthoringExportTest,
+    "Strand.Editor.Export.SvgAndAlembicRoundTrip",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FStrandSplineAuthoringExportTest::RunTest(const FString& Parameters)
+{
+    USplineDataAsset* Asset = NewObject<USplineDataAsset>(GetTransientPackage());
+    FSplinePointData A, B, C;
+    A.LocalPosition = FVector::ZeroVector;
+    A.LeaveTangent = FVector(100, 40, 0);
+    A.ArriveTangent = FVector(100, 0, 0);
+    A.PointType = ESplinePointType::CurveCustomTangent;
+    B.LocalPosition = FVector(200, 100, 0);
+    B.ArriveTangent = FVector(90, 50, 0);
+    B.LeaveTangent = FVector(90, 50, 0);
+    B.PointType = ESplinePointType::CurveCustomTangent;
+    C.LocalPosition = FVector(300, -20, 0);
+    C.ArriveTangent = FVector(40, -120, 0);
+    C.PointType = ESplinePointType::CurveCustomTangent;
+    Asset->Points = {A, B, C};
+    TestTrue(TEXT("XY spline recognized as planar"),
+        StrandSplineExport::IsPlanar(Asset, StrandSplineExport::EProjection::XY));
+    Asset->Points[1].LocalPosition.Z = 15.0;
+    TestFalse(TEXT("3D spline requires explicit SVG projection"),
+        StrandSplineExport::IsPlanar(Asset, StrandSplineExport::EProjection::XY));
+    Asset->Points[1].LocalPosition.Z = 0.0;
+    Asset->Points[1].LeaveTangent.Z = 25.0;
+    TestFalse(TEXT("Off-plane tangent handle prevents silent projection"),
+        StrandSplineExport::IsPlanar(Asset, StrandSplineExport::EProjection::XY));
+    Asset->Points[1].LeaveTangent.Z = 0.0;
+    FString Dir = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("Strand"), TEXT("ExportTests"));
+    IFileManager::Get().MakeDirectory(*Dir, true);
+    const FString SvgPath = FPaths::Combine(Dir, TEXT("StrandSplineTest.svg"));
+    const FString AbcPath = FPaths::Combine(Dir, TEXT("StrandSplineTest.abc"));
+    FString Error;
+    if (!TestTrue(TEXT("SVG export succeeds"),
+        StrandSplineExport::WriteSvg(Asset, SvgPath, StrandSplineExport::EProjection::XY, Error)))
+    { AddError(Error); return false; }
+    FString Xml;
+    TestTrue(TEXT("Exported SVG is UTF-8 text"), FFileHelper::LoadFileToString(Xml, *SvgPath));
+    TestTrue(TEXT("SVG uses cubic paths"), Xml.Contains(TEXT(" C ")));
+    TestTrue(TEXT("SVG uses declared coordinate bounds"), Xml.Contains(TEXT("viewBox=")));
+    TArray<FSplineImportedCurve> SvgCurves;
+    TestTrue(TEXT("SVG is understood by Strand's importer"), SplineAssetImport::LoadSvgCurves(SvgPath, SvgCurves));
+    TestTrue(TEXT("SVG preserves anchors"), SvgCurves.Num() == 1 && SvgCurves[0].Points.Num() == 3);
+    Error.Reset();
+    if (!TestTrue(TEXT("Alembic export succeeds"), StrandSplineExport::WriteAlembic(Asset, AbcPath, Error)))
+    { AddError(Error); return false; }
+    TArray<FSplineImportedCurve> AbcCurves;
+    TestTrue(TEXT("Alembic can be imported again"), SplineAssetImport::LoadAlembicCurves(AbcPath, nullptr, AbcCurves));
+    if (TestTrue(TEXT("Alembic preserves the point count"), AbcCurves.Num() == 1 && AbcCurves[0].Points.Num() == 3))
+    {
+        TestTrue(TEXT("Alembic preserves 3D local position orientation"),
+            AbcCurves[0].Points[1].LocalPosition.Equals(Asset->Points[1].LocalPosition, 0.005));
+        TestTrue(TEXT("Alembic preserves cubic leave tangent"),
+            AbcCurves[0].Points[0].LeaveTangent.Equals(Asset->Points[0].LeaveTangent, 0.005));
+    }
+    // Exercise closed-loop Bézier topology (3 anchors -> 9 exported control vertices).
+    Asset->bIsClosedLoop = true;
+    Error.Reset();
+    TestTrue(TEXT("Closed Alembic export succeeds"), StrandSplineExport::WriteAlembic(Asset, AbcPath, Error));
+    AbcCurves.Reset();
+    TestTrue(TEXT("Closed Alembic re-imports"), SplineAssetImport::LoadAlembicCurves(AbcPath, nullptr, AbcCurves));
+    TestTrue(TEXT("Closed topology preserved"),
+        AbcCurves.Num() == 1 && AbcCurves[0].bClosedLoop && AbcCurves[0].Points.Num() == 3);
+    IFileManager::Get().Delete(*SvgPath);
+    IFileManager::Get().Delete(*AbcPath);
     return true;
 }
 #endif

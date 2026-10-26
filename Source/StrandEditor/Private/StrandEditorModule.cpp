@@ -10,17 +10,30 @@
 #include "PropertyEditorModule.h"
 #include "SplineDataAsset.h"
 #include "StrandActorFactory.h"
+#include "StrandSplineAssetEditor.h"
+#include "StrandSplineExport.h"
+#include "StrandPlacement.h"
+#include "StrandDropLogic.h"
+#include "StrandSplineActor.h"
+#include "StrandSplineUserData.h"
+#include "StrandMultiSplineActor.h"
 #include "Subsystems/PlacementSubsystem.h"
 #include "Factories/AssetFactoryInterface.h"
 #include "UObject/StrongObjectPtr.h"
 #include "StrandSplineComponentCustomization.h"
 #include "StrandSplineMeshCustomization.h"
+#include "StrandActorDetails.h"
 #include "IPlacementModeModule.h"
 #include "Components/SplineMeshComponent.h"
 #include "UObject/UObjectIterator.h"
 #include "Editor.h"
 #include "SplineEditorCommands.h"
+#include "StrandCurveTestGenerator.h"
+#include "Misc/MessageDialog.h"
 #include "GameFramework/Actor.h"
+#include "Engine/World.h"
+#include "Engine/Level.h"
+#include "ScopedTransaction.h"
 #include "Components/SplineComponent.h"
 #include "LandscapeSplinesComponent.h"
 #include "Brushes/SlateImageBrush.h"
@@ -64,6 +77,24 @@ public:
     // asset type actions strictly for icon, label, and color avoids folding
     // engine-provided Data Asset commands into a misleading Strand group.
     virtual bool HasActions(const TArray<UObject*>& InObjects) const override { return false; }
+    virtual void OpenAssetEditor(const TArray<UObject*>& InObjects,
+        const EAssetTypeActivationOpenedMethod OpenedMethod,
+        TSharedPtr<IToolkitHost> EditWithinLevelEditor) override
+    {
+        OpenAssetEditor(InObjects, EditWithinLevelEditor);
+    }
+    virtual void OpenAssetEditor(const TArray<UObject*>& InObjects,
+        TSharedPtr<IToolkitHost> EditWithinLevelEditor) override
+    {
+        for (UObject* Object : InObjects)
+        {
+            if (USplineDataAsset* SplineAsset = Cast<USplineDataAsset>(Object))
+            {
+                TSharedRef<FStrandSplineAssetEditor> Editor = MakeShared<FStrandSplineAssetEditor>();
+                Editor->Init(SplineAsset, EditWithinLevelEditor);
+            }
+        }
+    }
 private:
     EAssetTypeCategories::Type Category;
 };
@@ -101,6 +132,12 @@ public:
                 RegisteredDetailClasses.Add(Class->GetFName());
             }
         }
+        PropertyEditor.RegisterCustomClassLayout(AStrandSplineActor::StaticClass()->GetFName(),
+            FOnGetDetailCustomizationInstance::CreateStatic(&FStrandActorDetails::MakeInstance));
+        RegisteredDetailClasses.Add(AStrandSplineActor::StaticClass()->GetFName());
+        PropertyEditor.RegisterCustomClassLayout(AStrandMultiSplineActor::StaticClass()->GetFName(),
+            FOnGetDetailCustomizationInstance::CreateStatic(&FStrandActorDetails::MakeInstance));
+        RegisteredDetailClasses.Add(AStrandMultiSplineActor::StaticClass()->GetFName());
         PropertyEditor.NotifyCustomizationModuleChanged();
 
         // Native Content Browser drag/drop calls this factory at the viewport drop location.
@@ -110,6 +147,9 @@ public:
             ActorFactory.Reset(NewObject<UStrandActorFactory>(GetTransientPackage(), UStrandActorFactory::StaticClass(),
                 NAME_None, RF_Transient));
             GEditor->ActorFactories.Add(ActorFactory.Get());
+            MultiActorFactory.Reset(NewObject<UStrandMultiActorFactory>(GetTransientPackage(),
+                UStrandMultiActorFactory::StaticClass(), NAME_None, RF_Transient));
+            GEditor->ActorFactories.Add(MultiActorFactory.Get());
             // UE 5.5+ viewport drops use the PlacementSubsystem's registry, which is
             // independent of GEditor->ActorFactories. Register with BOTH.
             if (UPlacementSubsystem* Placement = GEditor->GetEditorSubsystem<UPlacementSubsystem>())
@@ -118,6 +158,10 @@ public:
                 FactoryInterface.SetObject(ActorFactory.Get());
                 FactoryInterface.SetInterface(static_cast<IAssetFactoryInterface*>(ActorFactory.Get()));
                 Placement->RegisterAssetFactory(FactoryInterface);
+                TScriptInterface<IAssetFactoryInterface> MultiInterface;
+                MultiInterface.SetObject(MultiActorFactory.Get());
+                MultiInterface.SetInterface(static_cast<IAssetFactoryInterface*>(MultiActorFactory.Get()));
+                Placement->RegisterAssetFactory(MultiInterface);
             }
             // Add to Place Actors > Basic as well as the top-left Quickly Add menu.
             if (FModuleManager::Get().ModuleExists(TEXT("PlacementMode"), nullptr))
@@ -125,14 +169,26 @@ public:
                 IPlacementModeModule& PlaceActors = FModuleManager::LoadModuleChecked<IPlacementModeModule>(TEXT("PlacementMode"));
                 PlacementItemId = PlaceActors.RegisterPlaceableItem(FBuiltInPlacementCategories::Basic(),
                     MakeShared<FPlaceableItem>(ActorFactory.Get(), FAssetData(), TOptional<int32>(75)));
+                MultiPlacementItemId = PlaceActors.RegisterPlaceableItem(FBuiltInPlacementCategories::Basic(),
+                    MakeShared<FPlaceableItem>(MultiActorFactory.Get(), FAssetData(), TOptional<int32>(76)));
             }
         }
+        // This editor event is emitted for actual Content Browser viewport drops.
+        // Unlike ActorFactory::PostSpawnActor / EndPlacement, it does not include
+        // the temporary actors made and discarded while hovering the mouse.
+        ActorsDroppedHandle = FEditorDelegates::OnNewActorsDropped.AddRaw(
+            this, &FStrandEditorModule::OnNewActorsDropped);
         UToolMenus::RegisterStartupCallback(FSimpleMulticastDelegate::FDelegate::CreateRaw(
             this, &FStrandEditorModule::RegisterMenus));
     }
 
     virtual void ShutdownModule() override
     {
+        if (ActorsDroppedHandle.IsValid())
+        {
+            FEditorDelegates::OnNewActorsDropped.Remove(ActorsDroppedHandle);
+            ActorsDroppedHandle.Reset();
+        }
         if (GEditor && ActorFactory.IsValid())
         {
             if (UPlacementSubsystem* Placement = GEditor->GetEditorSubsystem<UPlacementSubsystem>())
@@ -142,13 +198,28 @@ public:
                 FactoryInterface.SetInterface(static_cast<IAssetFactoryInterface*>(ActorFactory.Get()));
                 Placement->UnregisterAssetFactory(FactoryInterface);
             }
+            if (MultiActorFactory.IsValid())
+            {
+                if (UPlacementSubsystem* Placement = GEditor->GetEditorSubsystem<UPlacementSubsystem>())
+                {
+                    TScriptInterface<IAssetFactoryInterface> MultiInterface;
+                    MultiInterface.SetObject(MultiActorFactory.Get());
+                    MultiInterface.SetInterface(static_cast<IAssetFactoryInterface*>(MultiActorFactory.Get()));
+                    Placement->UnregisterAssetFactory(MultiInterface);
+                }
+                GEditor->ActorFactories.Remove(MultiActorFactory.Get());
+            }
             GEditor->ActorFactories.Remove(ActorFactory.Get());
         }
         if (PlacementItemId.IsSet() && FModuleManager::Get().IsModuleLoaded(TEXT("PlacementMode")))
         {
             IPlacementModeModule::Get().UnregisterPlaceableItem(PlacementItemId.GetValue());
         }
+        if (MultiPlacementItemId.IsSet() && FModuleManager::Get().IsModuleLoaded(TEXT("PlacementMode")))
+        { IPlacementModeModule::Get().UnregisterPlaceableItem(MultiPlacementItemId.GetValue()); }
         PlacementItemId.Reset();
+        MultiPlacementItemId.Reset();
+        MultiActorFactory.Reset();
         ActorFactory.Reset();
         UToolMenus::UnRegisterStartupCallback(this);
         if (UToolMenus::IsToolMenuUIEnabled()) { UToolMenus::UnregisterOwner(this); }
@@ -173,7 +244,93 @@ public:
     }
 
 private:
+    FDelegateHandle ActorsDroppedHandle;
+
+    void OnNewActorsDropped(const TArray<UObject*>& DroppedObjects,
+                            const TArray<AActor*>& DroppedActors)
+    {
+        // This is a notification for a COMPLETED mouse drop. For one Strand
+        // asset do nothing: keep Unreal's existing regular actor and location.
+        // Mixed file types or preview actors must never be grouped/deleted.
+        if (!GEditor || !StrandDropLogic::HasMultipleDistinctStrandAssets(DroppedObjects) ||
+            DroppedActors.Num() != DroppedObjects.Num() || !ActorFactory.IsValid())
+        {
+            return;
+        }
+
+        TArray<USplineDataAsset*> Assets;
+        TMap<USplineDataAsset*, int32> RemainingAssets;
+        for (UObject* DroppedObject : DroppedObjects)
+        {
+            USplineDataAsset* Asset = Cast<USplineDataAsset>(DroppedObject);
+            if (!IsValid(Asset)) { return; }
+            Assets.Add(Asset);
+            RemainingAssets.FindOrAdd(Asset)++;
+        }
+        if (RemainingAssets.Num() < 2) { return; } // Repeated preview of a single asset is not multi-placement.
+
+        UWorld* World = GEditor->GetEditorWorldContext().World();
+        if (!IsValid(World) || World->WorldType != EWorldType::Editor) { return; }
+        const FTransform DropTransform = DroppedActors[0] ?
+            DroppedActors[0]->GetActorTransform() : FTransform::Identity;
+        for (AActor* DroppedActor : DroppedActors)
+        {
+            // Never mistake preview actors (which may be marked for replacement
+            // or destruction) for actors actually placed in the level.
+            if (!IsValid(DroppedActor) ||
+                !DroppedActor->IsA<AStrandSplineActor>() ||
+                DroppedActor->IsA<AStrandMultiSplineActor>() ||
+                DroppedActor->GetWorld() != World ||
+                !DroppedActor->GetLevel() ||
+                DroppedActor->HasAnyFlags(RF_Transient | RF_NewerVersionExists |
+                    RF_BeginDestroyed | RF_FinishDestroyed))
+            {
+                return;
+            }
+            USplineDataAsset* Linked = Cast<USplineDataAsset>(
+                ActorFactory->GetAssetFromActorInstance(DroppedActor));
+            int32* RemainingCount = RemainingAssets.Find(Linked);
+            if (!RemainingCount || *RemainingCount <= 0) { return; }
+            --(*RemainingCount);
+        }
+        for (const TPair<USplineDataAsset*, int32>& Entry : RemainingAssets)
+        {
+            if (Entry.Value != 0) { return; }
+        }
+
+        if (FMessageDialog::Open(EAppMsgType::YesNo,
+            LOCTEXT("GroupFinishedDropPrompt",
+                "You dropped multiple different Strand Spline assets.\n\n"
+                "Combine them into one Strand Multi Spline Actor?\n\n"
+                "Yes: group these newly placed splines.\n"
+                "No: keep the separate actors at their dropped locations.")) != EAppReturnType::Yes)
+        {
+            return;
+        }
+
+        const FScopedTransaction Transaction(LOCTEXT("GroupDroppedActors", "Group Dropped Strand Splines"));
+        FString Error;
+        AActor* Multi = StrandPlacement::CreateMultiSplineActor(Assets, Error, &DropTransform);
+        if (!IsValid(Multi))
+        {
+            UE_LOG(LogTemp, Warning, TEXT("Strand: Could not group dropped splines: %s"), *Error);
+            return; // Leave every original placed actor untouched on failure.
+        }
+
+        for (AActor* Original : DroppedActors)
+        {
+            Original->Modify();
+            Original->GetLevel()->Modify();
+            World->DestroyActor(Original);
+        }
+        GEditor->SelectNone(false, true, false);
+        GEditor->SelectActor(Multi, true, true, true);
+        GEditor->RedrawAllViewports();
+    }
+
     TStrongObjectPtr<UStrandActorFactory> ActorFactory;
+    TStrongObjectPtr<UStrandMultiActorFactory> MultiActorFactory;
+    TOptional<FPlacementModeID> MultiPlacementItemId;
     TOptional<FPlacementModeID> PlacementItemId;
     TArray<FName> RegisteredDetailClasses;
     TSharedPtr<IAssetTypeActions> AssetActions;
@@ -211,6 +368,9 @@ private:
         // The Content Browser asset icon/thumbnail continue to use the original SVG.
         if (FPaths::FileExists(ActorSvgPath))
         {
+            AssetStyle->Set(TEXT("ClassIcon.StrandMultiSplineActor"),
+                new FSlateVectorImageBrush(ActorSvgPath, FVector2D(16.0f, 16.0f),
+                    FLinearColor::White, ESlateBrushTileType::NoTile));
             AssetStyle->Set(TEXT("ClassIcon.StrandSplineActor"),
                 new FSlateVectorImageBrush(ActorSvgPath, FVector2D(16.0f, 16.0f),
                     FLinearColor::White, ESlateBrushTileType::NoTile));
@@ -255,11 +415,45 @@ private:
                 {
                     const UContentBrowserAssetContextMenuContext* Context =
                         UContentBrowserAssetContextMenuContext::FindContextWithAssets(DynamicSection);
-                    if (!Context || Context->SelectedAssets.Num() != 1 ||
-                        Context->SelectedAssets[0].AssetClassPath != USplineDataAsset::StaticClass()->GetClassPathName())
+                    if (!Context || Context->SelectedAssets.IsEmpty()) { return; }
+                    for (const FAssetData& Data : Context->SelectedAssets)
                     {
-                        return;
+                        if (Data.AssetClassPath != USplineDataAsset::StaticClass()->GetClassPathName()) { return; }
                     }
+                    TArray<FSoftObjectPath> SourceAssets;
+                    for (const FAssetData& Data : Context->SelectedAssets) { SourceAssets.Add(Data.ToSoftObjectPath()); }
+                    const auto ResolveAssets = [SourceAssets]()
+                    {
+                        TArray<USplineDataAsset*> Result;
+                        for (const FSoftObjectPath& Path : SourceAssets)
+                        {
+                            if (USplineDataAsset* Asset = Cast<USplineDataAsset>(Path.TryLoad())) { Result.AddUnique(Asset); }
+                        }
+                        return Result;
+                    };
+                    if (SourceAssets.Num() > 1)
+                    {
+                        DynamicSection.AddMenuEntry(TEXT("Strand_CreateMultiActor"),
+                            LOCTEXT("CreateMulti", "Create Strand Multi Spline Actor"),
+                            LOCTEXT("CreateMultiTip", "Create one actor with one native Spline Component per selected Strand asset."),
+                            FSlateIcon(StrandEditorStyle::StyleSetName, TEXT("ClassIcon.StrandMultiSplineActor")),
+                            FUIAction(FExecuteAction::CreateLambda([ResolveAssets]()
+                            {
+                                SplineEditorCommands::CreateMultiActorFromAssets(ResolveAssets());
+                            })));
+                    }
+                    DynamicSection.AddMenuEntry(TEXT("Strand_AddAndAssign"),
+                        LOCTEXT("AddAndAssign", "Add Spline Component and Assign"),
+                        LOCTEXT("AddAndAssignTip", "Add one native Spline Component per selected Strand asset to EACH selected level actor. Existing components and assets are preserved."),
+                        FSlateIcon(StrandEditorStyle::StyleSetName, TEXT("Strand.Action.New")),
+                        FUIAction(FExecuteAction::CreateLambda([ResolveAssets]()
+                        {
+                            SplineEditorCommands::AddSplineComponentsAndAssign(ResolveAssets());
+                        }), FCanExecuteAction::CreateLambda([]()
+                        {
+                            return !SplineEditorCommands::SelectedActors().IsEmpty();
+                        })));
+                    if (SourceAssets.Num() != 1) { return; }
                     // Do not load the selected asset to build a context menu.
                     // Loading occurs only when the designer clicks an action.
                     const FSoftObjectPath AssetPath = Context->SelectedAssets[0].ToSoftObjectPath();
@@ -267,6 +461,28 @@ private:
                     {
                         return Cast<USplineDataAsset>(AssetPath.TryLoad());
                     };
+                    DynamicSection.AddSubMenu(
+                        TEXT("Strand_Export"),
+                        LOCTEXT("ExportStrand", "Export Strand Spline"),
+                        LOCTEXT("ExportStrandTip", "Export spline geometry as a 3D Alembic curve or projected 2D SVG without modifying the asset."),
+                        FNewToolMenuDelegate::CreateLambda([ResolveAsset](UToolMenu* SubMenu)
+                        {
+                            FToolMenuSection& ExportSection = SubMenu->AddSection(TEXT("StrandExportFormats"));
+                            ExportSection.AddMenuEntry(TEXT("Strand_ExportABC"),
+                                LOCTEXT("ExportABC", "Alembic (.abc)  |  3D"),
+                                LOCTEXT("ExportABCTip", "Export native evaluated 3D curve geometry."),
+                                FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([ResolveAsset]()
+                                {
+                                    StrandSplineExport::ExportInteractive(ResolveAsset(), true);
+                                })));
+                            ExportSection.AddMenuEntry(TEXT("Strand_ExportSVG"),
+                                LOCTEXT("ExportSVG", "SVG (.svg)  |  2D"),
+                                LOCTEXT("ExportSVGTip", "Export projected 2D curve geometry with explicit projection when needed."),
+                                FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([ResolveAsset]()
+                                {
+                                    StrandSplineExport::ExportInteractive(ResolveAsset(), false);
+                                })));
+                        }), false);
                     DynamicSection.AddMenuEntry(
                         TEXT("Strand_CreateActor"),
                         LOCTEXT("CreateActor", "Create Strand Spline Actor"),
@@ -324,6 +540,21 @@ private:
 
         UToolMenu* ToolsMenu = UToolMenus::Get()->ExtendMenu(TEXT("LevelEditor.MainMenu.Tools"));
         FToolMenuSection& ImportSection = ToolsMenu->FindOrAddSection(TEXT("StrandImport"));
+        ImportSection.AddMenuEntry(TEXT("StrandGenerateCurveTests"),
+            LOCTEXT("GenerateTests", "Strand: Generate Helix and Braid Test Curves..."),
+            LOCTEXT("GenerateTestsTip", "Write two Alembic ICurves test fixtures to Project/Saved/Strand/CurveImportTests."),
+            FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([]()
+            {
+                FString Directory, Error;
+                if (StrandCurveTestGenerator::Generate(Directory, Error))
+                {
+                    FMessageDialog::Open(EAppMsgType::Ok, FText::FromString(FString(TEXT("Generated Helix.abc and TripleBraid.abc in:\n")) + Directory));
+                }
+                else
+                {
+                    FMessageDialog::Open(EAppMsgType::Ok, FText::FromString(FString(TEXT("Strand fixture generation failed: ")) + Error));
+                }
+            })));
         ImportSection.AddMenuEntry(TEXT("StrandImportAlembic"),
             LOCTEXT("ImportAbc", "Strand: Import Alembic Curves..."),
             LOCTEXT("ImportAbcTip", "Import native Alembic curve geometry as separate Strand spline assets. Does not intercept Unreal's mesh/groom workflow."),
@@ -338,88 +569,6 @@ private:
             {
                 SplineEditorCommands::ImportCurves(false);
             })));
-
-        ImportSection.AddMenuEntry(TEXT("StrandImportLegacyFBX"),
-            LOCTEXT("ImportLegacyFbx", "Strand: Import Legacy FBX Curves..."),
-            LOCTEXT("ImportLegacyFbxTip", "Explicitly import FBX curve nodes as Strand assets, without overriding native FBX mesh/skeleton import."),
-            FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([]()
-            {
-                SplineEditorCommands::ImportCurves(false, true);
-            })));
-        UToolMenu* Menu = UToolMenus::Get()->ExtendMenu(TEXT("LevelEditor.ActorContextMenu"));
-        FToolMenuSection& Section = Menu->FindOrAddSection(TEXT("Strand"));
-        Section.AddDynamicEntry(TEXT("StrandActorActions"),
-            FNewToolMenuSectionDelegate::CreateLambda([](FToolMenuSection& Subsection)
-            {
-                bool bHasSpline = false, bHasLandscape = false;
-                for (AActor* Actor : SplineEditorCommands::SelectedActors())
-                {
-                    bHasSpline |= IsValid(SplineEditorCommands::FindUnambiguousSpline(Actor));
-                    bHasLandscape |= IsValid(Actor->FindComponentByClass<ULandscapeSplinesComponent>());
-                }
-                if (bHasSpline)
-                {
-                    Subsection.AddMenuEntry(TEXT("SplineAssetConvert"),
-                        LOCTEXT("Convert", "Convert Spline to Spline Data Asset"),
-                        LOCTEXT("ConvertTip", "Create an asset, capture local points, and link it directly to the native spline component."),
-                        FSlateIcon(), FUIAction(FExecuteAction::CreateStatic(&SplineEditorCommands::ConvertSelectedActors)));
-                    Subsection.AddMenuEntry(TEXT("SplineAssetInject"),
-                        LOCTEXT("Inject", "Apply Selected Spline Data Asset"),
-                        LOCTEXT("InjectTip", "Read the asset selected in the Content Browser and overwrite actor spline points."),
-                        FSlateIcon(), FUIAction(FExecuteAction::CreateStatic(&SplineEditorCommands::ApplySelectedAssetToActors)));
-                }
-                const TArray<AActor*> Actors = SplineEditorCommands::SelectedActors();
-                if (Actors.Num() == 1 && IsValid(Actors[0]))
-                {
-                    TArray<USplineComponent*> Components;
-                    Actors[0]->GetComponents<USplineComponent>(Components);
-                    if (Components.IsEmpty())
-                    {
-                        Subsection.AddMenuEntry(TEXT("StrandAddNativeComponent"),
-                            LOCTEXT("AddNativeComponent", "Add Native Spline Component from Selected Strand"),
-                            LOCTEXT("AddNativeComponentTip", "Attach an ordinary, editable Spline Component and apply the Strand asset currently selected in the Content Browser."),
-                            FSlateIcon(), FUIAction(FExecuteAction::CreateStatic(&SplineEditorCommands::AddNativeSplineAndApplyToSelected)));
-                    }
-                    else if (Components.Num() > 1)
-                    {
-                        // Explicitly name every destination when the actor owns multiple
-                        // splines; never route all of them to the first component.
-                        for (int32 Index = 0; Index < Components.Num(); ++Index)
-                        {
-                            USplineComponent* Component = Components[Index];
-                            if (!IsValid(Component)) { continue; }
-                            const TWeakObjectPtr<USplineComponent> WeakComponent(Component);
-                            const FText ComponentName = FText::FromString(Component->GetName());
-                            Subsection.AddMenuEntry(FName(*FString::Printf(TEXT("StrandCapture_%d"), Index)),
-                                FText::Format(LOCTEXT("CaptureNamed", "Save {0} as Strand Spline"), ComponentName),
-                                LOCTEXT("CaptureNamedTip", "Save only this specific native spline component and link it to the new asset."),
-                                FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([WeakComponent]()
-                                {
-                                    SplineEditorCommands::CaptureComponent(WeakComponent);
-                                })));
-                            Subsection.AddMenuEntry(FName(*FString::Printf(TEXT("StrandApply_%d"), Index)),
-                                FText::Format(LOCTEXT("ApplyNamed", "Apply Selected Strand to {0}"), ComponentName),
-                                LOCTEXT("ApplyNamedTip", "Apply the selected Content Browser Strand asset to this specific component."),
-                                FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([WeakComponent]()
-                                {
-                                    USplineDataAsset* Asset = SplineEditorCommands::SelectedSplineAsset();
-                                    SplineEditorCommands::ApplyAssetToComponent(Asset, WeakComponent);
-                                })));
-                        }
-                    }
-                }
-                if (bHasLandscape)
-                {
-                    Subsection.AddMenuEntry(TEXT("SplineAssetLandscapeExport"),
-                        LOCTEXT("LandscapeExport", "Convert Landscape Path to Spline Data Asset"),
-                        LOCTEXT("LandscapeExportTip", "Extract the connected Landscape curve into a new reusable Spline Data Asset."),
-                        FSlateIcon(), FUIAction(FExecuteAction::CreateStatic(&SplineEditorCommands::ConvertSelectedLandscape)));
-                    Subsection.AddMenuEntry(TEXT("SplineAssetLandscapeInject"),
-                        LOCTEXT("LandscapeInject", "Apply Selected Spline Asset to Landscape Path"),
-                        LOCTEXT("LandscapeInjectTip", "Topology-safe Landscape spline snap, preserving the first control point."),
-                        FSlateIcon(), FUIAction(FExecuteAction::CreateStatic(&SplineEditorCommands::ApplySelectedAssetToLandscape)));
-                }
-            }));
     }
 };
 

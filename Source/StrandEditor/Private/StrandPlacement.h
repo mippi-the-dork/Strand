@@ -14,4 +14,8 @@ namespace StrandPlacement
 
     /** Creates a regular level actor with a native spline linked to a Strand asset at the world origin. */
     AActor* CreateNativeSplineActor(USplineDataAsset* Asset, FString& OutError);
+
+    /** Spawn a single native multi-spline container from one or more Strand assets. */
+    AActor* CreateMultiSplineActor(const TArray<USplineDataAsset*>& Assets, FString& OutError,
+                                   const FTransform* RequestedTransform = nullptr);
 }

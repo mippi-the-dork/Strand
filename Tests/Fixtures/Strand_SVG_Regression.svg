@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="-20 -20 150 110">
+ <defs><rect id="template" x="1" y="2" width="20" height="10" rx="3" ry="2"/></defs>
+ <use href="#template" x="40" y="0" fill="none" stroke="white"/>
+ <path id="mixed" d="M0 0 L100 0 C130 0 130 60 100 60 Z" fill="none" stroke="white"/>
+ <path id="explicit-close" d="M0 0 C10 0 10 10 0 10 C-10 10 -20 0 0 0 Z" fill="none" stroke="white"/>
+ <path id="compact-arc" d="M0 0 A5 5 0 0110 10" fill="none" stroke="white"/>
+ <circle id="disk" cx="30" cy="30" r="10" fill="none" stroke="white"/>
+</svg>

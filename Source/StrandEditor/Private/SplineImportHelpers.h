@@ -14,7 +14,8 @@ struct FSplineImportedCurve
 namespace SplineAssetImport
 {
     /** Parse source without changing any UObjects, suitable for safe reimport. */
-    bool LoadSvgCurves(const FString& Filename, TArray<FSplineImportedCurve>& Out);
+    /** bMirrorX defaults to the top-down viewport-friendly SVG orientation. */
+    bool LoadSvgCurves(const FString& Filename, TArray<FSplineImportedCurve>& Out, bool bMirrorX = true);
     bool LoadAlembicCurves(const FString& Filename, const USplineDataAsset* Settings, TArray<FSplineImportedCurve>& Out);
 
     /** Preserves disconnected source curves by creating sibling assets, never splicing them. */

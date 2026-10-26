@@ -51,7 +51,7 @@ EReimportResult::Type UStrandReimportFactory::Reimport(UObject* Obj)
     TArray<FSplineImportedCurve> Curves;
     const bool bLoaded = Asset->SourceImportFormat == TEXT("abc")
         ? SplineAssetImport::LoadAlembicCurves(Filename, Asset, Curves)
-        : (Asset->SourceImportFormat == TEXT("svg") && SplineAssetImport::LoadSvgCurves(Filename, Curves));
+        : (Asset->SourceImportFormat == TEXT("svg") && SplineAssetImport::LoadSvgCurves(Filename, Curves, Asset->bMirrorSvgXOnImport));
     if (!bLoaded) { return EReimportResult::Failed; }
     const FSplineImportedCurve* Match = Curves.FindByPredicate([Asset](const FSplineImportedCurve& Curve)
     {
