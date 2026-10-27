@@ -247,6 +247,8 @@ void SplineEditorCommands::ApplyPlacementToComponents(const TArray<TWeakObjectPt
         UStrandSplineUserData* Data = UStrandSplineUserData::Get(Component);
         if (!Data || !IsValid(Data->AssignedSplineAsset)) { continue; }
         Component->Modify();
+        UStrandSplineUserData::EnsureComponentOwned(Component);
+        Data = UStrandSplineUserData::Get(Component);
         Data->Modify();
         if (AActor* Owner = Component->GetOwner()) { Owner->Modify(); }
         Data->CoordinateMode = Mode;
@@ -497,6 +499,8 @@ void SplineEditorCommands::SetComponentPlacement(USplineComponent* Spline,
     const FScopedTransaction Transaction(LOCTEXT("Placement", "Change Strand Spline Placement"));
     if (AActor* Owner = Spline->GetOwner()) { Owner->Modify(); }
     Spline->Modify();
+    UStrandSplineUserData::EnsureComponentOwned(Spline);
+    Placement = UStrandSplineUserData::Get(Spline);
     Placement->Modify();
     Placement->CoordinateMode = Mode;
     Placement->AnchorMode = AnchorMode;

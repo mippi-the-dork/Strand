@@ -37,7 +37,10 @@ public:
     void SetShowTangents(bool bShow);
     bool GetShowTangents() const;
     void SetSelectedPointIndex(int32 Index);
-    void SetOnPointSelected(TFunction<void(int32)> InCallback);
+    void SetSelectedPoints(const TArray<int32>& Indices, int32 PrimaryIndex);
+    void SetOnPointSelected(TFunction<void(int32, bool, bool)> InCallback);
+    void SetOnSelectAll(TFunction<void()> InCallback);
+    void SetOnClearSelection(TFunction<void()> InCallback);
     void SetOnTangentSelected(TFunction<void(int32, int32)> InCallback);
     void SetTangentDragCallback(TFunction<void(int32, const FVector&)> InCallback);
     void SetSelectedHandle(int32 Handle);

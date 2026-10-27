@@ -1,9 +1,9 @@
 {
   "FileVersion": 3,
-  "Version": 37,
-  "VersionName": "0.6.4",
+  "Version": 38,
+  "VersionName": "0.6.5",
   "FriendlyName": "Strand",
-  "Description": "Native UE5 spline assets, viewport Pen authoring, tangent editing, modeling tools, and SVG/Alembic interchange.",
+  "Description": "Native UE5 spline assets, multi-point viewport authoring, Spline Pen, editing tools, and SVG/Alembic interchange.",
   "Category": "Editor",
   "CreatedBy": "Strand",
   "CanContainContent": false,

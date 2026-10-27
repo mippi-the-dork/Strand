@@ -146,6 +146,93 @@ namespace StrandSplineEditOperations
         return true;
     }
 
+    // Selection is editor state, never serialized into a Strand asset. Pure
+    // operations make group edits deterministic and independently testable.
+    inline FVector SelectionCenter(const TArray<FSplinePointData>& Points, const TArray<int32>& Indices)
+    {
+        FVector Sum = FVector::ZeroVector;
+        int32 Count = 0;
+        for (int32 Index : Indices)
+        {
+            if (Points.IsValidIndex(Index)) { Sum += Points[Index].LocalPosition; ++Count; }
+        }
+        return Count ? Sum / static_cast<double>(Count) : FVector::ZeroVector;
+    }
+
+    inline bool TranslateSelected(TArray<FSplinePointData>& Points, const TArray<int32>& Indices,
+        const FVector& Delta)
+    {
+        if (Delta.ContainsNaN() || Delta.IsNearlyZero() || Indices.IsEmpty()) { return false; }
+        bool bChanged = false;
+        for (int32 Index : Indices)
+        {
+            if (Points.IsValidIndex(Index))
+            {
+                Points[Index].LocalPosition += Delta;
+                bChanged = true;
+            }
+        }
+        return bChanged;
+    }
+
+    inline bool AlignSelected(TArray<FSplinePointData>& Points, const TArray<int32>& Indices, int32 Axis)
+    {
+        if (Indices.Num() < 2 || Axis < 0 || Axis > 2) { return false; }
+        const double Center = SelectionCenter(Points, Indices)[Axis];
+        bool bChanged = false;
+        for (int32 Index : Indices)
+        {
+            if (Points.IsValidIndex(Index))
+            {
+                bChanged |= !FMath::IsNearlyEqual(Points[Index].LocalPosition[Axis], Center, 0.000001);
+                Points[Index].LocalPosition[Axis] = Center;
+            }
+        }
+        return bChanged;
+    }
+
+    // Spatial-order distribution (not spline sequence). Endpoints of the selected
+    // range stay where they are; unselected anchors and all tangents stay intact.
+    inline bool DistributeSelected(TArray<FSplinePointData>& Points, const TArray<int32>& Indices, int32 Axis)
+    {
+        if (Indices.Num() < 3 || Axis < 0 || Axis > 2) { return false; }
+        TArray<int32> Ordered;
+        for (int32 Index : Indices) { if (Points.IsValidIndex(Index)) { Ordered.AddUnique(Index); } }
+        if (Ordered.Num() < 3) { return false; }
+        Ordered.Sort([&Points, Axis](int32 A, int32 B)
+        {
+            const double Left = Points[A].LocalPosition[Axis];
+            const double Right = Points[B].LocalPosition[Axis];
+            return Left == Right ? A < B : Left < Right;
+        });
+        const double First = Points[Ordered[0]].LocalPosition[Axis];
+        const double Last = Points[Ordered.Last()].LocalPosition[Axis];
+        if (FMath::IsNearlyEqual(First, Last)) { return false; }
+        bool bChanged = false;
+        const int32 LastIndex = Ordered.Num() - 1;
+        for (int32 I = 1; I < LastIndex; ++I)
+        {
+            const double Target = FMath::Lerp(First, Last, static_cast<double>(I) / LastIndex);
+            bChanged |= !FMath::IsNearlyEqual(Points[Ordered[I]].LocalPosition[Axis], Target, 0.000001);
+            Points[Ordered[I]].LocalPosition[Axis] = Target;
+        }
+        return bChanged;
+    }
+
+    // One-shot handle cleanup, not a persistent tangent mode. Incoming and
+    // outgoing Unreal tangent vectors both point in the direction of travel.
+    inline bool MatchTangents(FSplinePointData& Point, const FVector& Arrive,
+        const FVector& Leave, bool bMirror, bool bUseIncoming)
+    {
+        const FVector Driver = bUseIncoming ? Arrive : Leave;
+        if (Driver.IsNearlyZero()) { return false; }
+        const FVector Direction = Driver.GetSafeNormal();
+        Point.PointType = ESplinePointType::CurveCustomTangent;
+        Point.ArriveTangent = bUseIncoming ? Driver : Direction * (bMirror ? Driver.Size() : Arrive.Size());
+        Point.LeaveTangent = bUseIncoming ? Direction * (bMirror ? Driver.Size() : Leave.Size()) : Driver;
+        return true;
+    }
+
     inline void MakeAllLinear(TArray<FSplinePointData>& Points)
     {
         for (FSplinePointData& Point : Points)

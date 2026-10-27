@@ -33,6 +33,10 @@
 #include "GameFramework/Actor.h"
 #include "Engine/World.h"
 #include "Engine/Level.h"
+#include "EngineUtils.h"
+#include "UObject/UObjectGlobals.h"
+#include "UObject/ObjectSaveContext.h"
+#include "HAL/IConsoleManager.h"
 #include "ScopedTransaction.h"
 #include "Components/SplineComponent.h"
 #include "LandscapeSplinesComponent.h"
@@ -178,12 +182,39 @@ public:
         // the temporary actors made and discarded while hovering the mouse.
         ActorsDroppedHandle = FEditorDelegates::OnNewActorsDropped.AddRaw(
             this, &FStrandEditorModule::OnNewActorsDropped);
+        // Fix metadata on existing Blueprint instances before OFPA serialization.
+        // This is necessary because an inherited AssetUserData pointer can still
+        // refer to the Blueprint's *private* component-template subobject.
+        PreSaveExternalActorsHandle = FEditorDelegates::PreSaveExternalActors.AddRaw(
+            this, &FStrandEditorModule::RepairWorldBeforeSave);
+        ObjectPreSaveHandle = FCoreUObjectDelegates::OnObjectPreSave.AddRaw(
+            this, &FStrandEditorModule::OnObjectPreSave);
+        RepairCommand = IConsoleManager::Get().RegisterConsoleCommand(
+            TEXT("Strand.RepairUserData"),
+            TEXT("Repair Strand asset user data on native spline components in the active editor world."),
+            FConsoleCommandDelegate::CreateRaw(this, &FStrandEditorModule::RepairCurrentEditorWorld),
+            ECVF_Default);
         UToolMenus::RegisterStartupCallback(FSimpleMulticastDelegate::FDelegate::CreateRaw(
             this, &FStrandEditorModule::RegisterMenus));
     }
 
     virtual void ShutdownModule() override
     {
+        if (RepairCommand)
+        {
+            IConsoleManager::Get().UnregisterConsoleObject(RepairCommand);
+            RepairCommand = nullptr;
+        }
+        if (ObjectPreSaveHandle.IsValid())
+        {
+            FCoreUObjectDelegates::OnObjectPreSave.Remove(ObjectPreSaveHandle);
+            ObjectPreSaveHandle.Reset();
+        }
+        if (PreSaveExternalActorsHandle.IsValid())
+        {
+            FEditorDelegates::PreSaveExternalActors.Remove(PreSaveExternalActorsHandle);
+            PreSaveExternalActorsHandle.Reset();
+        }
         if (ActorsDroppedHandle.IsValid())
         {
             FEditorDelegates::OnNewActorsDropped.Remove(ActorsDroppedHandle);
@@ -245,6 +276,94 @@ public:
 
 private:
     FDelegateHandle ActorsDroppedHandle;
+    FDelegateHandle PreSaveExternalActorsHandle;
+    FDelegateHandle ObjectPreSaveHandle;
+    IConsoleObject* RepairCommand = nullptr;
+
+    static int32 RepairActor(AActor* Actor)
+    {
+        if (!IsValid(Actor) || Actor->IsTemplate()) { return 0; }
+        int32 Repaired = 0;
+        TArray<USplineComponent*> Splines;
+        Actor->GetComponents<USplineComponent>(Splines);
+        for (USplineComponent* Component : Splines)
+        {
+            Repaired += UStrandSplineUserData::EnsureComponentOwned(Component) ? 1 : 0;
+        }
+        TArray<USplineMeshComponent*> Meshes;
+        Actor->GetComponents<USplineMeshComponent>(Meshes);
+        for (USplineMeshComponent* Component : Meshes)
+        {
+            Repaired += UStrandSplineUserData::EnsureComponentOwned(Component) ? 1 : 0;
+        }
+        return Repaired;
+    }
+
+    void RepairWorldBeforeSave(UWorld* World)
+    {
+        if (!IsValid(World) || World->WorldType != EWorldType::Editor) { return; }
+        int32 Repaired = 0;
+        for (TActorIterator<AActor> It(World); It; ++It)
+        {
+            Repaired += RepairActor(*It);
+        }
+        if (Repaired > 0)
+        {
+            UE_LOG(LogTemp, Display,
+                TEXT("Strand: repaired %d Blueprint-instanced spline user-data owners before external actor save."),
+                Repaired);
+        }
+    }
+
+    void OnObjectPreSave(UObject* Object, FObjectPreSaveContext /*SaveContext*/)
+    {
+        // Supplement the early PreSaveExternalActors repair for save paths that
+        // serialize actors/components individually. New exports generated from
+        // within a PreSave callback may not receive PreSave themselves, so
+        // PreSaveExternalActors and the explicit command remain the preferred
+        // repair points for level external-actor packages.
+        if (AActor* Actor = Cast<AActor>(Object))
+        {
+            RepairActor(Actor);
+        }
+        else if (USplineComponent* Spline = Cast<USplineComponent>(Object))
+        {
+            if (AActor* Owner = Spline->GetOwner())
+            {
+                if (!Owner->IsTemplate()) { UStrandSplineUserData::EnsureComponentOwned(Spline); }
+            }
+        }
+        else if (USplineMeshComponent* Mesh = Cast<USplineMeshComponent>(Object))
+        {
+            if (AActor* Owner = Mesh->GetOwner())
+            {
+                if (!Owner->IsTemplate()) { UStrandSplineUserData::EnsureComponentOwned(Mesh); }
+            }
+        }
+    }
+
+    void RepairCurrentEditorWorld()
+    {
+        if (!GEditor)
+        {
+            UE_LOG(LogTemp, Warning, TEXT("Strand.RepairUserData: no Unreal Editor instance."));
+            return;
+        }
+        UWorld* World = GEditor->GetEditorWorldContext().World();
+        if (!IsValid(World) || World->WorldType != EWorldType::Editor)
+        {
+            UE_LOG(LogTemp, Warning, TEXT("Strand.RepairUserData: no active editor world."));
+            return;
+        }
+        int32 Count = 0;
+        for (TActorIterator<AActor> It(World); It; ++It)
+        {
+            Count += RepairActor(*It);
+        }
+        UE_LOG(LogTemp, Display,
+            TEXT("Strand.RepairUserData: repaired %d native spline/spline-mesh metadata owners in loaded editor actors. Save the level to persist repairs."),
+            Count);
+    }
 
     void OnNewActorsDropped(const TArray<UObject*>& DroppedObjects,
                             const TArray<AActor*>& DroppedActors)

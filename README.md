@@ -9,7 +9,7 @@ Strand has two complementary editing workflows:
 - **Strand Spline Editor:** Double-click a Strand Spline asset to edit its saved curve in a dedicated 2D/3D preview. These changes modify the asset, not existing level actors.
 - **Native Level Editor spline editing:** Drag a Strand asset into the level or associate it with an existing native spline component. Continue using Unreal's native actor, spline, and viewport tools. Explicitly **Apply Asset** or **Update Asset** to synchronize the two copies.
 
-**Package:** v0.6.4 source candidate. **Validation:** The source package has been statically inspected, but v0.6.4 has not been compiled or exercised in Unreal Engine 5.8.3 in this environment. The last explicitly reported successful earlier build was v0.6.2; this new package still requires its own Unreal build and tests. Features described below are implemented in the packaged source, not a claim of completed engine QA. See [TEST_PLAN_0.6.4.md](TEST_PLAN_0.6.4.md) and [FEATURE_ROADMAP.md](FEATURE_ROADMAP.md).
+**Package:** v0.6.5 source candidate. **Validation:** The previous v0.6.4 Strand runtime/editor/PCG modules compiled and linked in the user-provided build log, and screenshots show that editor running. v0.6.5 itself has not been compiled or tested in UE 5.8.3 in this environment. The included source defines these features, but live editor behavior still requires validation. See [TEST_PLAN_0.6.5.md](TEST_PLAN_0.6.5.md) and [FEATURE_ROADMAP.md](FEATURE_ROADMAP.md).
 
 ## Install
 
@@ -28,9 +28,10 @@ This archive contains C++ source, test fixtures, documentation, and editor artwo
 2. Double-click the asset. Its dedicated editor has a native spline preview on the left and the selected-point inspector plus asset properties on the right.
 3. Choose **Pen** in the viewport toolbar. Click to add anchors; click-drag to create symmetric incoming/outgoing Bezier handles. The highlighted **Pen** mode is active until you choose **Select** or press **Esc**. To start with no points, choose **Spline Tools > Clear All Points**, confirm, and draw a new path. Clear is a single Undo step.
 4. In Pen mode, click an existing segment to add an anchor at the clicked location using a shape-preserving cubic split. Click an endpoint to select the side to extend, then click empty space to continue from that end. With three or more points in an open path, clicking the opposite endpoint joins the ends and exits Pen mode. The other end can be selected and extended similarly. **Snap: Off / 1 / 10 / 100 cm** controls Pen placement and handles.
-5. Choose **Select** to move points with Unreal's translation widget or to enter local X/Y/Z coordinates in the inspector. Use **Insert After** to split after the selected point or, with an open spline's final point selected, extend it.
-6. Enable **Tangents**, select an incoming or outgoing handle, and move its translation widget or edit the selected handle's numeric X/Y/Z values. When necessary, Strand converts an automatically evaluated point to **Curve (Custom Tangents)** while preserving its opposite evaluated tangent.
-7. Use **Spline Tools** for whole-curve operations, then save through the asset editor's standard Unreal Save command.
+5. Choose **Select**. Click an anchor to select it, **Shift-click** to extend an index range, or **Ctrl-click** to toggle individual anchors. **Ctrl+A** selects all and **Esc** clears selection while the viewport is focused. The Selection menu and inspector All/None buttons offer the same actions.
+6. Use Unreal's translation gizmo to move all selected anchors as a group, or enter a new local **selection-center X/Y/Z** coordinate to move the whole group without changing relative spacing. For one point, these numeric fields edit that point's position. Use **Spline Tools > Selected Points** to align, distribute, snap, or change selected interpolation types.
+7. With just one point selected, choose **Incoming Handle** or **Outgoing Handle** to edit the corresponding tangent numerically or via its translation widget. The **Tangents** overlay is enabled by default in Select mode. **Align Primary Tangents / Mirror Primary Tangents** are one-shot adjustments; the handles remain independently editable afterward.
+8. Use **Insert After** for a single selected point or **Delete Selected** for a set that leaves at least two points. Whole-spline tools remain separate from selection tools. Save via the asset editor's standard Unreal Save command.
 
 Point and tangent edits operate on the **asset's local geometry**, are backed by editor transactions, and refresh the transient preview. They do not automatically change placed level instances or modify the original SVG/Alembic source file.
 
@@ -43,24 +44,34 @@ Point and tangent edits operate on the **asset's local geometry**, are backed by
 
 For an empty native Strand actor, use **Quickly Add > Strand Spline Actor** or **Place Actors > Basic**. For multiple separate splines on one actor, use **Strand Multi Spline Actor**, the Content Browser multi-asset creation command, or the command to add native spline components to selected actors.
 
+### Blueprint spline components and external-actor level saves
+
+Strand's component link is stored as native Unreal `UAssetUserData`. Blueprint-instanced spline and spline-mesh components can otherwise inherit a link to their Blueprint component template, or a locally owned metadata copy with an archetype reference to that private template. Unreal's **One File Per Actor (OFPA)** save cannot serialize either kind of private cross-package reference.
+
+Strand repairs loaded placed actors before Unreal saves external actors and also checks individual actor/component save paths. Repair replaces **only** an unsafe Strand user-data object with one owned by the placed component and based on Strand's class default object. It preserves the linked asset, placement settings and spline geometry; unrelated user data is untouched. Blueprint class templates are not modified by a placed-actor repair.
+
+For a level that already fails to save, open the affected level, run `Strand.RepairUserData` in the Unreal console, check the Output Log for the repair count, then save the level again. The command only scans actors loaded in the active editor world. A count of zero means no currently loaded spline/spline-mesh metadata matched the unsafe-ownership check, not necessarily that a different save issue is absent.
+
+**Clearing the Strand Spline field** must remove Strand's component metadata even when that field was already empty. Clearing the Blueprint class default alone may not clear overridden or previously instanced metadata on already-placed actors. The repair command is safe to run with the asset still assigned; you do not need to remove your Blueprint actor or clear spline geometry.
+
 ## Dedicated Strand Spline Editor
 
 ### Viewport and inspector
 
 | Control | Behavior |
 | --- | --- |
-| **Select / Pen** | Explicit viewport modes. Select edits existing points and tangents; Pen adds, extends, closes, and inserts points with interactive handle drawing. Press Esc to exit Pen. |
+| **Select / Pen** | Select supports single-click, Shift-click contiguous ranges, Ctrl-click toggles, Ctrl+A all, and Esc clear. Pen adds, extends, closes and inserts anchors; Esc exits Pen. |
 | **Pen Snap** | Optional placement/handle snapping to 1, 10, or 100 cm, or Off. Available while Pen is active. |
 | **Camera** | Perspective, Top (XY), Front (XZ), Side (YZ). Controls the view, not saved geometry. |
 | **Edit: 3D** | No movement-axis restriction. |
 | **Edit: XY / XZ / YZ** | Constrains translation and numeric edits to the chosen two axes. Switching modes does **not** flatten existing positions or tangents; a locked numeric axis is disabled. Choosing a 2D mode also changes to the matching orthographic view. |
-| **Frame All / Frame Point** | Focuses the preview camera on the curve or selection. |
-| **Points / Grid / Tangents** | Toggles preview overlays. Tangent handles appear for the selected point when Tangents is enabled. |
-| **Selected Point** | Navigate with previous/next, modify local position, insert/delete, and change native point type. |
-| **Selected Tangent** | After selecting an incoming or outgoing handle, independently modify its evaluated vector with the widget or numeric fields. |
+| **Frame All / Frame Primary** | Focuses the camera on the full curve or primary selected anchor. |
+| **Points / Grid / Tangents** | Toggles overlays. Tangents default on in Select mode for one selected point and hide automatically during Pen drawing. |
+| **Selection / Point Editor** | Navigate to a primary anchor; All/None selection; edit one position or a multi-selection center; delete selected anchors, insert after a single anchor, change native interpolation types. |
+| **Selected Tangent** | Incoming/Outgoing Handle buttons and clickable handles select the evaluated tangent for numeric or widget edits on one anchor. |
 | **Asset Properties** | Native Details for stored points, point properties, source identification, import options, and placement defaults. |
 
-**Marker colors:** Start is green, end of an open spline is orange, and selected point is yellow. Preview point markers and sampled segments are capped for very dense curves; the selected point remains visible. Pen segment hit targets are disabled above 4,096 points to prevent large hit-proxy allocations; endpoint extension remains available.
+**Marker colors:** Start is green, end of an open spline is orange, and selected anchors are yellow with a larger primary marker. Preview point markers and sampled segments are capped for very dense curves; the primary point remains visible. Pen segment hit targets are disabled above 4,096 points to prevent large hit-proxy allocations; endpoint extension remains available.
 
 **Point types:** Curve (Auto), Curve (Clamped), Curve (Custom Tangents), Linear, and Constant are offered as native Unreal interpolation types. **Constant** interpolation is not supported by Strand's SVG or Alembic exporters. Native point rotations and scales remain editable in the asset properties even though they are not part of the viewport translation widget.
 
@@ -75,14 +86,17 @@ For an empty native Strand actor, use **Quickly Add > Strand Spline Actor** or *
 | **Subdivide All Segments** | Inserts a midpoint on each segment. Cubic segments use de Casteljau subdivision of the evaluated native spline. Linear and constant segments are handled separately. Maximum 8,192 input anchors; one Undo transaction. |
 | **Reverse Direction** | Reverses anchor order and swaps/negates incoming and outgoing tangents. Also adjusts segment interpolation assignment. |
 | **Set Selected as First (Closed)** | Cyclically rotates point order so the selected anchor is first, only on a closed spline. |
-| **Snap Selected Point** | Rounds unlocked coordinates to a 1, 10, or 100 cm grid. This is an explicit point command, not automatic live viewport snapping. |
+| **Align Selected X / Y / Z** | Aligns selected anchors to their mean coordinate on the chosen axis; requires two or more selected and an unlocked edit axis. |
+| **Distribute Selected X / Y / Z** | Evenly distributes three or more selected anchors in ascending axis-coordinate order between their selected extremes. Does not distribute along curve arc length. |
+| **Align Primary Tangents / Mirror Primary Tangents** | One-shot co-linear tangent directions; Align preserves evaluated handle lengths, Mirror matches lengths using the selected handle. Single-point only; not persistent coupling. |
+| **Snap Selected Points** | Rounds unlocked coordinates of all selected anchors to a 1, 10, or 100 cm grid. Explicit command, not live viewport snapping. |
 | **Toggle Closed Loop** | Changes the native closed-loop flag. |
 | **Linearize All** | Converts every point to Linear and zeros tangent vectors. Changes geometry. |
 | **Auto-Smooth All** | Converts every point to native Curve (Auto). Changes geometry. |
 | **Mirror X / Y / Z** | Reflects every point and both tangents around the selected axis of the control-point bounding-box center. |
 | **Flatten to XY / XZ / YZ** | With confirmation, zeros the discarded axis for every position and both tangent vectors. Destructive to geometry but undoable. This is distinct from choosing a 2D edit plane. |
 
-**Insert After** and **Delete Point** in the point inspector operate on the current point selection. Insert uses an exact evaluated cubic split for a curved segment; Delete preserves a minimum of two points but can change the neighboring curve. Pen-mode clicking on a spline segment inserts an anchor using parameter-refined de Casteljau splitting. All spline Pen interactions, their mouse capture, and Undo/Redo still require live editor validation.
+**Insert After** requires one selected anchor and uses an exact evaluated cubic split on a curved segment. **Delete Selected** removes the whole selection in one transaction only if at least two points remain; deleting anchors can change neighboring curve geometry. Numeric selection-center edits and group gizmo translation preserve unselected anchors and each selected point's tangent vectors. Pen-mode clicking on a spline segment inserts an anchor using parameter-refined de Casteljau splitting. All spline Pen interactions, their mouse capture, and Undo/Redo still require live editor validation.
 
 ### Editor toolbar and asset lifecycle
 
@@ -172,19 +186,20 @@ After compiling in UE 5.8.3, run these console commands:
 Automation RunTests Strand.Data.RoundTripPointData
 Automation RunTests Strand.Editor.Authoring.SplineEditingOperations
 Automation RunTests Strand.Editor.Authoring.SplinePenGeometry
+Automation RunTests Strand.Editor.Authoring.GroupEditingOperations
 Automation RunTests Strand.Editor.Export.SvgAndAlembicRoundTrip
 ```
 
-Further fixtures and regression tests are in [TEST_PLAN.md](TEST_PLAN.md), [TEST_PLAN_0.6.4.md](TEST_PLAN_0.6.4.md), and `Tests/Fixtures/`. The existing authoring test exercises subdivision, mirror, reverse tangent direction, flattening, and point-type conversion. It does **not** fully validate live Slate input, mouse gizmo behavior, Undo/Redo, import UI, or all closed/mixed-interpolation cases. Perform the manual steps in the test plan as well.
+Further fixtures and regression tests are in [TEST_PLAN.md](TEST_PLAN.md), [TEST_PLAN_0.6.5.md](TEST_PLAN_0.6.5.md), and `Tests/Fixtures/`. The existing authoring test exercises subdivision, mirror, reverse tangent direction, flattening, and point-type conversion. It does **not** fully validate live Slate input, mouse gizmo behavior, Undo/Redo, import UI, or all closed/mixed-interpolation cases. Perform the manual steps in the test plan as well.
 
 **Current known gaps:**
 
-- Multi-point/marquee selection, full independent Free/Aligned/Mirrored tangent authoring policies, segment dragging, procedural primitives, and automatic alignment/distribution are not implemented.
+- Marquee selection, rotate/scale group gizmos, full persistent Free/Aligned/Mirrored tangent authoring policies, segment dragging and procedural primitives are not implemented. Point alignment and spatial-axis distribution are available under Spline Tools > Selected Points.
 - Pen free-3D placement uses a **camera-facing construction plane** passing through the current endpoint, or through the local origin when the path is empty. It is NOT surface snapping or scene geometry picking. Constrained XY/XZ/YZ modes use a fixed coordinate plane at the selected endpoint's locked-axis depth, rather than flattening the curve.
 - Pen handles are **symmetric during creation**, then independently editable in Select mode. There are no persistent DCC-specific handle mode labels in the saved data.
-- The editor currently supports one active spline point, and Pen point placement still needs actual UE 5.8.3 testing with camera navigation, press/release capture, viewport resizing, axis selection, and Undo/Redo.
+- The editor supports multiple selected anchors with one primary point. Pen point placement and group viewport input still need actual UE 5.8.3 testing with camera navigation, press/release capture, viewport resizing, axis selection and Undo/Redo.
 - An empty or single-point Strand asset may exist while authoring; supply at least two anchors before exporting or placing for a meaningful spline.
 - SVG projection of 3D curves discards a dimension. Geometry and interpolation metadata are not identical interchange concepts.
-- Live UE 5.8.3 compilation and tests for v0.6.4 are pending, including Pen input and viewport behavior.
+- UE 5.8.3 compilation and tests for v0.6.5 are pending, particularly modifier clicks, viewport drag transactions, selected-state preservation and tangent controls.
 
 The implementation roadmap and release criteria are in [FEATURE_ROADMAP.md](FEATURE_ROADMAP.md). The interaction research is recorded in [Docs/SPLINE_AUTHORING_TOOL_SURVEY.md](Docs/SPLINE_AUTHORING_TOOL_SURVEY.md). Previous changes and historical development notes are preserved in [CHANGELOG.md](CHANGELOG.md) and the versioned changelogs; they are not duplicated in this current-version README.

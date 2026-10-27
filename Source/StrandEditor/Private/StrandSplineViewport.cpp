@@ -8,6 +8,7 @@
 #include "PreviewScene.h"
 #include "PrimitiveDrawInterface.h"
 #include "SceneView.h"
+#include "Framework/Application/SlateApplication.h"
 
 namespace
 {
@@ -111,7 +112,21 @@ public:
     bool GetShowGrid() const { return bShowGrid; }
     void SetShowTangents(bool bShow) { bShowTangents = bShow; Invalidate(); }
     bool GetShowTangents() const { return bShowTangents; }
-    void SetSelectedPoint(int32 InIndex) { if (SelectedPoint != InIndex) { SelectedHandle = 0; } SelectedPoint = InIndex; Invalidate(); }
+    void SetSelectedPoint(int32 InIndex)
+    {
+        TArray<int32> Indices;
+        if (InIndex != INDEX_NONE) { Indices.Add(InIndex); }
+        SetSelectedPoints(Indices, InIndex);
+    }
+    void SetSelectedPoints(const TArray<int32>& Indices, int32 PrimaryIndex)
+    {
+        if (SelectedPoint != PrimaryIndex) { SelectedHandle = 0; }
+        SelectedPoints.Reset();
+        for (int32 Index : Indices) { SelectedPoints.Add(Index); }
+        SelectedPoint = PrimaryIndex;
+        if (SelectedPoints.Num() > 1) { SelectedHandle = 0; }
+        Invalidate();
+    }
     void SetSelectedHandle(int32 InHandle) { SelectedHandle = FMath::Clamp(InHandle, 0, 2); Invalidate(); }
     void SetPenMode(bool bEnable)
     {
@@ -134,7 +149,9 @@ public:
     }
     void SetOnTangentSelected(TFunction<void(int32, int32)> InCallback) { OnTangentSelected = MoveTemp(InCallback); }
     void SetTangentDragCallback(TFunction<void(int32, const FVector&)> InCallback) { OnTangentDragDelta = MoveTemp(InCallback); }
-    void SetOnPointSelected(TFunction<void(int32)> InCallback) { OnPointSelected = MoveTemp(InCallback); }
+    void SetOnPointSelected(TFunction<void(int32, bool, bool)> InCallback) { OnPointSelected = MoveTemp(InCallback); }
+    void SetOnSelectAll(TFunction<void()> InCallback) { OnSelectAll = MoveTemp(InCallback); }
+    void SetOnClearSelection(TFunction<void()> InCallback) { OnClearSelection = MoveTemp(InCallback); }
     void SetPointDragCallbacks(TFunction<void(const FVector&)> InDelta, TFunction<void()> InEnd)
     {
         OnPointDragDelta = MoveTemp(InDelta);
@@ -153,6 +170,20 @@ public:
         const FSplinePoint Point = Native->GetSplinePointAt(SelectedPoint, ESplineCoordinateSpace::Local);
         if (SelectedHandle == 1) { return Point.Position - Point.ArriveTangent / 3.0; }
         if (SelectedHandle == 2) { return Point.Position + Point.LeaveTangent / 3.0; }
+        if (SelectedPoints.Num() > 1)
+        {
+            FVector Center = FVector::ZeroVector;
+            int32 Count = 0;
+            for (int32 Index : SelectedPoints)
+            {
+                if (Index >= 0 && Index < Native->GetNumberOfSplinePoints())
+                {
+                    Center += Native->GetLocationAtSplinePoint(Index, ESplineCoordinateSpace::Local);
+                    ++Count;
+                }
+            }
+            if (Count) { return Center / static_cast<double>(Count); }
+        }
         return Point.Position;
     }
 
@@ -219,6 +250,20 @@ public:
     // standard click-on-release selection path in ProcessClick.
     virtual bool InputKey(const FInputKeyEventArgs& EventArgs) override
     {
+        if (!bPenMode && EventArgs.Event == IE_Pressed)
+        {
+            const FModifierKeysState Mods = FSlateApplication::Get().GetModifierKeys();
+            if (EventArgs.Key == EKeys::A && Mods.IsControlDown() && !Mods.IsAltDown())
+            {
+                if (OnSelectAll) { OnSelectAll(); }
+                return true;
+            }
+            if (EventArgs.Key == EKeys::Escape)
+            {
+                if (OnClearSelection) { OnClearSelection(); }
+                return true;
+            }
+        }
         if (bPenMode && EventArgs.Key == EKeys::Escape && EventArgs.Event == IE_Pressed)
         {
             if (bPenDragging && OnPenCancel) { OnPenCancel(); }
@@ -328,6 +373,8 @@ public:
             {
                 const HStrandSplineTangentProxy* Tangent = static_cast<HStrandSplineTangentProxy*>(HitProxy);
                 SelectedPoint = Tangent->PointIndex;
+                SelectedPoints.Reset();
+                SelectedPoints.Add(SelectedPoint);
                 SelectedHandle = Tangent->Handle;
                 if (OnTangentSelected) { OnTangentSelected(SelectedPoint, SelectedHandle); }
                 Invalidate();
@@ -338,9 +385,10 @@ public:
             {
                 NewPoint = static_cast<HStrandSplinePointProxy*>(HitProxy)->PointIndex;
             }
-            SelectedPoint = NewPoint;
-            SelectedHandle = 0;
-            if (OnPointSelected) { OnPointSelected(NewPoint); }
+            const FModifierKeysState Mods = FSlateApplication::Get().GetModifierKeys();
+            // Owner handles Shift range and Ctrl toggling, including choosing the
+            // new primary anchor. Never preemptively discard the selection here.
+            if (OnPointSelected) { OnPointSelected(NewPoint, Mods.IsShiftDown(), Mods.IsControlDown()); }
             Invalidate();
             return;
         }
@@ -351,7 +399,7 @@ public:
     {
         FEditorViewportClient::Draw(View, PDI);
         if (!PDI || !View) { return; }
-        CachedInvViewProjection = View->ViewMatrices.GetInvViewProjectionMatrix();
+        CachedInvViewProjection = View->ViewMatrices.GetClipToWorld();
         CachedViewRect = View->UnscaledViewRect;
         bHasCachedView = true;
         const USplineComponent* Native = Spline.Get();
@@ -430,7 +478,7 @@ public:
                     const double Alpha = static_cast<double>(Step) / SamplesPerSpan;
                     const FVector Next = SegmentPosition(Native, Segment, Alpha);
                     PDI->SetHitProxy(new HStrandSplineSegmentProxy(Segment, (Step - 0.5) / SamplesPerSpan));
-                    PDI->DrawLine(Prev, Next, StrandCurveColor, SDPG_World, 5.0f);
+                    PDI->DrawLine(Prev, Next, StrandCurveColor, SDPG_World, 3.0f);
                     PDI->SetHitProxy(nullptr);
                     Prev = Next;
                 }
@@ -468,15 +516,29 @@ public:
             for (int32 Index = 0; Index < PointCount; Index += Step)
             {
                 const FVector Position = Native->GetLocationAtSplinePoint(Index, ESplineCoordinateSpace::Local);
-                const FLinearColor Color = Index == SelectedPoint ? StrandSelectedColor
+                const FLinearColor Color = SelectedPoints.Contains(Index) ? StrandSelectedColor
                     : Index == 0 ? StrandStartColor
                     : (Index == PointCount - 1 && !Native->IsClosedLoop() ? StrandEndColor : StrandControlColor);
                 PDI->SetHitProxy(new HStrandSplinePointProxy(Index));
-                PDI->DrawPoint(Position, Color, Index == SelectedPoint ? 17.0f : 10.0f, SDPG_Foreground);
+                PDI->DrawPoint(Position, Color, Index == SelectedPoint ? 17.0f
+                    : SelectedPoints.Contains(Index) ? 13.0f : 10.0f, SDPG_Foreground);
                 PDI->SetHitProxy(nullptr);
             }
-            // Make sure a selected point remains visible and clickable even if density culling skips it.
-            if (SelectedPoint >= 0 && SelectedPoint < PointCount && SelectedPoint % Step != 0)
+            // All selected anchors are drawn on smaller splines. On extremely
+            // dense selections keep the representative points + primary only:
+            // never submit tens of thousands of extra hit proxies each frame.
+            if (SelectedPoints.Num() <= MaxVisibleMarkers)
+            {
+                for (int32 Index : SelectedPoints)
+                {
+                    if (Index < 0 || Index >= PointCount || Index % Step == 0) { continue; }
+                    PDI->SetHitProxy(new HStrandSplinePointProxy(Index));
+                    PDI->DrawPoint(Native->GetLocationAtSplinePoint(Index, ESplineCoordinateSpace::Local),
+                        StrandSelectedColor, Index == SelectedPoint ? 17.0f : 13.0f, SDPG_Foreground);
+                    PDI->SetHitProxy(nullptr);
+                }
+            }
+            else if (SelectedPoint >= 0 && SelectedPoint < PointCount && SelectedPoint % Step != 0)
             {
                 PDI->SetHitProxy(new HStrandSplinePointProxy(SelectedPoint));
                 PDI->DrawPoint(Native->GetLocationAtSplinePoint(SelectedPoint, ESplineCoordinateSpace::Local),
@@ -491,7 +553,8 @@ public:
                 PDI->SetHitProxy(nullptr);
             }
         }
-        if (bShowTangents && SelectedPoint >= 0 && SelectedPoint < PointCount)
+        if (bShowTangents && !bPenMode && SelectedPoints.Num() == 1 &&
+            SelectedPoint >= 0 && SelectedPoint < PointCount)
         {
             const FSplinePoint Point = Native->GetSplinePointAt(SelectedPoint, ESplineCoordinateSpace::Local);
             const FVector InHandle = Point.Position - Point.ArriveTangent / 3.0;
@@ -593,7 +656,10 @@ private:
     }
 
     TWeakObjectPtr<USplineComponent> Spline;
-    TFunction<void(int32)> OnPointSelected;
+    TFunction<void(int32, bool, bool)> OnPointSelected;
+    TFunction<void()> OnSelectAll;
+    TFunction<void()> OnClearSelection;
+    TSet<int32> SelectedPoints;
     TFunction<void(int32, int32)> OnTangentSelected;
     TFunction<void(int32, const FVector&)> OnTangentDragDelta;
     TFunction<void(const FVector&)> OnPointDragDelta;
@@ -602,7 +668,7 @@ private:
     int32 SelectedHandle = 0;
     bool bShowPoints = true;
     bool bShowGrid = true;
-    bool bShowTangents = false;
+    bool bShowTangents = true;
     bool bPenMode = false;
     bool bPenDragging = false;
     bool bDelegatedPenCameraClick = false;
@@ -671,9 +737,21 @@ bool SStrandSplineViewport::GetShowGrid() const { return StrandViewportClient.Is
 void SStrandSplineViewport::SetShowTangents(bool bShow) { if (StrandViewportClient.IsValid()) { StrandViewportClient->SetShowTangents(bShow); } }
 bool SStrandSplineViewport::GetShowTangents() const { return StrandViewportClient.IsValid() && StrandViewportClient->GetShowTangents(); }
 void SStrandSplineViewport::SetSelectedPointIndex(int32 Index) { if (StrandViewportClient.IsValid()) { StrandViewportClient->SetSelectedPoint(Index); } }
-void SStrandSplineViewport::SetOnPointSelected(TFunction<void(int32)> InCallback)
+void SStrandSplineViewport::SetSelectedPoints(const TArray<int32>& Indices, int32 PrimaryIndex)
+{
+    if (StrandViewportClient.IsValid()) { StrandViewportClient->SetSelectedPoints(Indices, PrimaryIndex); }
+}
+void SStrandSplineViewport::SetOnPointSelected(TFunction<void(int32, bool, bool)> InCallback)
 {
     if (StrandViewportClient.IsValid()) { StrandViewportClient->SetOnPointSelected(MoveTemp(InCallback)); }
+}
+void SStrandSplineViewport::SetOnSelectAll(TFunction<void()> InCallback)
+{
+    if (StrandViewportClient.IsValid()) { StrandViewportClient->SetOnSelectAll(MoveTemp(InCallback)); }
+}
+void SStrandSplineViewport::SetOnClearSelection(TFunction<void()> InCallback)
+{
+    if (StrandViewportClient.IsValid()) { StrandViewportClient->SetOnClearSelection(MoveTemp(InCallback)); }
 }
 void SStrandSplineViewport::OnFocusViewportToSelection() { FrameSpline(); }
 

@@ -47,6 +47,7 @@ private:
     TSharedPtr<IDetailsView> DetailsView;
     TSharedPtr<SStrandSplineViewport> PreviewWidget;
     int32 SelectedPointIndex = INDEX_NONE;
+    TSet<int32> SelectedPointIndices;
     TUniquePtr<FScopedTransaction> ActivePointDragTransaction;
     bool bPointChangedDuringDrag = false;
     EStrandEditPlane EditPlane = EStrandEditPlane::Free3D;
@@ -72,6 +73,19 @@ private:
     FReply ExportSvg();
     FReply AddPointAfterSelection();
     FReply RemoveSelectedPoint();
+    FReply AlignSelection(int32 Axis);
+    FReply DistributeSelection(int32 Axis);
+    FReply MatchSelectedTangents(bool bMirror);
+    FReply SelectAllPoints();
+    FReply InvertPointSelection();
+    FReply ClearPointSelection();
+    TSharedRef<SWidget> MakeSelectionMenu();
+    bool HasMultipleSelectedPoints() const;
+    bool CanEditAxis(int32 Axis) const;
+    bool CanDeleteSelection() const;
+    TArray<int32> GetSelectedIndices() const;
+    void SyncViewportSelection();
+    void PruneSelection();
     FReply ToggleClosedLoop();
     FReply ClearSpline();
     void SetPenMode(bool bEnabled);
@@ -96,7 +110,7 @@ private:
     TSharedRef<SWidget> MakeEditPlaneMenu();
     FText GetEditPlaneLabel() const;
     void SetEditPlane(EStrandEditPlane NewPlane);
-    void CommitSplineEdit(int32 NewSelection);
+    void CommitSplineEdit(int32 NewSelection, bool bPreserveSelection = false);
     void SelectTangentHandle(int32 Point, int32 Handle);
     void ApplyViewportTangentDrag(int32 Handle, const FVector& LocalDelta);
     FReply SetSelectedPointType(ESplinePointType::Type NewType);
@@ -114,7 +128,7 @@ private:
     void SetPointCoordinate(double Value, int32 Axis);
     TOptional<double> GetTangentCoordinate(int32 Axis) const;
     void SetTangentCoordinate(double Value, int32 Axis);
-    void SelectPoint(int32 Index);
+    void SelectPoint(int32 Index, bool bRange = false, bool bToggle = false);
     void BeginViewportPointDrag();
     void ApplyViewportPointDrag(const FVector& LocalDelta);
     void EndViewportPointDrag();

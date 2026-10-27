@@ -8,6 +8,7 @@
 class USplineDataAsset;
 class USplineComponent;
 class USplineMeshComponent;
+class UActorComponent;
 
 /** Serialized, per-component Strand link. No additional actor component or spline class is needed. */
 UCLASS(BlueprintType, EditInlineNew)
@@ -27,6 +28,15 @@ public:
 
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category="Strand|Placement")
     int32 AnchorPointIndex = 0;
+
+    /**
+     * Repair a Blueprint-instanced native component that inherited Strand metadata
+     * owned by a different component (usually the Blueprint component template).
+     * Copies only Strand's four placement/link fields into a new component-owned
+     * instance, never changes spline geometry or unrelated Asset User Data.
+     * Returns true only when an ownership repair was needed.
+     */
+    static bool EnsureComponentOwned(UActorComponent* Component);
 
     /** Spline meshes store only a single Hermite segment, using the same metadata class. */
     static UStrandSplineUserData* GetOnSplineMesh(const USplineMeshComponent* Mesh);

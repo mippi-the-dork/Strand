@@ -90,6 +90,108 @@ bool FSplineAssetRoundTripTest::RunTest(const FString& Parameters)
     return true;
 }
 
+// Regression for OFPA saving a Blueprint that has a Strand-linked native spline
+// component. Blueprint instancing can inherit either the private template
+// user-data pointer or a local copy with a private template ARCHETYPE.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStrandBlueprintUserDataOwnershipTest,
+    "Strand.Editor.Placement.BlueprintUserDataOwnership",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FStrandBlueprintUserDataOwnershipTest::RunTest(const FString& Parameters)
+{
+    USplineDataAsset* Asset = NewObject<USplineDataAsset>(GetTransientPackage());
+    USplineComponent* Template = NewObject<USplineComponent>(GetTransientPackage());
+    UStrandSplineUserData::AssignAsset(Template, Asset);
+    UStrandSplineUserData* Source = UStrandSplineUserData::Get(Template);
+    if (!TestNotNull(TEXT("Blueprint component template owns Strand data"), Source)) { return false; }
+    Source->CoordinateMode = EStrandCoordinateMode::Relative;
+    Source->AnchorMode = EStrandAnchorMode::PointCenter;
+    Source->AnchorPointIndex = 3;
+
+    USplineComponent* Instance = NewObject<USplineComponent>(GetTransientPackage());
+    // Simulate the inherited pointer on a Blueprint-created level instance.
+    Instance->AddAssetUserData(Source);
+    TestTrue(TEXT("Inherited user data is visible on the instance"),
+        UStrandSplineUserData::GetAssignedAsset(Instance) == Asset);
+    const bool bRepaired = UStrandSplineUserData::EnsureComponentOwned(Instance);
+    UStrandSplineUserData* Local = UStrandSplineUserData::Get(Instance);
+    TestTrue(TEXT("Foreign user-data ownership repaired"), bRepaired);
+    if (!TestNotNull(TEXT("Repaired metadata exists"), Local)) { return false; }
+    TestTrue(TEXT("Metadata outer is exactly the receiving instance"), Local->GetOuter() == Instance);
+    TestTrue(TEXT("Instance has independent Strand metadata"), Local != Source);
+    TestTrue(TEXT("Repair avoids private Blueprint-template archetypes"),
+        Local->GetArchetype() == UStrandSplineUserData::StaticClass()->GetDefaultObject());
+    TestEqual(TEXT("Asset reference retained"), Local->AssignedSplineAsset.Get(), Asset);
+    TestEqual(TEXT("Coordinate mode retained"), Local->CoordinateMode, EStrandCoordinateMode::Relative);
+    TestEqual(TEXT("Anchor mode retained"), Local->AnchorMode, EStrandAnchorMode::PointCenter);
+    TestEqual(TEXT("Anchor index retained"), Local->AnchorPointIndex, 3);
+    TestFalse(TEXT("Repeated repair is a no-op"), UStrandSplineUserData::EnsureComponentOwned(Instance));
+    Local->AnchorPointIndex = 1;
+    TestEqual(TEXT("Editing placed instance does not change Blueprint template"), Source->AnchorPointIndex, 3);
+
+    USplineComponent* SameAssetInstance = NewObject<USplineComponent>(GetTransientPackage());
+    SameAssetInstance->AddAssetUserData(Source);
+    UStrandSplineUserData::AssignAsset(SameAssetInstance, Asset);
+    TestTrue(TEXT("Assigning the same asset still fixes foreign ownership"),
+        UStrandSplineUserData::Get(SameAssetInstance)->GetOuter() == SameAssetInstance);
+
+    // The actual reported OFPA error can be from a *locally owned* instance
+    // that still holds its Blueprint component template as its archetype.
+    // Unreal calls this an "Unknown property" reference in the save error.
+    USplineComponent* LocalArchetypeInstance = NewObject<USplineComponent>(GetTransientPackage());
+    UStrandSplineUserData* InheritedArchetype = NewObject<UStrandSplineUserData>(
+        LocalArchetypeInstance, UStrandSplineUserData::StaticClass(), NAME_None,
+        RF_Transactional, Source);
+    LocalArchetypeInstance->AddAssetUserData(InheritedArchetype);
+    TestTrue(TEXT("Simulated local metadata has a foreign Blueprint archetype"),
+        InheritedArchetype->GetOuter() == LocalArchetypeInstance && InheritedArchetype->GetArchetype() == Source);
+    TestTrue(TEXT("Locally owned metadata with foreign archetype is repaired"),
+        UStrandSplineUserData::EnsureComponentOwned(LocalArchetypeInstance));
+    UStrandSplineUserData* FixedArchetype = UStrandSplineUserData::Get(LocalArchetypeInstance);
+    TestTrue(TEXT("Repaired instance no longer references Blueprint private archetype"),
+        FixedArchetype && FixedArchetype != InheritedArchetype &&
+        FixedArchetype->GetOuter() == LocalArchetypeInstance &&
+        FixedArchetype->GetArchetype() == UStrandSplineUserData::StaticClass()->GetDefaultObject());
+    TestEqual(TEXT("Private-archetype repair preserves asset assignment"),
+        FixedArchetype ? FixedArchetype->AssignedSplineAsset.Get() : nullptr, Asset);
+    TestFalse(TEXT("Safe archetype does not trigger repeated repairs"),
+        UStrandSplineUserData::EnsureComponentOwned(LocalArchetypeInstance));
+
+    // Clearing a null-valued assignment must remove the user-data OBJECT,
+    // not leave an empty subobject whose archetype can poison level saving.
+    USplineComponent* EmptyInheritedInstance = NewObject<USplineComponent>(GetTransientPackage());
+    UStrandSplineUserData* EmptyTemplateData = NewObject<UStrandSplineUserData>(Template);
+    EmptyInheritedInstance->AddAssetUserData(EmptyTemplateData);
+    TestNull(TEXT("Empty inherited Strand metadata contains no linked asset"),
+        UStrandSplineUserData::GetAssignedAsset(EmptyInheritedInstance));
+    UStrandSplineUserData::AssignAsset(EmptyInheritedInstance, nullptr);
+    TestNull(TEXT("Clearing an already-empty field removes inherited user-data subobject"),
+        UStrandSplineUserData::Get(EmptyInheritedInstance));
+    USplineComponent* OldEmptyActorInstance = NewObject<USplineComponent>(GetTransientPackage());
+    OldEmptyActorInstance->AddAssetUserData(EmptyTemplateData);
+    TestTrue(TEXT("Automatic repair drops empty foreign metadata on previously placed instances"),
+        UStrandSplineUserData::EnsureComponentOwned(OldEmptyActorInstance));
+    TestNull(TEXT("No orphaned Strand metadata remains after empty-link repair"),
+        UStrandSplineUserData::Get(OldEmptyActorInstance));
+
+    USplineMeshComponent* MeshTemplate = NewObject<USplineMeshComponent>(GetTransientPackage());
+    UStrandSplineUserData::AssignAssetToSplineMesh(MeshTemplate, Asset);
+    UStrandSplineUserData* MeshSource = UStrandSplineUserData::GetOnSplineMesh(MeshTemplate);
+    USplineMeshComponent* MeshInstance = NewObject<USplineMeshComponent>(GetTransientPackage());
+    MeshInstance->AddAssetUserData(MeshSource);
+    UStrandSplineUserData::AssignAssetToSplineMesh(MeshInstance, Asset);
+    const UStrandSplineUserData* MeshLocal = UStrandSplineUserData::GetOnSplineMesh(MeshInstance);
+    TestNotNull(TEXT("Spline mesh retains Strand metadata"), MeshLocal);
+    TestTrue(TEXT("Spline mesh instance owns independent metadata"),
+        MeshLocal && MeshLocal->GetOuter() == MeshInstance && MeshLocal != MeshSource);
+    USplineMeshComponent* EmptyMesh = NewObject<USplineMeshComponent>(GetTransientPackage());
+    EmptyMesh->AddAssetUserData(NewObject<UStrandSplineUserData>(MeshTemplate));
+    UStrandSplineUserData::AssignAssetToSplineMesh(EmptyMesh, nullptr);
+    TestNull(TEXT("Clearing an empty spline mesh link removes inherited metadata"),
+        UStrandSplineUserData::GetOnSplineMesh(EmptyMesh));
+    return true;
+}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStrandMeshAdapterTest,
     "Strand.Editor.SplineMeshTwoPointAdapter", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
 
@@ -929,8 +1031,8 @@ bool FStrandSplinePenGeometryTest::RunTest(const FString& Parameters)
     Asset->Points = { A, B, C };
     Asset->bIsClosedLoop = true;
     Asset->ApplyToSplineComponent(Native);
-    const FVector ClosedBeforeA = Native->GetLocationAtSplineInputKey(2.73, ESplineCoordinateSpace::Local);
-    const FVector ClosedBeforeB = Native->GetLocationAtSplineInputKey(2.90, ESplineCoordinateSpace::Local);
+    const FVector ClosedBeforeA = Native->GetLocationAtSplineInputKey(2.73f, ESplineCoordinateSpace::Local);
+    const FVector ClosedBeforeB = Native->GetLocationAtSplineInputKey(2.90f, ESplineCoordinateSpace::Local);
     TestEqual(TEXT("Closed wrap insert appends before closure"), StrandSplineEditOperations::InsertOnSegment(
         Asset->Points, true, Native, 2, 0.73), 3);
     Asset->ApplyToSplineComponent(Native);
@@ -938,7 +1040,7 @@ bool FStrandSplinePenGeometryTest::RunTest(const FString& Parameters)
     TestTrue(TEXT("Closed wrap insertion point stays on original curve"),
         ClosedBeforeA.Equals(Native->GetLocationAtSplineInputKey(3.0, ESplineCoordinateSpace::Local), 0.01));
     TestTrue(TEXT("Closed wrap second half remains on original curve"),
-        ClosedBeforeB.Equals(Native->GetLocationAtSplineInputKey(3.0 + (0.90 - 0.73) / 0.27,
+        ClosedBeforeB.Equals(Native->GetLocationAtSplineInputKey(3.0f + (0.90f - 0.73f) / 0.27f,
             ESplineCoordinateSpace::Local), 0.01));
     // Empty assets are valid while drawing a new path from scratch.
     Asset->Points.Empty();
@@ -946,6 +1048,62 @@ bool FStrandSplinePenGeometryTest::RunTest(const FString& Parameters)
         Asset->Points, FVector(4, 5, 6), false, false), 0);
     TestEqual(TEXT("Second anchor in empty path"), StrandSplineEditOperations::AppendPenPoint(
         Asset->Points, FVector(44, 5, 6), false, false), 1);
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStrandGroupEditingTest,
+    "Strand.Editor.Authoring.GroupEditingOperations",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FStrandGroupEditingTest::RunTest(const FString& Parameters)
+{
+    TArray<FSplinePointData> Points;
+    Points.SetNum(5);
+    Points[0].LocalPosition = FVector(-100, 5, 0);
+    Points[1].LocalPosition = FVector(0, 7, 20);
+    Points[2].LocalPosition = FVector(30, 12, 10);
+    Points[3].LocalPosition = FVector(90, 16, 40);
+    Points[4].LocalPosition = FVector(300, -5, 0);
+    const TArray<int32> Selection = { 1, 2, 3 };
+    const FVector Center = StrandSplineEditOperations::SelectionCenter(Points, Selection);
+    TestTrue(TEXT("Selection center averages only chosen control points"),
+        Center.Equals(FVector(40, 35.0 / 3.0, 70.0 / 3.0), 0.000001));
+    const FVector UnselectedBefore = Points[0].LocalPosition;
+    const FVector UnselectedAfter = Points[4].LocalPosition;
+    TestTrue(TEXT("Group translate changes selected points"), StrandSplineEditOperations::TranslateSelected(
+        Points, Selection, FVector(100, 0, -10)));
+    TestTrue(TEXT("Primary point maintains correct offset"),
+        Points[2].LocalPosition.Equals(FVector(130, 12, 0)));
+    TestTrue(TEXT("Group translate leaves unselected endpoints"),
+        Points[0].LocalPosition.Equals(UnselectedBefore) && Points[4].LocalPosition.Equals(UnselectedAfter));
+    TestTrue(TEXT("Align selection along Y"), StrandSplineEditOperations::AlignSelected(Points, Selection, 1));
+    TestTrue(TEXT("Aligned points share Y"),
+        FMath::IsNearlyEqual(Points[1].LocalPosition.Y, Points[2].LocalPosition.Y) &&
+        FMath::IsNearlyEqual(Points[2].LocalPosition.Y, Points[3].LocalPosition.Y));
+    TestTrue(TEXT("Distribute selection along X"), StrandSplineEditOperations::DistributeSelected(Points, Selection, 0));
+    TestTrue(TEXT("Intermediate anchor is midpoint of selection range"),
+        FMath::IsNearlyEqual(Points[2].LocalPosition.X, 145.0));
+    TestTrue(TEXT("Unselected endpoints remain untouched after align/distribute"),
+        Points[0].LocalPosition.Equals(UnselectedBefore) && Points[4].LocalPosition.Equals(UnselectedAfter));
+    const FVector FirstTangent(30, 0, 0);
+    const FVector SecondTangent(0, 60, 0);
+    TestTrue(TEXT("One-shot aligned tangents accepts nonzero driver"),
+        StrandSplineEditOperations::MatchTangents(Points[2], FirstTangent, SecondTangent, false, true));
+    TestTrue(TEXT("Aligned handles preserve separate lengths"),
+        Points[2].ArriveTangent.Equals(FVector(30, 0, 0)) &&
+        Points[2].LeaveTangent.Equals(FVector(60, 0, 0)));
+    TestTrue(TEXT("One-shot mirrored tangents accept outgoing driver"),
+        StrandSplineEditOperations::MatchTangents(Points[2], FirstTangent, SecondTangent, true, false));
+    TestTrue(TEXT("Mirrored handles share equal vector"),
+        Points[2].ArriveTangent.Equals(SecondTangent) &&
+        Points[2].LeaveTangent.Equals(SecondTangent));
+    const TArray<FSplinePointData> Unchanged = Points;
+    TestFalse(TEXT("Cannot distribute on invalid axis"),
+        StrandSplineEditOperations::DistributeSelected(Points, Selection, 3));
+    TestFalse(TEXT("Cannot translate with zero delta"),
+        StrandSplineEditOperations::TranslateSelected(Points, Selection, FVector::ZeroVector));
+    TestTrue(TEXT("Invalid operations do not touch unrelated point data"),
+        Points[0].LocalPosition.Equals(Unchanged[0].LocalPosition));
     return true;
 }
 #endif
