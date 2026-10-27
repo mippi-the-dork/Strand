@@ -6,15 +6,25 @@
 #include "EditorUndoClient.h"
 #include "ScopedTransaction.h"
 #include "Components/SplineComponent.h"
+#include "SplineDataAsset.h"
 
 class IDetailsView;
 class USplineDataAsset;
 class USplineComponent;
 class SDockTab;
 class SStrandSplineViewport;
+struct FStrandPenHit;
 struct FPropertyChangedEvent;
 
 /** Dedicated Strand Spline asset editor. The preview evaluates a native USplineComponent. */
+enum class EStrandEditPlane : uint8
+{
+    Free3D,
+    XY,
+    XZ,
+    YZ
+};
+
 class FStrandSplineAssetEditor final : public FAssetEditorToolkit, public FSelfRegisteringEditorUndoClient
 {
 public:
@@ -39,6 +49,17 @@ private:
     int32 SelectedPointIndex = INDEX_NONE;
     TUniquePtr<FScopedTransaction> ActivePointDragTransaction;
     bool bPointChangedDuringDrag = false;
+    EStrandEditPlane EditPlane = EStrandEditPlane::Free3D;
+    int32 SelectedHandle = 0; // 0 anchor, 1 incoming, 2 outgoing.
+    bool bPenMode = false;
+    double PenSnapStep = 0.0;
+    TUniquePtr<FScopedTransaction> ActivePenTransaction;
+    TArray<FSplinePointData> PenPreviousPoints;
+    bool bPenPreviousClosed = false;
+    int32 PenEditingPoint = INDEX_NONE;
+    FVector LastPenHandleOffset = FVector::ZeroVector;
+    bool bPenHandleMoved = false;
+    FSplinePointData PenPointBeforeHandleDrag;
 
     TSharedRef<SDockTab> SpawnPreviewTab(const FSpawnTabArgs& Args);
     TSharedRef<SDockTab> SpawnDetailsTab(const FSpawnTabArgs& Args);
@@ -52,6 +73,32 @@ private:
     FReply AddPointAfterSelection();
     FReply RemoveSelectedPoint();
     FReply ToggleClosedLoop();
+    FReply ClearSpline();
+    void SetPenMode(bool bEnabled);
+    void SetPenSnapStep(double Step);
+    TSharedRef<SWidget> MakePenSnapMenu();
+    FText GetPenSnapLabel() const;
+    FText GetEditorHint() const;
+    bool BeginPenStroke(const FStrandPenHit& Hit);
+    void UpdatePenStroke(const FVector& HandleOffset);
+    void EndPenStroke();
+    void CancelPenStroke();
+    FReply ExtendStart();
+    FReply ReverseSpline();
+    FReply SetSelectedAsFirst();
+    FReply SnapSelectedPoint(double Step);
+    FReply SubdivideSpline();
+    FReply LinearizeSpline();
+    FReply SmoothSpline();
+    FReply MirrorSpline(int32 Axis);
+    FReply FlattenSpline(int32 Axis);
+    TSharedRef<SWidget> MakeSplineToolsMenu();
+    TSharedRef<SWidget> MakeEditPlaneMenu();
+    FText GetEditPlaneLabel() const;
+    void SetEditPlane(EStrandEditPlane NewPlane);
+    void CommitSplineEdit(int32 NewSelection);
+    void SelectTangentHandle(int32 Point, int32 Handle);
+    void ApplyViewportTangentDrag(int32 Handle, const FVector& LocalDelta);
     FReply SetSelectedPointType(ESplinePointType::Type NewType);
     TSharedRef<SWidget> MakePointTypeMenu();
     FReply CreateActor();
@@ -65,6 +112,8 @@ private:
     FText GetSelectedPointLabel() const;
     TOptional<double> GetPointCoordinate(int32 Axis) const;
     void SetPointCoordinate(double Value, int32 Axis);
+    TOptional<double> GetTangentCoordinate(int32 Axis) const;
+    void SetTangentCoordinate(double Value, int32 Axis);
     void SelectPoint(int32 Index);
     void BeginViewportPointDrag();
     void ApplyViewportPointDrag(const FVector& LocalDelta);

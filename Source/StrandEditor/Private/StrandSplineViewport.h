@@ -8,6 +8,15 @@ class USplineComponent;
 class FPreviewScene;
 class FStrandSplineViewportClient;
 
+/** Screen-space pen target, evaluated in native spline-local centimeters. */
+struct FStrandPenHit
+{
+    FVector Position = FVector::ZeroVector;
+    int32 PointIndex = INDEX_NONE;
+    int32 SegmentIndex = INDEX_NONE;
+    double SegmentAlpha = 0.5;
+};
+
 /** 3D, camera-navigable Strand preview. Selection is editor-only; source data stays in USplineDataAsset. */
 class SStrandSplineViewport final : public SEditorViewport
 {
@@ -29,6 +38,15 @@ public:
     bool GetShowTangents() const;
     void SetSelectedPointIndex(int32 Index);
     void SetOnPointSelected(TFunction<void(int32)> InCallback);
+    void SetOnTangentSelected(TFunction<void(int32, int32)> InCallback);
+    void SetTangentDragCallback(TFunction<void(int32, const FVector&)> InCallback);
+    void SetSelectedHandle(int32 Handle);
+    void SetPenMode(bool bEnabled);
+    void SetPenPlane(int32 LockedAxis);
+    void SetPenSnap(double Step);
+    void SetPenCallbacks(TFunction<bool(const FStrandPenHit&)> OnDown,
+        TFunction<void(const FVector&)> OnDrag, TFunction<void()> OnUp,
+        TFunction<void()> OnCancel, TFunction<void()> OnExit);
     /** Called for native translation widget deltas and when tracking finishes. */
     void SetPointDragCallbacks(TFunction<void(const FVector&)> InDelta, TFunction<void()> InEnd);
 

@@ -4,6 +4,9 @@
 #include "SplineDataAssetFactory.h"
 #include "SplineEditorCommands.h"
 #include "StrandSplineExport.h"
+#include "StrandSplineEditOperations.h"
+#include "Styling/AppStyle.h"
+#include "Widgets/Images/SImage.h"
 #include "AssetToolsModule.h"
 #include "IAssetTools.h"
 #include "Subsystems/AssetEditorSubsystem.h"
@@ -38,6 +41,16 @@ namespace
 {
     const FName PreviewTabId(TEXT("StrandSplineEditor_Preview"));
     const FName DetailsTabId(TEXT("StrandSplineEditor_Details"));
+
+    TSharedRef<SWidget> ActionContent(const FName Icon, const FText& Label)
+    {
+        return SNew(SHorizontalBox)
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0, 0, 5, 0)
+              [SNew(SImage).Image(FAppStyle::GetBrush(Icon)).DesiredSizeOverride(FVector2D(16.0f, 16.0f))]
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
+              [SNew(STextBlock).Text(Label)];
+    }
+
 }
 
 FText FStrandSplineAssetEditor::GetBaseToolkitName() const
@@ -113,12 +126,12 @@ void FStrandSplineAssetEditor::Init(USplineDataAsset* InAsset, const TSharedPtr<
     DetailsView->SetObject(InAsset);
     DetailsView->OnFinishedChangingProperties().AddSP(this, &FStrandSplineAssetEditor::OnPropertyChanged);
 
-    const TSharedRef<FTabManager::FLayout> Layout = FTabManager::NewLayout("StrandSplineEditor_Layout_v4")
+    const TSharedRef<FTabManager::FLayout> Layout = FTabManager::NewLayout("StrandSplineEditor_Layout_v5")
         ->AddArea(FTabManager::NewPrimaryArea()->SetOrientation(Orient_Vertical)
             ->Split(FTabManager::NewSplitter()->SetOrientation(Orient_Horizontal)
-                ->Split(FTabManager::NewStack()->SetSizeCoefficient(0.60f)
+                ->Split(FTabManager::NewStack()->SetSizeCoefficient(0.71f)
                     ->AddTab(PreviewTabId, ETabState::OpenedTab)->SetHideTabWell(true))
-                ->Split(FTabManager::NewStack()->SetSizeCoefficient(0.40f)
+                ->Split(FTabManager::NewStack()->SetSizeCoefficient(0.29f)
                     ->AddTab(DetailsTabId, ETabState::OpenedTab)->SetHideTabWell(true))));
     TArray<UObject*> ObjectsToEdit;
     ObjectsToEdit.Add(InAsset);
@@ -152,9 +165,10 @@ TSharedRef<SDockTab> FStrandSplineAssetEditor::SpawnPreviewTab(const FSpawnTabAr
         [
             SNew(SHorizontalBox)
             + SHorizontalBox::Slot().AutoWidth().Padding(2.0f)
-            [SNew(SButton).Text(LOCTEXT("NewSpline", "New Spline"))
+            [SNew(SButton)
                 .ToolTipText(LOCTEXT("NewSplineTip", "Create and open an independent, editable Strand Spline asset in the same Content Browser folder."))
-                .OnClicked(this, &FStrandSplineAssetEditor::NewSplineAsset)]
+                .OnClicked(this, &FStrandSplineAssetEditor::NewSplineAsset)
+                [ActionContent(TEXT("Icons.Plus"), LOCTEXT("NewSpline", "New Spline"))]]
             + SHorizontalBox::Slot().AutoWidth().Padding(2.0f)
             [SNew(SComboButton)
                 .ToolTipText(LOCTEXT("ExportTip", "Export this native spline geometry without modifying the Strand asset."))
@@ -169,34 +183,68 @@ TSharedRef<SDockTab> FStrandSplineAssetEditor::SpawnPreviewTab(const FSpawnTabAr
                         FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this]() { ExportSvg(); })));
                     return Menu.MakeWidget();
                 })
-                .ButtonContent()[SNew(STextBlock).Text(LOCTEXT("Export", "Export"))]]
+                .ButtonContent()[ActionContent(TEXT("Icons.Export"), LOCTEXT("Export", "Export"))]]
             + SHorizontalBox::Slot().AutoWidth().Padding(10.0f, 0.0f, 2.0f, 0.0f)
-            [SNew(SButton).Text(LOCTEXT("Reimport", "Reimport Source"))
+            [SNew(SButton)
                 .ToolTipText(LOCTEXT("ReimportTip", "Regenerate this spline from Alembic or SVG using its current import settings. This replaces the asset's stored points but does not automatically change placed actors."))
                 .IsEnabled(this, &FStrandSplineAssetEditor::CanReimport)
-                .OnClicked(this, &FStrandSplineAssetEditor::ReimportSource)]
-            + SHorizontalBox::Slot().AutoWidth().Padding(14.0f, 0.0f, 2.0f, 0.0f)
-            [SNew(SButton).Text(LOCTEXT("CreateActor", "Create Actor"))
-                .ToolTipText(LOCTEXT("CreateActorTip", "Place a native Strand spline actor from this asset."))
-                .OnClicked(this, &FStrandSplineAssetEditor::CreateActor)]
-            + SHorizontalBox::Slot().AutoWidth().Padding(2.0f)
-            [SNew(SButton).Text(LOCTEXT("SelectUsers", "Select Users"))
-                .ToolTipText(LOCTEXT("SelectUsersTip", "Select actors linked to this asset in the current level."))
-                .OnClicked(this, &FStrandSplineAssetEditor::SelectUsers)]
-            + SHorizontalBox::Slot().AutoWidth().Padding(2.0f)
-            [SNew(SButton).Text(LOCTEXT("InspectUsage", "Inspect Usage"))
-                .ToolTipText(LOCTEXT("InspectUsageTip", "Inspect references to this asset in the current level."))
-                .OnClicked(this, &FStrandSplineAssetEditor::InspectUsage)]
+                .OnClicked(this, &FStrandSplineAssetEditor::ReimportSource)
+                [ActionContent(TEXT("Icons.Refresh"), LOCTEXT("Reimport", "Reimport"))]]
+            + SHorizontalBox::Slot().AutoWidth().Padding(11.0f, 0.0f, 2.0f, 0.0f)
+            [SNew(SComboButton)
+                .ToolTipText(LOCTEXT("ActorActionTip", "Actions involving spline actors and their asset links in the current level."))
+                .OnGetMenuContent_Lambda([this]()
+                {
+                    FMenuBuilder Menu(true, nullptr);
+                    Menu.AddMenuEntry(LOCTEXT("CreateActor", "Create Actor"), LOCTEXT("CreateActorTip", "Place a native Strand spline actor from this asset."),
+                        FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.Plus"), FUIAction(FExecuteAction::CreateLambda([this]() { CreateActor(); })));
+                    Menu.AddMenuEntry(LOCTEXT("SelectUsers", "Select Users"), LOCTEXT("SelectUsersTip", "Select actors linked to this spline in the level."),
+                        FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this]() { SelectUsers(); })));
+                    Menu.AddMenuEntry(LOCTEXT("InspectUsage", "Inspect Usage"), LOCTEXT("InspectUsageTip", "Inspect actors using this asset."),
+                        FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this]() { InspectUsage(); })));
+                    return Menu.MakeWidget();
+                })
+                .ButtonContent()[ActionContent(TEXT("Icons.Actor"), LOCTEXT("ActorsButton", "Actors"))]]
+            + SHorizontalBox::Slot().AutoWidth().Padding(5.0f, 0.0f, 2.0f, 0.0f)
+            [SNew(SComboButton)
+                .ToolTipText(LOCTEXT("SplineToolsTip", "Spline modeling tools: subdivide, reverse, extend, mirror, flatten, linearize, and smooth."))
+                .OnGetMenuContent(this, &FStrandSplineAssetEditor::MakeSplineToolsMenu)
+                .ButtonContent()[ActionContent(TEXT("Icons.Edit"), LOCTEXT("SplineToolsLabel", "Spline Tools"))]]
         ]
         + SVerticalBox::Slot().AutoHeight().Padding(7.0f, 1.0f, 7.0f, 5.0f)
         [
             SNew(SHorizontalBox)
             + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.0f)
+            [SNew(SCheckBox)
+                .Style(FAppStyle::Get(), "ToggleButtonCheckbox")
+                .IsChecked_Lambda([this]() { return bPenMode ? ECheckBoxState::Unchecked : ECheckBoxState::Checked; })
+                .OnCheckStateChanged_Lambda([this](ECheckBoxState) { SetPenMode(false); })
+                .ToolTipText(LOCTEXT("SelectModeTip", "Select points and tangent handles using Unreal's translation gizmo. Esc returns to Select mode."))
+                [SNew(STextBlock).Text(LOCTEXT("SelectMode", "Select"))]]
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.0f)
+            [SNew(SCheckBox)
+                .Style(FAppStyle::Get(), "ToggleButtonCheckbox")
+                .IsChecked_Lambda([this]() { return bPenMode ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
+                .OnCheckStateChanged_Lambda([this](ECheckBoxState State) { SetPenMode(State == ECheckBoxState::Checked); })
+                .ToolTipText(LOCTEXT("PenModeTip", "Pen: click to add anchors, drag to shape symmetric handles, click a segment to insert, click an endpoint to continue or close; Esc to exit."))
+                [ActionContent(TEXT("Icons.Edit"), LOCTEXT("PenMode", "Pen"))]]
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(7.0f, 0.0f, 2.0f, 0.0f)
             [SNew(SComboButton)
                 .ToolTipText(LOCTEXT("ProjectionTip", "Choose a perspective or orthographic viewport."))
                 .OnGetMenuContent(this, &FStrandSplineAssetEditor::MakeProjectionMenu)
                 .ButtonContent()
                 [SNew(STextBlock).Text(this, &FStrandSplineAssetEditor::GetProjectionLabel)]]
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(7.0f, 0.0f, 2.0f, 0.0f)
+            [SNew(SComboButton)
+                .ToolTipText(LOCTEXT("EditPlaneTip", "Constrain point and tangent movement to a 2D plane, or use unrestricted 3D editing. Choosing a plane does not flatten existing geometry."))
+                .OnGetMenuContent(this, &FStrandSplineAssetEditor::MakeEditPlaneMenu)
+                .ButtonContent()[SNew(STextBlock).Text(this, &FStrandSplineAssetEditor::GetEditPlaneLabel)]]
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(4.0f, 0.0f, 2.0f, 0.0f)
+            [SNew(SComboButton)
+                .IsEnabled_Lambda([this]() { return bPenMode; })
+                .ToolTipText(LOCTEXT("PenSnapTip", "Pen anchor and handle snapping in centimeters. Does not modify existing spline geometry."))
+                .OnGetMenuContent(this, &FStrandSplineAssetEditor::MakePenSnapMenu)
+                .ButtonContent()[SNew(STextBlock).Text(this, &FStrandSplineAssetEditor::GetPenSnapLabel)]]
             + SHorizontalBox::Slot().AutoWidth().Padding(7.0f, 0.0f, 2.0f, 0.0f)
             [SNew(SButton).Text(LOCTEXT("Frame", "Frame All"))
                 .ToolTipText(LOCTEXT("FrameTip", "Fit the entire spline in the viewport. Shortcut: F."))
@@ -228,21 +276,32 @@ TSharedRef<SDockTab> FStrandSplineAssetEditor::SpawnPreviewTab(const FSpawnTabAr
         + SVerticalBox::Slot().FillHeight(1.0f).Padding(6.0f, 0.0f)
         [SAssignNew(PreviewWidget, SStrandSplineViewport)]
         + SVerticalBox::Slot().AutoHeight().Padding(9.0f, 6.0f, 9.0f, 2.0f)
-        [SNew(STextBlock).Text(this, &FStrandSplineAssetEditor::GetSummary)]
-        + SVerticalBox::Slot().AutoHeight().Padding(9.0f, 0.0f, 9.0f, 2.0f)
-        [SNew(STextBlock).Text(this, &FStrandSplineAssetEditor::GetSourceDescription)]
-        + SVerticalBox::Slot().AutoHeight().Padding(9.0f, 0.0f, 9.0f, 7.0f)
         [SNew(STextBlock)
-            .Text(LOCTEXT("PointLegend", "Green: start   |   Amber: end   |   Yellow: selected   |   Click to select, drag translation axes to move"))
+            .Text(this, &FStrandSplineAssetEditor::GetSummary)
+            .ToolTipText(this, &FStrandSplineAssetEditor::GetSourceDescription)]
+        + SVerticalBox::Slot().AutoHeight().Padding(9.0f, 0.0f, 9.0f, 6.0f)
+        [SNew(STextBlock).Text(this, &FStrandSplineAssetEditor::GetEditorHint)
             .ColorAndOpacity(FSlateColor::UseSubduedForeground())]
     ];
     if (PreviewWidget.IsValid() && NativePreview.IsValid())
     {
         PreviewWidget->SetSpline(NativePreview.Get());
         PreviewWidget->SetOnPointSelected([this](int32 Index) { SelectPoint(Index); });
+        PreviewWidget->SetOnTangentSelected([this](int32 Index, int32 Handle) { SelectTangentHandle(Index, Handle); });
+        PreviewWidget->SetTangentDragCallback([this](int32 Handle, const FVector& Delta) { ApplyViewportTangentDrag(Handle, Delta); });
         PreviewWidget->SetPointDragCallbacks(
             [this](const FVector& Delta) { ApplyViewportPointDrag(Delta); },
             [this]() { EndViewportPointDrag(); });
+        PreviewWidget->SetPenCallbacks(
+            [this](const FStrandPenHit& Hit) { return BeginPenStroke(Hit); },
+            [this](const FVector& Offset) { UpdatePenStroke(Offset); },
+            [this]() { EndPenStroke(); },
+            [this]() { CancelPenStroke(); },
+            [this]() { SetPenMode(false); });
+        PreviewWidget->SetPenMode(bPenMode);
+        PreviewWidget->SetPenSnap(PenSnapStep);
+        PreviewWidget->SetPenPlane(EditPlane == EStrandEditPlane::XY ? 2 :
+            EditPlane == EStrandEditPlane::XZ ? 1 : EditPlane == EStrandEditPlane::YZ ? 0 : -1);
     }
     return Tab;
 }
@@ -254,7 +313,7 @@ TSharedRef<SDockTab> FStrandSplineAssetEditor::SpawnDetailsTab(const FSpawnTabAr
     [
         SNew(SVerticalBox)
         + SVerticalBox::Slot().AutoHeight().Padding(8.0f, 8.0f, 8.0f, 2.0f)
-        [SNew(STextBlock).Text(LOCTEXT("PointInspector", "SELECTED POINT"))
+        [SNew(STextBlock).Text(LOCTEXT("PointInspector", "POINT EDITOR"))
             .ColorAndOpacity(FSlateColor::UseForeground())]
         + SVerticalBox::Slot().AutoHeight().Padding(8.0f, 0.0f, 8.0f, 8.0f)
         [
@@ -279,6 +338,7 @@ TSharedRef<SDockTab> FStrandSplineAssetEditor::SpawnDetailsTab(const FSpawnTabAr
                 .MaxFractionalDigits(3)
                 .LabelVAlign(VAlign_Center)
                 .Label()[SNew(STextBlock).Text(FText::FromString(TEXT("X")))]
+                .IsEnabled_Lambda([this]() { return EditPlane != EStrandEditPlane::YZ; })
                 .Value_Lambda([this]() { return GetPointCoordinate(0); })
                 .OnValueCommitted_Lambda([this](double Value, ETextCommit::Type) { SetPointCoordinate(Value, 0); })]
             + SHorizontalBox::Slot().FillWidth(1.0f).Padding(2.0f)
@@ -287,6 +347,7 @@ TSharedRef<SDockTab> FStrandSplineAssetEditor::SpawnDetailsTab(const FSpawnTabAr
                 .MaxFractionalDigits(3)
                 .LabelVAlign(VAlign_Center)
                 .Label()[SNew(STextBlock).Text(FText::FromString(TEXT("Y")))]
+                .IsEnabled_Lambda([this]() { return EditPlane != EStrandEditPlane::XZ; })
                 .Value_Lambda([this]() { return GetPointCoordinate(1); })
                 .OnValueCommitted_Lambda([this](double Value, ETextCommit::Type) { SetPointCoordinate(Value, 1); })]
             + SHorizontalBox::Slot().FillWidth(1.0f).Padding(2.0f)
@@ -295,38 +356,60 @@ TSharedRef<SDockTab> FStrandSplineAssetEditor::SpawnDetailsTab(const FSpawnTabAr
                 .MaxFractionalDigits(3)
                 .LabelVAlign(VAlign_Center)
                 .Label()[SNew(STextBlock).Text(FText::FromString(TEXT("Z")))]
+                .IsEnabled_Lambda([this]() { return EditPlane != EStrandEditPlane::XY; })
                 .Value_Lambda([this]() { return GetPointCoordinate(2); })
                 .OnValueCommitted_Lambda([this](double Value, ETextCommit::Type) { SetPointCoordinate(Value, 2); })]
+        ]
+        + SVerticalBox::Slot().AutoHeight().Padding(8.0f, 0.0f, 8.0f, 7.0f)
+        [SNew(SVerticalBox)
+            .Visibility_Lambda([this]() { return HasSelectedPoint() && SelectedHandle != 0 ? EVisibility::Visible : EVisibility::Collapsed; })
+            + SVerticalBox::Slot().AutoHeight().Padding(0.0f, 2.0f)
+            [SNew(STextBlock).Text(LOCTEXT("SelectedTangentCoords", "SELECTED TANGENT (local cm per spline key)"))
+                .ColorAndOpacity(FSlateColor::UseSubduedForeground())]
+            + SVerticalBox::Slot().AutoHeight()
+            [SNew(SHorizontalBox)
+                + SHorizontalBox::Slot().FillWidth(1.0f).Padding(2.0f)
+                [SNew(SNumericEntryBox<double>).MinFractionalDigits(0).MaxFractionalDigits(3)
+                    .IsEnabled_Lambda([this]() { return EditPlane != EStrandEditPlane::YZ; })
+                    .Label()[SNew(STextBlock).Text(FText::FromString(TEXT("X")))]
+                    .Value_Lambda([this]() { return GetTangentCoordinate(0); })
+                    .OnValueCommitted_Lambda([this](double Value, ETextCommit::Type) { SetTangentCoordinate(Value, 0); })]
+                + SHorizontalBox::Slot().FillWidth(1.0f).Padding(2.0f)
+                [SNew(SNumericEntryBox<double>).MinFractionalDigits(0).MaxFractionalDigits(3)
+                    .IsEnabled_Lambda([this]() { return EditPlane != EStrandEditPlane::XZ; })
+                    .Label()[SNew(STextBlock).Text(FText::FromString(TEXT("Y")))]
+                    .Value_Lambda([this]() { return GetTangentCoordinate(1); })
+                    .OnValueCommitted_Lambda([this](double Value, ETextCommit::Type) { SetTangentCoordinate(Value, 1); })]
+                + SHorizontalBox::Slot().FillWidth(1.0f).Padding(2.0f)
+                [SNew(SNumericEntryBox<double>).MinFractionalDigits(0).MaxFractionalDigits(3)
+                    .IsEnabled_Lambda([this]() { return EditPlane != EStrandEditPlane::XY; })
+                    .Label()[SNew(STextBlock).Text(FText::FromString(TEXT("Z")))]
+                    .Value_Lambda([this]() { return GetTangentCoordinate(2); })
+                    .OnValueCommitted_Lambda([this](double Value, ETextCommit::Type) { SetTangentCoordinate(Value, 2); })]
+            ]
         ]
         + SVerticalBox::Slot().AutoHeight().Padding(8.0f, 1.0f, 8.0f, 4.0f)
         [SNew(SHorizontalBox)
             + SHorizontalBox::Slot().AutoWidth().Padding(2.0f)
-            [SNew(SButton).Text(LOCTEXT("AddPoint", "Insert Point"))
+            [SNew(SButton)
                 .ToolTipText(LOCTEXT("AddPointTip", "Insert a new control point after the selected point, splitting the segment at its midpoint. Undoable."))
                 .IsEnabled(this, &FStrandSplineAssetEditor::HasSelectedPoint)
-                .OnClicked(this, &FStrandSplineAssetEditor::AddPointAfterSelection)]
+                .OnClicked(this, &FStrandSplineAssetEditor::AddPointAfterSelection)
+                [ActionContent(TEXT("Icons.Plus"), LOCTEXT("AddPoint", "Insert After"))]]
             + SHorizontalBox::Slot().AutoWidth().Padding(2.0f)
-            [SNew(SButton).Text(LOCTEXT("DeletePoint", "Delete Point"))
+            [SNew(SButton)
                 .ToolTipText(LOCTEXT("DeletePointTip", "Delete the selected point. A spline must retain at least two points. Undoable."))
                 .IsEnabled_Lambda([this]() { return HasSelectedPoint() && Asset->Points.Num() > 2; })
-                .OnClicked(this, &FStrandSplineAssetEditor::RemoveSelectedPoint)]
+                .OnClicked(this, &FStrandSplineAssetEditor::RemoveSelectedPoint)
+                [ActionContent(TEXT("Icons.Delete"), LOCTEXT("DeletePoint", "Delete Point"))]]
             + SHorizontalBox::Slot().AutoWidth().Padding(2.0f)
             [SNew(SComboButton)
                 .IsEnabled(this, &FStrandSplineAssetEditor::HasSelectedPoint)
                 .OnGetMenuContent(this, &FStrandSplineAssetEditor::MakePointTypeMenu)
                 .ButtonContent()[SNew(STextBlock).Text(LOCTEXT("PointType", "Point Type"))]]
         ]
-        + SVerticalBox::Slot().AutoHeight().Padding(8.0f, 0.0f, 8.0f, 3.0f)
-        [SNew(SButton).Text(LOCTEXT("ToggleLoop", "Toggle Closed Loop"))
-            .ToolTipText(LOCTEXT("ToggleLoopTip", "Toggle the source spline's closed-loop state. Does not modify linked level instances."))
-            .OnClicked(this, &FStrandSplineAssetEditor::ToggleClosedLoop)]
-        + SVerticalBox::Slot().AutoHeight().Padding(8.0f, 0.0f, 8.0f, 8.0f)
-        [SNew(STextBlock)
-            .Text(LOCTEXT("PointInspectorHint", "Position in local centimeters. Drag the viewport gizmo or commit a value; one Undo action per gizmo drag."))
-            .AutoWrapText(true)
-            .ColorAndOpacity(FSlateColor::UseSubduedForeground())]
         + SVerticalBox::Slot().AutoHeight().Padding(8.0f, 4.0f, 8.0f, 6.0f)
-        [SNew(STextBlock).Text(LOCTEXT("AdvancedProperties", "ASSET PROPERTIES"))]
+        [SNew(STextBlock).Text(LOCTEXT("AdvancedProperties", "ASSET SETTINGS"))]
         + SVerticalBox::Slot().FillHeight(1.0f)
         [DetailsView.ToSharedRef()]
         + SVerticalBox::Slot().AutoHeight().Padding(8.0f, 6.0f, 8.0f, 8.0f)
@@ -377,7 +460,8 @@ FText FStrandSplineAssetEditor::GetSelectedPointLabel() const
     const USplineDataAsset* Current = Asset.Get();
     if (!Current || Current->Points.IsEmpty()) { return LOCTEXT("NoPoints", "No spline points"); }
     if (!HasSelectedPoint()) { return LOCTEXT("SelectPointHint", "Click a control point in the viewport"); }
-    return FText::FromString(FString::Printf(TEXT("Point %d of %d"), SelectedPointIndex + 1, Current->Points.Num()));
+    const TCHAR* HandleName = SelectedHandle == 1 ? TEXT("  |  Incoming tangent") : SelectedHandle == 2 ? TEXT("  |  Outgoing tangent") : TEXT("");
+    return FText::FromString(FString::Printf(TEXT("Point %d of %d%s"), SelectedPointIndex + 1, Current->Points.Num(), HandleName));
 }
 
 TOptional<double> FStrandSplineAssetEditor::GetPointCoordinate(int32 Axis) const
@@ -391,12 +475,53 @@ void FStrandSplineAssetEditor::SetPointCoordinate(double Value, int32 Axis)
 {
     USplineDataAsset* Current = Asset.Get();
     if (!HasSelectedPoint() || !FMath::IsFinite(Value)) { return; }
+    const int32 LockedAxis = EditPlane == EStrandEditPlane::XY ? 2 : EditPlane == EStrandEditPlane::XZ ? 1 : EditPlane == EStrandEditPlane::YZ ? 0 : -1;
+    if (Axis == LockedAxis) { return; }
     FVector& Position = Current->Points[SelectedPointIndex].LocalPosition;
     double* Target = Axis == 0 ? &Position.X : Axis == 1 ? &Position.Y : &Position.Z;
     if (FMath::IsNearlyEqual(*Target, Value, 0.000001)) { return; }
     const FScopedTransaction Transaction(LOCTEXT("MovePointTransaction", "Move Strand Spline Point"));
     Current->Modify();
     *Target = Value;
+    Current->PostEditChange();
+    Current->MarkPackageDirty();
+    RebuildNativePreview();
+    if (DetailsView.IsValid()) { DetailsView->ForceRefresh(); }
+}
+
+TOptional<double> FStrandSplineAssetEditor::GetTangentCoordinate(int32 Axis) const
+{
+    if (!HasSelectedPoint() || !NativePreview.IsValid() || SelectedHandle == 0 || Axis < 0 || Axis > 2)
+    {
+        return TOptional<double>();
+    }
+    const FSplinePoint Point = NativePreview->GetSplinePointAt(SelectedPointIndex, ESplineCoordinateSpace::Local);
+    return SelectedHandle == 1 ? Point.ArriveTangent[Axis] : Point.LeaveTangent[Axis];
+}
+
+void FStrandSplineAssetEditor::SetTangentCoordinate(double Value, int32 Axis)
+{
+    USplineDataAsset* Current = Asset.Get();
+    if (!HasSelectedPoint() || !NativePreview.IsValid() || SelectedHandle == 0 || Axis < 0 || Axis > 2 || !FMath::IsFinite(Value))
+    {
+        return;
+    }
+    const int32 LockedAxis = EditPlane == EStrandEditPlane::XY ? 2 : EditPlane == EStrandEditPlane::XZ ? 1 : EditPlane == EStrandEditPlane::YZ ? 0 : -1;
+    if (Axis == LockedAxis) { return; }
+    const FSplinePoint Evaluated = NativePreview->GetSplinePointAt(SelectedPointIndex, ESplineCoordinateSpace::Local);
+    const double Previous = SelectedHandle == 1 ? Evaluated.ArriveTangent[Axis] : Evaluated.LeaveTangent[Axis];
+    if (FMath::IsNearlyEqual(Previous, Value, 0.000001)) { return; }
+    const FScopedTransaction Transaction(LOCTEXT("EditTangentUndo", "Edit Strand Spline Tangent"));
+    Current->Modify();
+    FSplinePointData& Saved = Current->Points[SelectedPointIndex];
+    if (Saved.PointType != ESplinePointType::CurveCustomTangent)
+    {
+        Saved.ArriveTangent = Evaluated.ArriveTangent;
+        Saved.LeaveTangent = Evaluated.LeaveTangent;
+        Saved.PointType = ESplinePointType::CurveCustomTangent;
+    }
+    if (SelectedHandle == 1) { Saved.ArriveTangent[Axis] = Value; }
+    else { Saved.LeaveTangent[Axis] = Value; }
     Current->PostEditChange();
     Current->MarkPackageDirty();
     RebuildNativePreview();
@@ -424,7 +549,11 @@ void FStrandSplineAssetEditor::ApplyViewportPointDrag(const FVector& LocalDelta)
     // tracking. In that case open the transaction lazily on the first delta.
     if (!ActivePointDragTransaction) { BeginViewportPointDrag(); }
     if (!ActivePointDragTransaction) { return; }
-    Current->Points[SelectedPointIndex].LocalPosition += LocalDelta;
+    FVector Constrained = LocalDelta;
+    const int32 LockedAxis = EditPlane == EStrandEditPlane::XY ? 2 : EditPlane == EStrandEditPlane::XZ ? 1 : EditPlane == EStrandEditPlane::YZ ? 0 : -1;
+    if (LockedAxis >= 0) { Constrained[LockedAxis] = 0.0; }
+    if (Constrained.IsNearlyZero()) { return; }
+    Current->Points[SelectedPointIndex].LocalPosition += Constrained;
     bPointChangedDuringDrag = true;
     Current->PostEditChange();
     RebuildNativePreview();
@@ -447,7 +576,8 @@ void FStrandSplineAssetEditor::SelectPoint(int32 Index)
     EndViewportPointDrag();
     const USplineDataAsset* Current = Asset.Get();
     SelectedPointIndex = Current && Current->Points.IsValidIndex(Index) ? Index : INDEX_NONE;
-    if (PreviewWidget.IsValid()) { PreviewWidget->SetSelectedPointIndex(SelectedPointIndex); }
+    SelectedHandle = 0;
+    if (PreviewWidget.IsValid()) { PreviewWidget->SetSelectedPointIndex(SelectedPointIndex); PreviewWidget->SetSelectedHandle(0); }
 }
 
 FReply FStrandSplineAssetEditor::SelectAdjacentPoint(int32 Direction)
@@ -587,89 +717,27 @@ FReply FStrandSplineAssetEditor::ExportSvg()
 FReply FStrandSplineAssetEditor::AddPointAfterSelection()
 {
     USplineDataAsset* Current = Asset.Get();
-    if (!HasSelectedPoint() || Current->Points.Num() >= 100000) { return FReply::Handled(); }
+    if (!HasSelectedPoint() || !NativePreview.IsValid() || Current->Points.Num() >= 100000) { return FReply::Handled(); }
     EndViewportPointDrag();
     const int32 Index = SelectedPointIndex;
-    const int32 NextIndex = (Index + 1) % Current->Points.Num();
-    // Split the evaluated Hermite/Bézier segment at t=0.5 using de Casteljau.
-    // This preserves the 3D curve exactly, unlike averaging its anchor positions.
-    // An append after the final point of an open spline is an intentional extension.
-    FSplinePointData NewPoint = Current->Points[Index];
     const bool bAppend = !Current->bIsClosedLoop && Index == Current->Points.Num() - 1;
-    bool bSplitBezier = false;
-    // Tangents are only consumed after a cubic split, but initialize them so
-    // all control-flow paths remain well-defined (including MSVC /analyze).
-    FVector FirstLeave = FVector::ZeroVector;
-    FVector NextArrive = FVector::ZeroVector;
+    const FScopedTransaction Transaction(LOCTEXT("InsertStrandPoint", "Insert Strand Spline Point"));
+    Current->Modify();
+    int32 InsertIndex = INDEX_NONE;
     if (bAppend)
     {
-        const FVector Direction = Current->Points[Index].LocalPosition - Current->Points[Index - 1].LocalPosition;
-        NewPoint.LocalPosition += Direction * 0.5;
-        NewPoint.PointType = ESplinePointType::Curve;
-        NewPoint.ArriveTangent = FVector::ZeroVector;
-        NewPoint.LeaveTangent = FVector::ZeroVector;
+        const FVector Direction = Index > 0
+            ? (Current->Points[Index].LocalPosition - Current->Points[Index - 1].LocalPosition) * 0.5
+            : FVector(100.0, 0.0, 0.0);
+        InsertIndex = StrandSplineEditOperations::AppendPenPoint(Current->Points,
+            Current->Points[Index].LocalPosition + Direction, false, false);
     }
     else
     {
-        // Use the transient native spline, which has already evaluated Curve
-        // and CurveClamped tangents according to Unreal's own spline semantics.
-        const FSplinePoint A = NativePreview->GetSplinePointAt(Index, ESplineCoordinateSpace::Local);
-        const FSplinePoint B = NativePreview->GetSplinePointAt(NextIndex, ESplineCoordinateSpace::Local);
-        if (A.Type == ESplinePointType::Linear)
-        {
-            NewPoint.LocalPosition = (A.Position + B.Position) * 0.5;
-            NewPoint.PointType = ESplinePointType::Linear;
-            NewPoint.ArriveTangent = FVector::ZeroVector;
-            NewPoint.LeaveTangent = FVector::ZeroVector;
-        }
-        else if (A.Type == ESplinePointType::Constant)
-        {
-            // Insert at the middle of the parameter range without changing
-            // the constant segment's discontinuous value.
-            NewPoint.LocalPosition = A.Position;
-            NewPoint.PointType = ESplinePointType::Constant;
-        }
-        else
-        {
-            const FVector C1 = A.Position + A.LeaveTangent / 3.0;
-            const FVector C2 = B.Position - B.ArriveTangent / 3.0;
-            const FVector L = (A.Position + C1) * 0.5;
-            const FVector M = (C1 + C2) * 0.5;
-            const FVector R = (C2 + B.Position) * 0.5;
-            const FVector LM = (L + M) * 0.5;
-            const FVector MR = (M + R) * 0.5;
-            const FVector Midpoint = (LM + MR) * 0.5;
-            FirstLeave = (L - A.Position) * 3.0;
-            const FVector MidArrive = (Midpoint - LM) * 3.0;
-            const FVector MidLeave = (MR - Midpoint) * 3.0;
-            NextArrive = (B.Position - R) * 3.0;
-            NewPoint.LocalPosition = Midpoint;
-            NewPoint.ArriveTangent = MidArrive;
-            NewPoint.LeaveTangent = MidLeave;
-            NewPoint.PointType = ESplinePointType::CurveCustomTangent;
-            bSplitBezier = true;
-        }
+        InsertIndex = StrandSplineEditOperations::InsertOnSegment(Current->Points,
+            Current->bIsClosedLoop, NativePreview.Get(), Index, 0.5);
     }
-    const FScopedTransaction Transaction(LOCTEXT("InsertStrandPoint", "Insert Strand Spline Point"));
-    Current->Modify();
-    // When splitting a smooth segment, the neighboring anchors become custom-
-    // tangent anchors. This preserves the exact original geometry even if they
-    // previously used auto-generated tangent modes.
-    if (bSplitBezier)
-    {
-        Current->Points[Index].PointType = ESplinePointType::CurveCustomTangent;
-        Current->Points[Index].ArriveTangent = NativePreview->GetSplinePointAt(Index, ESplineCoordinateSpace::Local).ArriveTangent;
-        Current->Points[Index].LeaveTangent = FirstLeave;
-        Current->Points[NextIndex].PointType = ESplinePointType::CurveCustomTangent;
-        Current->Points[NextIndex].LeaveTangent = NativePreview->GetSplinePointAt(NextIndex, ESplineCoordinateSpace::Local).LeaveTangent;
-        Current->Points[NextIndex].ArriveTangent = NextArrive;
-    }
-    Current->Points.Insert(NewPoint, Index + 1);
-    Current->PostEditChange();
-    Current->MarkPackageDirty();
-    RebuildNativePreview();
-    SelectPoint(Index + 1);
-    if (DetailsView.IsValid()) { DetailsView->ForceRefresh(); }
+    if (InsertIndex != INDEX_NONE) { CommitSplineEdit(InsertIndex); }
     return FReply::Handled();
 }
 
@@ -693,7 +761,7 @@ FReply FStrandSplineAssetEditor::RemoveSelectedPoint()
 FReply FStrandSplineAssetEditor::ToggleClosedLoop()
 {
     USplineDataAsset* Current = Asset.Get();
-    if (!Current) { return FReply::Handled(); }
+    if (!Current || (!Current->bIsClosedLoop && Current->Points.Num() < 2)) { return FReply::Handled(); }
     EndViewportPointDrag();
     const FScopedTransaction Transaction(LOCTEXT("ToggleStrandLoop", "Toggle Strand Closed Loop"));
     Current->Modify();
@@ -737,6 +805,467 @@ TSharedRef<SWidget> FStrandSplineAssetEditor::MakePointTypeMenu()
     Add(ESplinePointType::Linear, LOCTEXT("LinearPoint", "Linear"));
     Add(ESplinePointType::Constant, LOCTEXT("ConstantPoint", "Constant (not exportable yet)"));
     return Menu.MakeWidget();
+}
+
+FText FStrandSplineAssetEditor::GetEditPlaneLabel() const
+{
+    switch (EditPlane)
+    {
+    case EStrandEditPlane::XY: return LOCTEXT("EditXYLabel", "Edit: XY");
+    case EStrandEditPlane::XZ: return LOCTEXT("EditXZLabel", "Edit: XZ");
+    case EStrandEditPlane::YZ: return LOCTEXT("EditYZLabel", "Edit: YZ");
+    default: return LOCTEXT("Edit3DLabel", "Edit: 3D");
+    }
+}
+
+void FStrandSplineAssetEditor::SetEditPlane(EStrandEditPlane NewPlane)
+{
+    EndViewportPointDrag();
+    EditPlane = NewPlane;
+    if (PreviewWidget.IsValid())
+    {
+        PreviewWidget->SetPenPlane(NewPlane == EStrandEditPlane::XY ? 2 :
+            NewPlane == EStrandEditPlane::XZ ? 1 : NewPlane == EStrandEditPlane::YZ ? 0 : -1);
+    }
+    if (PreviewWidget.IsValid() && NewPlane != EStrandEditPlane::Free3D)
+    {
+        PreviewWidget->SetProjection(NewPlane == EStrandEditPlane::XY ? LVT_OrthoXY
+            : NewPlane == EStrandEditPlane::XZ ? LVT_OrthoXZ : LVT_OrthoYZ);
+    }
+}
+
+TSharedRef<SWidget> FStrandSplineAssetEditor::MakeEditPlaneMenu()
+{
+    FMenuBuilder Menu(true, nullptr);
+    auto Entry = [this, &Menu](EStrandEditPlane Plane, const FText& Label, const FText& Description)
+    {
+        Menu.AddMenuEntry(Label, Description, FSlateIcon(),
+            FUIAction(FExecuteAction::CreateLambda([this, Plane]() { SetEditPlane(Plane); })));
+    };
+    Entry(EStrandEditPlane::Free3D, LOCTEXT("Edit3D", "Free 3D"), LOCTEXT("Edit3DHelp", "Unrestricted X, Y, Z movement."));
+    Entry(EStrandEditPlane::XY, LOCTEXT("EditXY", "2D Top (XY)"), LOCTEXT("EditXYHelp", "Edit only X/Y; leave existing Z coordinates untouched."));
+    Entry(EStrandEditPlane::XZ, LOCTEXT("EditXZ", "2D Front (XZ)"), LOCTEXT("EditXZHelp", "Edit only X/Z; leave existing Y coordinates untouched."));
+    Entry(EStrandEditPlane::YZ, LOCTEXT("EditYZ", "2D Side (YZ)"), LOCTEXT("EditYZHelp", "Edit only Y/Z; leave existing X coordinates untouched."));
+    return Menu.MakeWidget();
+}
+
+void FStrandSplineAssetEditor::SelectTangentHandle(int32 Point, int32 Handle)
+{
+    SelectPoint(Point);
+    if (!HasSelectedPoint() || Handle < 1 || Handle > 2) { return; }
+    SelectedHandle = Handle;
+    if (PreviewWidget.IsValid()) { PreviewWidget->SetSelectedHandle(Handle); }
+}
+
+void FStrandSplineAssetEditor::ApplyViewportTangentDrag(int32 Handle, const FVector& LocalDelta)
+{
+    USplineDataAsset* Current = Asset.Get();
+    if (!HasSelectedPoint() || (Handle != 1 && Handle != 2)
+        || LocalDelta.IsNearlyZero() || LocalDelta.ContainsNaN() || !NativePreview.IsValid()) { return; }
+    FVector Constrained = LocalDelta;
+    const int32 LockedAxis = EditPlane == EStrandEditPlane::XY ? 2 : EditPlane == EStrandEditPlane::XZ ? 1 : EditPlane == EStrandEditPlane::YZ ? 0 : -1;
+    if (LockedAxis >= 0) { Constrained[LockedAxis] = 0.0; }
+    if (Constrained.IsNearlyZero()) { return; }
+    if (!ActivePointDragTransaction) { BeginViewportPointDrag(); }
+    if (!ActivePointDragTransaction) { return; }
+    FSplinePointData& Point = Current->Points[SelectedPointIndex];
+    if (Point.PointType != ESplinePointType::CurveCustomTangent)
+    {
+        const FSplinePoint Evaluated = NativePreview->GetSplinePointAt(SelectedPointIndex, ESplineCoordinateSpace::Local);
+        Point.ArriveTangent = Evaluated.ArriveTangent;
+        Point.LeaveTangent = Evaluated.LeaveTangent;
+        Point.PointType = ESplinePointType::CurveCustomTangent;
+    }
+    if (Handle == 1) { Point.ArriveTangent -= Constrained * 3.0; }
+    else { Point.LeaveTangent += Constrained * 3.0; }
+    bPointChangedDuringDrag = true;
+    Current->PostEditChange();
+    RebuildNativePreview();
+}
+
+void FStrandSplineAssetEditor::CommitSplineEdit(int32 NewSelection)
+{
+    if (USplineDataAsset* Current = Asset.Get())
+    {
+        Current->PostEditChange();
+        Current->MarkPackageDirty();
+        RebuildNativePreview();
+        SelectPoint(NewSelection);
+        if (DetailsView.IsValid()) { DetailsView->ForceRefresh(); }
+    }
+}
+
+FReply FStrandSplineAssetEditor::ExtendStart()
+{
+    USplineDataAsset* Current = Asset.Get();
+    if (!Current || Current->bIsClosedLoop || Current->Points.Num() < 2 || Current->Points.Num() >= 100000) { return FReply::Handled(); }
+    EndViewportPointDrag();
+    const FScopedTransaction Transaction(LOCTEXT("ExtendStartUndo", "Extend Strand Spline Start"));
+    Current->Modify();
+    FSplinePointData First = Current->Points[0];
+    const FVector Direction = First.LocalPosition - Current->Points[1].LocalPosition;
+    First.LocalPosition += Direction * 0.5;
+    First.PointType = ESplinePointType::Curve;
+    First.ArriveTangent = FVector::ZeroVector;
+    First.LeaveTangent = FVector::ZeroVector;
+    Current->Points.Insert(First, 0);
+    CommitSplineEdit(0);
+    return FReply::Handled();
+}
+
+FReply FStrandSplineAssetEditor::ReverseSpline()
+{
+    USplineDataAsset* Current = Asset.Get();
+    if (!Current || Current->Points.Num() < 2) { return FReply::Handled(); }
+    EndViewportPointDrag();
+    const int32 OldIndex = SelectedPointIndex;
+    const FScopedTransaction Transaction(LOCTEXT("ReverseSplineUndo", "Reverse Strand Spline"));
+    Current->Modify();
+    StrandSplineEditOperations::Reverse(Current->Points, Current->bIsClosedLoop);
+    CommitSplineEdit(OldIndex == INDEX_NONE ? INDEX_NONE : Current->Points.Num() - 1 - OldIndex);
+    return FReply::Handled();
+}
+
+FReply FStrandSplineAssetEditor::SetSelectedAsFirst()
+{
+    USplineDataAsset* Current = Asset.Get();
+    if (!HasSelectedPoint() || !Current->bIsClosedLoop || Current->Points.Num() < 2 || SelectedPointIndex == 0)
+    {
+        return FReply::Handled();
+    }
+    EndViewportPointDrag();
+    const FScopedTransaction Transaction(LOCTEXT("SetStartSplineUndo", "Set Strand Spline First Point"));
+    Current->Modify();
+    const TArray<FSplinePointData> Original = Current->Points;
+    const int32 Count = Original.Num();
+    const int32 NewStart = SelectedPointIndex;
+    for (int32 I = 0; I < Count; ++I) { Current->Points[I] = Original[(NewStart + I) % Count]; }
+    CommitSplineEdit(0);
+    return FReply::Handled();
+}
+
+FReply FStrandSplineAssetEditor::SnapSelectedPoint(double Step)
+{
+    USplineDataAsset* Current = Asset.Get();
+    if (!HasSelectedPoint() || Step <= 0.0 || !FMath::IsFinite(Step)) { return FReply::Handled(); }
+    EndViewportPointDrag();
+    FSplinePointData& Point = Current->Points[SelectedPointIndex];
+    FVector Snapped = Point.LocalPosition;
+    const int32 LockedAxis = EditPlane == EStrandEditPlane::XY ? 2 : EditPlane == EStrandEditPlane::XZ ? 1 : EditPlane == EStrandEditPlane::YZ ? 0 : -1;
+    for (int32 Axis = 0; Axis < 3; ++Axis)
+    {
+        if (Axis != LockedAxis) { Snapped[Axis] = FMath::RoundHalfFromZero(Snapped[Axis] / Step) * Step; }
+    }
+    if (Snapped.Equals(Point.LocalPosition, 0.000001)) { return FReply::Handled(); }
+    const FScopedTransaction Transaction(LOCTEXT("SnapSplinePointUndo", "Snap Strand Spline Point"));
+    Current->Modify();
+    Point.LocalPosition = Snapped;
+    CommitSplineEdit(SelectedPointIndex);
+    return FReply::Handled();
+}
+
+FReply FStrandSplineAssetEditor::SubdivideSpline()
+{
+    USplineDataAsset* Current = Asset.Get();
+    if (!Current || !NativePreview.IsValid() || Current->Points.Num() < 2 || Current->Points.Num() > 8192)
+    {
+        return FReply::Handled();
+    }
+    EndViewportPointDrag();
+    const int32 OldIndex = SelectedPointIndex;
+    const FScopedTransaction Transaction(LOCTEXT("SubdivideSplineUndo", "Subdivide Strand Spline"));
+    Current->Modify();
+    if (StrandSplineEditOperations::Subdivide(Current->Points, Current->bIsClosedLoop, NativePreview.Get()))
+    {
+        CommitSplineEdit(OldIndex == INDEX_NONE ? INDEX_NONE : OldIndex * 2);
+    }
+    return FReply::Handled();
+}
+
+FReply FStrandSplineAssetEditor::LinearizeSpline()
+{
+    USplineDataAsset* Current = Asset.Get();
+    if (!Current || Current->Points.IsEmpty()) { return FReply::Handled(); }
+    EndViewportPointDrag();
+    const FScopedTransaction Transaction(LOCTEXT("LinearSplineUndo", "Linearize Strand Spline"));
+    Current->Modify();
+    StrandSplineEditOperations::MakeAllLinear(Current->Points);
+    CommitSplineEdit(SelectedPointIndex);
+    return FReply::Handled();
+}
+
+FReply FStrandSplineAssetEditor::SmoothSpline()
+{
+    USplineDataAsset* Current = Asset.Get();
+    if (!Current || Current->Points.IsEmpty()) { return FReply::Handled(); }
+    EndViewportPointDrag();
+    const FScopedTransaction Transaction(LOCTEXT("SmoothSplineUndo", "Auto-Smooth Strand Spline"));
+    Current->Modify();
+    StrandSplineEditOperations::MakeAllAuto(Current->Points);
+    CommitSplineEdit(SelectedPointIndex);
+    return FReply::Handled();
+}
+
+FReply FStrandSplineAssetEditor::MirrorSpline(int32 Axis)
+{
+    USplineDataAsset* Current = Asset.Get();
+    if (!Current || Current->Points.IsEmpty()) { return FReply::Handled(); }
+    EndViewportPointDrag();
+    const FScopedTransaction Transaction(LOCTEXT("MirrorSplineUndo", "Mirror Strand Spline"));
+    Current->Modify();
+    StrandSplineEditOperations::Mirror(Current->Points, Axis);
+    CommitSplineEdit(SelectedPointIndex);
+    return FReply::Handled();
+}
+
+FReply FStrandSplineAssetEditor::FlattenSpline(int32 Axis)
+{
+    USplineDataAsset* Current = Asset.Get();
+    if (!Current || Current->Points.IsEmpty()) { return FReply::Handled(); }
+    EndViewportPointDrag();
+    const FText Warning = LOCTEXT("FlattenSplineWarning", "Flattening projects ALL spline points and tangent handles to the selected plane. This permanently changes the saved spline geometry (but supports Undo). Continue?");
+    if (FMessageDialog::Open(EAppMsgType::YesNo, Warning) != EAppReturnType::Yes) { return FReply::Handled(); }
+    const FScopedTransaction Transaction(LOCTEXT("FlattenSplineUndo", "Flatten Strand Spline"));
+    Current->Modify();
+    StrandSplineEditOperations::Flatten(Current->Points, Axis);
+    CommitSplineEdit(SelectedPointIndex);
+    return FReply::Handled();
+}
+
+TSharedRef<SWidget> FStrandSplineAssetEditor::MakeSplineToolsMenu()
+{
+    FMenuBuilder Menu(true, nullptr);
+    auto Entry = [&Menu](const FText& Label, const FText& Tip, TFunction<void()> Action)
+    {
+        const TSharedRef<TFunction<void()>> SharedAction = MakeShared<TFunction<void()>>(MoveTemp(Action));
+        Menu.AddMenuEntry(Label, Tip, FSlateIcon(),
+            FUIAction(FExecuteAction::CreateLambda([SharedAction]() { (*SharedAction)(); })));
+    };
+    Menu.BeginSection(TEXT("Build"), LOCTEXT("BuildToolsSection", "Create and Refine"));
+    Entry(LOCTEXT("StartPenMenu", "Activate Spline Pen"), LOCTEXT("StartPenTip", "Click to draw splines directly in the viewport."), [this]() { SetPenMode(true); });
+    Entry(LOCTEXT("ClearSplineMenu", "Clear All Points"), LOCTEXT("ClearSplineTip", "Remove all points so you can draw a new spline from scratch. Undoable and requires confirmation."), [this]() { ClearSpline(); });
+    Entry(LOCTEXT("ExtendStartMenu", "Extend Start"), LOCTEXT("ExtendStartTip", "Add an anchor before the first point of an open spline."), [this]() { ExtendStart(); });
+    Entry(LOCTEXT("ExtendEndMenu", "Extend End"), LOCTEXT("ExtendEndTip", "Select the final anchor then Insert to extend an open spline."),
+        [this]() { if (USplineDataAsset* Current = Asset.Get()) { if (!Current->bIsClosedLoop && Current->Points.Num() >= 2) { SelectPoint(Current->Points.Num() - 1); AddPointAfterSelection(); } } });
+    Entry(LOCTEXT("SubdivideMenu", "Subdivide All Segments"), LOCTEXT("SubdivideTip", "Insert an anchor halfway along every segment, preserving evaluated cubic geometry."), [this]() { SubdivideSpline(); });
+    Entry(LOCTEXT("ReverseMenu", "Reverse Direction"), LOCTEXT("ReverseTip", "Reverse point order, with inverted incoming/outgoing handles."), [this]() { ReverseSpline(); });
+    Entry(LOCTEXT("FirstPointMenu", "Set Selected as First (Closed)"), LOCTEXT("FirstPointTip", "For closed loops, change the starting anchor without changing the shape."), [this]() { SetSelectedAsFirst(); });
+    Menu.AddSubMenu(LOCTEXT("SnapPointMenu", "Snap Selected Point"), LOCTEXT("SnapPointTip", "Round selected coordinates to a grid increment in centimeters. Active 2D plane locking is respected."),
+        FNewMenuDelegate::CreateLambda([this](FMenuBuilder& Sub)
+        {
+            Sub.AddMenuEntry(LOCTEXT("Snap1", "1 cm"), FText::GetEmpty(), FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this]() { SnapSelectedPoint(1.0); })));
+            Sub.AddMenuEntry(LOCTEXT("Snap10", "10 cm"), FText::GetEmpty(), FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this]() { SnapSelectedPoint(10.0); })));
+            Sub.AddMenuEntry(LOCTEXT("Snap100", "100 cm"), FText::GetEmpty(), FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this]() { SnapSelectedPoint(100.0); })));
+        }));
+    Entry(LOCTEXT("ToggleClosedMenu", "Toggle Closed Loop"), LOCTEXT("ToggleClosedTip", "Join or separate the spline endpoints."), [this]() { ToggleClosedLoop(); });
+    Menu.EndSection();
+    Menu.BeginSection(TEXT("Shape"), LOCTEXT("ShapeToolsSection", "Shape"));
+    Entry(LOCTEXT("LinearAllMenu", "Linearize All"), LOCTEXT("LinearAllTip", "Turn all segments into straight edges. This changes the geometry."), [this]() { LinearizeSpline(); });
+    Entry(LOCTEXT("AutoAllMenu", "Auto-Smooth All"), LOCTEXT("AutoAllTip", "Use Unreal's native automatic cubic tangents on every point. This changes the geometry."), [this]() { SmoothSpline(); });
+    Menu.AddSubMenu(LOCTEXT("MirrorSubMenu", "Mirror"), LOCTEXT("MirrorTip", "Reflect positions and tangents around the spline's control-point bounds center."),
+        FNewMenuDelegate::CreateLambda([this](FMenuBuilder& Sub)
+        {
+            Sub.AddMenuEntry(LOCTEXT("MirrorX", "Mirror X"), FText::GetEmpty(), FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this]() { MirrorSpline(0); })));
+            Sub.AddMenuEntry(LOCTEXT("MirrorY", "Mirror Y"), FText::GetEmpty(), FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this]() { MirrorSpline(1); })));
+            Sub.AddMenuEntry(LOCTEXT("MirrorZ", "Mirror Z"), FText::GetEmpty(), FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this]() { MirrorSpline(2); })));
+        }));
+    Menu.AddSubMenu(LOCTEXT("FlattenSubMenu", "Flatten to Plane"), LOCTEXT("FlattenTip", "Project points AND handles to a 2D plane. Requires confirmation; Undo supported."),
+        FNewMenuDelegate::CreateLambda([this](FMenuBuilder& Sub)
+        {
+            Sub.AddMenuEntry(LOCTEXT("FlattenXY", "Top (XY), discard Z"), FText::GetEmpty(), FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this]() { FlattenSpline(2); })));
+            Sub.AddMenuEntry(LOCTEXT("FlattenXZ", "Front (XZ), discard Y"), FText::GetEmpty(), FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this]() { FlattenSpline(1); })));
+            Sub.AddMenuEntry(LOCTEXT("FlattenYZ", "Side (YZ), discard X"), FText::GetEmpty(), FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this]() { FlattenSpline(0); })));
+        }));
+    Menu.EndSection();
+    return Menu.MakeWidget();
+}
+
+
+void FStrandSplineAssetEditor::SetPenMode(bool bEnabled)
+{
+    if (!bEnabled) { EndPenStroke(); }
+    EndViewportPointDrag();
+    bPenMode = bEnabled;
+    if (PreviewWidget.IsValid())
+    {
+        PreviewWidget->SetPenMode(bEnabled);
+        if (bEnabled) { PreviewWidget->SetShowControlPoints(true); }
+    }
+}
+
+void FStrandSplineAssetEditor::SetPenSnapStep(double Step)
+{
+    PenSnapStep = Step;
+    if (PreviewWidget.IsValid()) { PreviewWidget->SetPenSnap(Step); }
+}
+
+TSharedRef<SWidget> FStrandSplineAssetEditor::MakePenSnapMenu()
+{
+    FMenuBuilder Menu(true, nullptr);
+    auto Add = [this, &Menu](double Step, const FText& Label)
+    {
+        Menu.AddMenuEntry(Label, FText::GetEmpty(), FSlateIcon(),
+            FUIAction(FExecuteAction::CreateLambda([this, Step]() { SetPenSnapStep(Step); })));
+    };
+    Add(0.0, LOCTEXT("PenSnapOff", "No Snapping"));
+    Add(1.0, LOCTEXT("PenSnapOne", "1 cm"));
+    Add(10.0, LOCTEXT("PenSnapTen", "10 cm"));
+    Add(100.0, LOCTEXT("PenSnapHundred", "100 cm"));
+    return Menu.MakeWidget();
+}
+
+FText FStrandSplineAssetEditor::GetPenSnapLabel() const
+{
+    return PenSnapStep > 0.0
+        ? FText::FromString(FString::Printf(TEXT("Snap: %.0f cm"), PenSnapStep))
+        : LOCTEXT("PenSnapNone", "Snap: Off");
+}
+
+FText FStrandSplineAssetEditor::GetEditorHint() const
+{
+    if (bPenMode)
+    {
+        if (const USplineDataAsset* Current = Asset.Get())
+        {
+            if (Current->Points.Num() > 4096)
+            {
+                return LOCTEXT("PenDenseStatus", "Pen  |  Curve segment hit targets disabled above 4096 points  |  Endpoint extension available");
+            }
+        }
+        return LOCTEXT("PenModeStatus", "Pen  |  Click: add / insert  |  Drag: Bezier handles  |  Click endpoints: extend / close  |  Esc: Select");
+    }
+    return LOCTEXT("SelectModeStatus", "Select  |  Green: start  |  Amber: end  |  Yellow: selected  |  Drag gizmo to edit");
+}
+
+FReply FStrandSplineAssetEditor::ClearSpline()
+{
+    USplineDataAsset* Current = Asset.Get();
+    if (!Current || Current->Points.IsEmpty()) { return FReply::Handled(); }
+    if (FMessageDialog::Open(EAppMsgType::YesNo,
+        LOCTEXT("ConfirmClearSpline", "Remove every spline point? The asset will be empty until you draw new points. You can Undo this action."))
+        != EAppReturnType::Yes) { return FReply::Handled(); }
+    EndPenStroke();
+    EndViewportPointDrag();
+    const FScopedTransaction Transaction(LOCTEXT("ClearStrandSplineUndo", "Clear Strand Spline Points"));
+    Current->Modify();
+    Current->Points.Reset();
+    Current->bIsClosedLoop = false;
+    CommitSplineEdit(INDEX_NONE);
+    if (PreviewWidget.IsValid()) { PreviewWidget->FrameSpline(); }
+    return FReply::Handled();
+}
+
+bool FStrandSplineAssetEditor::BeginPenStroke(const FStrandPenHit& Hit)
+{
+    USplineDataAsset* Current = Asset.Get();
+    if (!bPenMode || !Current || !NativePreview.IsValid()) { return false; }
+    EndViewportPointDrag();
+    const int32 Count = Current->Points.Num();
+    if (Hit.PointIndex != INDEX_NONE && Current->Points.IsValidIndex(Hit.PointIndex))
+    {
+        // Click the opposite endpoint to close an open path, or click the same
+        // endpoint to choose which end the next pen click should extend.
+        const bool bOppositeEnds = Count >= 3 && !Current->bIsClosedLoop &&
+            ((SelectedPointIndex == 0 && Hit.PointIndex == Count - 1) ||
+             (SelectedPointIndex == Count - 1 && Hit.PointIndex == 0));
+        if (bOppositeEnds)
+        {
+            ToggleClosedLoop();
+            SetPenMode(false);
+        }
+        else { SelectPoint(Hit.PointIndex); }
+        return false;
+    }
+    if (Current->bIsClosedLoop && Hit.SegmentIndex == INDEX_NONE) { return false; }
+    if (Count >= 100000) { return false; }
+    const bool bPrepend = Count > 1 && SelectedPointIndex == 0;
+    PenPreviousPoints = Current->Points;
+    bPenPreviousClosed = Current->bIsClosedLoop;
+    ActivePenTransaction = MakeUnique<FScopedTransaction>(LOCTEXT("StrandPenStrokeUndo", "Draw Strand Spline Point"));
+    Current->Modify();
+    if (Hit.SegmentIndex != INDEX_NONE)
+    {
+        PenEditingPoint = StrandSplineEditOperations::InsertOnSegment(Current->Points,
+            Current->bIsClosedLoop, NativePreview.Get(), Hit.SegmentIndex, Hit.SegmentAlpha);
+    }
+    else
+    {
+        PenEditingPoint = StrandSplineEditOperations::AppendPenPoint(Current->Points,
+            Hit.Position, bPrepend, Current->bIsClosedLoop);
+    }
+    if (PenEditingPoint == INDEX_NONE)
+    {
+        ActivePenTransaction->Cancel();
+        ActivePenTransaction.Reset();
+        PenPreviousPoints.Reset();
+        return false;
+    }
+    PenPointBeforeHandleDrag = Current->Points[PenEditingPoint];
+    LastPenHandleOffset = FVector::ZeroVector;
+    bPenHandleMoved = false;
+    Current->PostEditChange();
+    RebuildNativePreview();
+    SelectPoint(PenEditingPoint);
+    return true;
+}
+
+void FStrandSplineAssetEditor::UpdatePenStroke(const FVector& HandleOffset)
+{
+    USplineDataAsset* Current = Asset.Get();
+    if (!ActivePenTransaction || !Current || PenEditingPoint == INDEX_NONE ||
+        HandleOffset.ContainsNaN() ||
+        (bPenHandleMoved && HandleOffset.Equals(LastPenHandleOffset, 0.01))) { return; }
+    if (!bPenHandleMoved && HandleOffset.IsNearlyZero(0.01)) { return; }
+    FVector Offset = HandleOffset;
+    const int32 LockedAxis = EditPlane == EStrandEditPlane::XY ? 2 : EditPlane == EStrandEditPlane::XZ ? 1
+        : EditPlane == EStrandEditPlane::YZ ? 0 : -1;
+    if (LockedAxis >= 0) { Offset[LockedAxis] = 0.0; }
+    if (Offset.IsNearlyZero(0.01))
+    {
+        // Returning to the press position must restore an exact inserted
+        // segment, rather than destroying its carefully split tangents.
+        Current->Points[PenEditingPoint] = PenPointBeforeHandleDrag;
+    }
+    else if (!StrandSplineEditOperations::SetPenHandles(Current->Points, PenEditingPoint, Offset))
+    {
+        return;
+    }
+    LastPenHandleOffset = HandleOffset;
+    bPenHandleMoved = true;
+    Current->PostEditChange();
+    RebuildNativePreview();
+}
+
+void FStrandSplineAssetEditor::EndPenStroke()
+{
+    if (!ActivePenTransaction) { return; }
+    if (USplineDataAsset* Current = Asset.Get())
+    {
+        Current->MarkPackageDirty();
+        if (DetailsView.IsValid()) { DetailsView->ForceRefresh(); }
+    }
+    ActivePenTransaction.Reset();
+    PenPreviousPoints.Reset();
+    PenEditingPoint = INDEX_NONE;
+    bPenHandleMoved = false;
+}
+
+void FStrandSplineAssetEditor::CancelPenStroke()
+{
+    if (!ActivePenTransaction) { return; }
+    if (USplineDataAsset* Current = Asset.Get())
+    {
+        Current->Points = MoveTemp(PenPreviousPoints);
+        Current->bIsClosedLoop = bPenPreviousClosed;
+        ActivePenTransaction->Cancel();
+        ActivePenTransaction.Reset();
+        PenEditingPoint = INDEX_NONE;
+        bPenHandleMoved = false;
+        Current->PostEditChange();
+        RebuildNativePreview();
+        SelectPoint(INDEX_NONE);
+        if (DetailsView.IsValid()) { DetailsView->ForceRefresh(); }
+    }
 }
 
 FText FStrandSplineAssetEditor::GetSummary() const

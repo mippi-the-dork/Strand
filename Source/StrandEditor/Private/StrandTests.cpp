@@ -806,3 +806,146 @@ bool FStrandSplineAuthoringExportTest::RunTest(const FString& Parameters)
     return true;
 }
 #endif
+
+#if WITH_DEV_AUTOMATION_TESTS
+#include "StrandSplineEditOperations.h"
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStrandSplineEditingOperationsTest,
+    "Strand.Editor.Authoring.SplineEditingOperations",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FStrandSplineEditingOperationsTest::RunTest(const FString& Parameters)
+{
+    USplineDataAsset* Asset = NewObject<USplineDataAsset>(GetTransientPackage());
+    FSplinePointData A, B, C;
+    A.LocalPosition = FVector(5.0, -7.0, 15.0);
+    B.LocalPosition = FVector(120.0, 75.0, 45.0);
+    C.LocalPosition = FVector(270.0, -30.0, -20.0);
+    A.LeaveTangent = FVector(110.0, 180.0, 15.0);
+    B.ArriveTangent = FVector(150.0, 80.0, 20.0);
+    B.LeaveTangent = FVector(100.0, -45.0, 50.0);
+    C.ArriveTangent = FVector(160.0, -70.0, -20.0);
+    A.PointType = B.PointType = C.PointType = ESplinePointType::CurveCustomTangent;
+    Asset->Points = {A, B, C};
+    USplineComponent* Native = NewObject<USplineComponent>(GetTransientPackage());
+    Asset->ApplyToSplineComponent(Native);
+    TArray<FVector> OriginalSamples;
+    for (int32 I = 0; I <= 48; ++I)
+    {
+        OriginalSamples.Add(Native->GetLocationAtSplineInputKey(I * 2.0 / 48.0, ESplineCoordinateSpace::Local));
+    }
+    TestTrue(TEXT("Subdivide succeeds"), StrandSplineEditOperations::Subdivide(Asset->Points, false, Native));
+    TestEqual(TEXT("Subdivide inserts one anchor per segment"), Asset->Points.Num(), 5);
+    Asset->ApplyToSplineComponent(Native);
+    double LargestDeviation = 0.0;
+    for (int32 I = 0; I <= 48; ++I)
+    {
+        const FVector After = Native->GetLocationAtSplineInputKey(I * 4.0 / 48.0, ESplineCoordinateSpace::Local);
+        LargestDeviation = FMath::Max(LargestDeviation, FVector::Distance(OriginalSamples[I], After));
+    }
+    TestTrue(TEXT("de Casteljau subdivision retains cubic shape to 0.01 cm"), LargestDeviation < 0.01);
+    const TArray<FSplinePointData> BeforeReverse = Asset->Points;
+    StrandSplineEditOperations::Reverse(Asset->Points, false);
+    TestTrue(TEXT("Reverse flips endpoint order"), Asset->Points[0].LocalPosition.Equals(BeforeReverse.Last().LocalPosition));
+    TestTrue(TEXT("Reverse swaps and negates arriving tangent"), Asset->Points[0].ArriveTangent.Equals(-BeforeReverse.Last().LeaveTangent));
+    StrandSplineEditOperations::Mirror(Asset->Points, 0);
+    StrandSplineEditOperations::Mirror(Asset->Points, 0);
+    for (int32 I = 0; I < Asset->Points.Num(); ++I)
+    {
+        TestTrue(TEXT("Double mirror restores point coordinates"), Asset->Points[I].LocalPosition.Equals(BeforeReverse[BeforeReverse.Num() - I - 1].LocalPosition, 0.001));
+    }
+    StrandSplineEditOperations::Flatten(Asset->Points, 2);
+    for (const FSplinePointData& Point : Asset->Points)
+    {
+        TestTrue(TEXT("Flatten XY zeros depth and both handles"),
+            FMath::IsNearlyZero(Point.LocalPosition.Z) && FMath::IsNearlyZero(Point.ArriveTangent.Z) && FMath::IsNearlyZero(Point.LeaveTangent.Z));
+    }
+    StrandSplineEditOperations::MakeAllLinear(Asset->Points);
+    for (const FSplinePointData& Point : Asset->Points) { TestTrue(TEXT("Linear mode"), Point.PointType == ESplinePointType::Linear); }
+    StrandSplineEditOperations::MakeAllAuto(Asset->Points);
+    for (const FSplinePointData& Point : Asset->Points) { TestTrue(TEXT("Auto mode"), Point.PointType == ESplinePointType::Curve); }
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStrandSplinePenGeometryTest,
+    "Strand.Editor.Authoring.SplinePenGeometry",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FStrandSplinePenGeometryTest::RunTest(const FString& Parameters)
+{
+    USplineDataAsset* Asset = NewObject<USplineDataAsset>(GetTransientPackage());
+    USplineComponent* Native = NewObject<USplineComponent>(GetTransientPackage());
+    FSplinePointData A, B, C;
+    A.LocalPosition = FVector(0, 10, 30);
+    B.LocalPosition = FVector(120, 40, -20);
+    C.LocalPosition = FVector(250, -20, 90);
+    A.PointType = B.PointType = C.PointType = ESplinePointType::CurveCustomTangent;
+    A.LeaveTangent = FVector(100, 160, 30);
+    B.ArriveTangent = FVector(60, 90, 20);
+    B.LeaveTangent = FVector(75, -80, 10);
+    C.ArriveTangent = FVector(120, -70, 45);
+    Asset->Points = { A, B, C };
+    Asset->ApplyToSplineComponent(Native);
+    // Inserting at a non-midpoint parameter must not reshape either segment.
+    TArray<FVector> Before;
+    for (int32 I = 0; I <= 80; ++I)
+    {
+        Before.Add(Native->GetLocationAtSplineInputKey(I / 40.0, ESplineCoordinateSpace::Local));
+    }
+    TestEqual(TEXT("Pen split index"), StrandSplineEditOperations::InsertOnSegment(
+        Asset->Points, false, Native, 0, 0.25), 1);
+    TestEqual(TEXT("Pen split adds one point"), Asset->Points.Num(), 4);
+    Asset->ApplyToSplineComponent(Native);
+    double MaxDeviation = 0.0;
+    for (int32 I = 0; I <= 80; ++I)
+    {
+        const double OldKey = I / 40.0;
+        const double NewKey = OldKey <= 0.25 ? OldKey / 0.25
+            : OldKey <= 1.0 ? 1.0 + (OldKey - 0.25) / 0.75 : OldKey + 1.0;
+        MaxDeviation = FMath::Max(MaxDeviation, FVector::Distance(Before[I],
+            Native->GetLocationAtSplineInputKey(NewKey, ESplineCoordinateSpace::Local)));
+    }
+    TestTrue(TEXT("Quarter-segment split preserves cubic to 0.01 cm"), MaxDeviation < 0.01);
+    const int32 CountBeforeInvalid = Asset->Points.Num();
+    TestEqual(TEXT("Cannot split open final endpoint"), StrandSplineEditOperations::InsertOnSegment(
+        Asset->Points, false, Native, CountBeforeInvalid - 1, 0.5), INDEX_NONE);
+    TestEqual(TEXT("Cannot split t=0 endpoint"), StrandSplineEditOperations::InsertOnSegment(
+        Asset->Points, false, Native, 0, 0.0), INDEX_NONE);
+    TestEqual(TEXT("Invalid inserts never mutate"), Asset->Points.Num(), CountBeforeInvalid);
+    TestEqual(TEXT("Pen prepend index"), StrandSplineEditOperations::AppendPenPoint(
+        Asset->Points, FVector(-50, 0, 0), true, false), 0);
+    TestTrue(TEXT("Prepended anchor stays first"), Asset->Points[0].LocalPosition.Equals(FVector(-50, 0, 0)));
+    TestEqual(TEXT("Pen append index"), StrandSplineEditOperations::AppendPenPoint(
+        Asset->Points, FVector(350, 0, 0), false, false), 5);
+    TestTrue(TEXT("Pen handle edit applies"), StrandSplineEditOperations::SetPenHandles(
+        Asset->Points, 5, FVector(10, 20, -5)));
+    TestTrue(TEXT("Outgoing handle is 3x drag"), Asset->Points[5].LeaveTangent.Equals(FVector(30, 60, -15)));
+    TestTrue(TEXT("Incoming handle mirrors outgoing"), Asset->Points[5].ArriveTangent.Equals(FVector(30, 60, -15)));
+    TestEqual(TEXT("Closed splines cannot be extended"), StrandSplineEditOperations::AppendPenPoint(
+        Asset->Points, FVector(400, 0, 0), false, true), INDEX_NONE);
+    TestEqual(TEXT("Count unchanged after closed extension"), Asset->Points.Num(), 6);
+    // The last segment of a closed spline wraps back to point zero. Inserting
+    // on this span must preserve closure and the two cubic subsegments.
+    Asset->Points = { A, B, C };
+    Asset->bIsClosedLoop = true;
+    Asset->ApplyToSplineComponent(Native);
+    const FVector ClosedBeforeA = Native->GetLocationAtSplineInputKey(2.73, ESplineCoordinateSpace::Local);
+    const FVector ClosedBeforeB = Native->GetLocationAtSplineInputKey(2.90, ESplineCoordinateSpace::Local);
+    TestEqual(TEXT("Closed wrap insert appends before closure"), StrandSplineEditOperations::InsertOnSegment(
+        Asset->Points, true, Native, 2, 0.73), 3);
+    Asset->ApplyToSplineComponent(Native);
+    TestTrue(TEXT("Closed loop remains closed"), Native->IsClosedLoop());
+    TestTrue(TEXT("Closed wrap insertion point stays on original curve"),
+        ClosedBeforeA.Equals(Native->GetLocationAtSplineInputKey(3.0, ESplineCoordinateSpace::Local), 0.01));
+    TestTrue(TEXT("Closed wrap second half remains on original curve"),
+        ClosedBeforeB.Equals(Native->GetLocationAtSplineInputKey(3.0 + (0.90 - 0.73) / 0.27,
+            ESplineCoordinateSpace::Local), 0.01));
+    // Empty assets are valid while drawing a new path from scratch.
+    Asset->Points.Empty();
+    TestEqual(TEXT("First anchor in empty path"), StrandSplineEditOperations::AppendPenPoint(
+        Asset->Points, FVector(4, 5, 6), false, false), 0);
+    TestEqual(TEXT("Second anchor in empty path"), StrandSplineEditOperations::AppendPenPoint(
+        Asset->Points, FVector(44, 5, 6), false, false), 1);
+    return true;
+}
+#endif

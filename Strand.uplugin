@@ -1,9 +1,9 @@
 {
   "FileVersion": 3,
-  "Version": 35,
-  "VersionName": "0.6.2",
+  "Version": 37,
+  "VersionName": "0.6.4",
   "FriendlyName": "Strand",
-  "Description": "Native 2D and 3D Strand spline authoring and editing, with SVG and Alembic import/export, editor 3D viewport, point controls, and component synchronization.",
+  "Description": "Native UE5 spline assets, viewport Pen authoring, tangent editing, modeling tools, and SVG/Alembic interchange.",
   "Category": "Editor",
   "CreatedBy": "Strand",
   "CanContainContent": false,
