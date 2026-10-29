@@ -10,6 +10,20 @@
 class UAssetImportData;
 
 /** One spline-local point. No actor/component transform or scene placement is stored. */
+/** How Strand's viewport constrains the two handles of one cubic anchor.
+ *  These are authoring rules; native spline components still receive only
+ *  Unreal's standard point interpolation and tangent vectors.
+ */
+UENUM(BlueprintType)
+enum class EStrandBezierHandleMode : uint8
+{
+    Free UMETA(DisplayName="Free"),
+    Aligned UMETA(DisplayName="Aligned"),
+    Mirrored UMETA(DisplayName="Mirrored"),
+    Auto UMETA(DisplayName="Auto"),
+    Corner UMETA(DisplayName="Corner")
+};
+
 USTRUCT(BlueprintType)
 struct STRAND_API FSplinePointData
 {
@@ -21,6 +35,12 @@ struct STRAND_API FSplinePointData
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Spline") FRotator LocalRotation = FRotator::ZeroRotator;
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Spline") FVector LocalScale = FVector::OneVector;
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Spline") TEnumAsByte<ESplinePointType::Type> PointType = ESplinePointType::Curve;
+    /** Persistent Strand authoring rule. Free is the compatibility default for older assets.
+     *  Native Curve/CurveClamped points are always evaluated as Auto until converted
+     *  to custom tangents. This field does not change the native component schema.
+     */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Spline", meta=(DisplayName="Bezier Handle Mode"))
+    EStrandBezierHandleMode HandleMode = EStrandBezierHandleMode::Free;
 
     FSplinePoint ToSplinePoint(int32 Index) const;
 };

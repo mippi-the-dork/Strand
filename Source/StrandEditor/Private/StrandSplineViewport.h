@@ -45,6 +45,15 @@ public:
     void SetTangentDragCallback(TFunction<void(int32, const FVector&)> InCallback);
     void SetSelectedHandle(int32 Handle);
     void SetPenMode(bool bEnabled);
+    void SetMarqueeMode(bool bEnabled);
+    void SetWidgetMode(int32 Mode);
+    void SetOnMarqueeSelected(TFunction<void(const TArray<int32>&, bool, bool)> InCallback);
+    void SetOnMarqueeExit(TFunction<void()> InCallback);
+    void SetPointRotationCallback(TFunction<void(int32, double)> InCallback);
+    void SetPointScaleCallback(TFunction<void(double)> InCallback);
+    void SetOnWidgetModeChanged(TFunction<void(int32)> InCallback);
+    void SetOnToolShortcut(TFunction<void(int32)> InCallback);
+    void SetOnDeleteShortcut(TFunction<void()> InCallback);
     void SetPenPlane(int32 LockedAxis);
     void SetPenSnap(double Step);
     void SetPenCallbacks(TFunction<bool(const FStrandPenHit&)> OnDown,

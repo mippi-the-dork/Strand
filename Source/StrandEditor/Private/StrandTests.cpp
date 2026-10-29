@@ -84,9 +84,34 @@ bool FSplineAssetRoundTripTest::RunTest(const FString& Parameters)
 
     USplineComponent* Independent = NewObject<USplineComponent>(GetTransientPackage());
     TestNull(TEXT("Second native spline starts unassigned"), UStrandSplineUserData::GetAssignedAsset(Independent));
+    // The asset was intentionally reserialized from Anchored above, so its
+    // contents no longer match Target. Test the actual contract instead:
+    // unlinking metadata must not modify the native component's geometry.
+    TArray<FSplinePoint> GeometryBeforeClear;
+    const int32 PointCountBeforeClear = Target->GetNumberOfSplinePoints();
+    const bool bClosedBeforeClear = Target->IsClosedLoop();
+    for (int32 Index = 0; Index < PointCountBeforeClear; ++Index)
+    {
+        GeometryBeforeClear.Add(Target->GetSplinePointAt(Index, ESplineCoordinateSpace::Local));
+    }
     UStrandSplineUserData::AssignAsset(Target, nullptr);
     TestNull(TEXT("Clearing assignment leaves no reference"), UStrandSplineUserData::GetAssignedAsset(Target));
-    TestTrue(TEXT("Clearing assignment preserves points"), Asset->MatchesSplineComponent(Target));
+    bool bGeometryPreserved = Target->GetNumberOfSplinePoints() == PointCountBeforeClear &&
+        Target->IsClosedLoop() == bClosedBeforeClear;
+    if (bGeometryPreserved)
+    {
+        for (int32 Index = 0; Index < PointCountBeforeClear; ++Index)
+        {
+            const FSplinePoint After = Target->GetSplinePointAt(Index, ESplineCoordinateSpace::Local);
+            const FSplinePoint& PointBeforeClear = GeometryBeforeClear[Index];
+            bGeometryPreserved &= After.Position.Equals(PointBeforeClear.Position, 0.0001) &&
+                After.ArriveTangent.Equals(PointBeforeClear.ArriveTangent, 0.0001) &&
+                After.LeaveTangent.Equals(PointBeforeClear.LeaveTangent, 0.0001) &&
+                After.Rotation.Equals(PointBeforeClear.Rotation, 0.0001) &&
+                After.Scale.Equals(PointBeforeClear.Scale, 0.0001) && After.Type == PointBeforeClear.Type;
+        }
+    }
+    TestTrue(TEXT("Clearing assignment preserves points"), bGeometryPreserved);
     return true;
 }
 
@@ -135,26 +160,39 @@ bool FStrandBlueprintUserDataOwnershipTest::RunTest(const FString& Parameters)
     TestTrue(TEXT("Assigning the same asset still fixes foreign ownership"),
         UStrandSplineUserData::Get(SameAssetInstance)->GetOuter() == SameAssetInstance);
 
-    // The actual reported OFPA error can be from a *locally owned* instance
-    // that still holds its Blueprint component template as its archetype.
-    // Unreal calls this an "Unknown property" reference in the save error.
+    // NewObject with a non-null Template COPIES property values; it does not
+    // promise that GetArchetype() will become that template. The previous test
+    // asserted exactly that undocumented behavior, so it failed on UE 5.8.3
+    // before actually testing Strand. Verify the copy independently, and only
+    // exercise the foreign-archetype repair branch if the engine constructed one.
     USplineComponent* LocalArchetypeInstance = NewObject<USplineComponent>(GetTransientPackage());
-    UStrandSplineUserData* InheritedArchetype = NewObject<UStrandSplineUserData>(
+    UStrandSplineUserData* TemplateCopy = NewObject<UStrandSplineUserData>(
         LocalArchetypeInstance, UStrandSplineUserData::StaticClass(), NAME_None,
         RF_Transactional, Source);
-    LocalArchetypeInstance->AddAssetUserData(InheritedArchetype);
-    TestTrue(TEXT("Simulated local metadata has a foreign Blueprint archetype"),
-        InheritedArchetype->GetOuter() == LocalArchetypeInstance && InheritedArchetype->GetArchetype() == Source);
-    TestTrue(TEXT("Locally owned metadata with foreign archetype is repaired"),
-        UStrandSplineUserData::EnsureComponentOwned(LocalArchetypeInstance));
-    UStrandSplineUserData* FixedArchetype = UStrandSplineUserData::Get(LocalArchetypeInstance);
-    TestTrue(TEXT("Repaired instance no longer references Blueprint private archetype"),
-        FixedArchetype && FixedArchetype != InheritedArchetype &&
-        FixedArchetype->GetOuter() == LocalArchetypeInstance &&
-        FixedArchetype->GetArchetype() == UStrandSplineUserData::StaticClass()->GetDefaultObject());
-    TestEqual(TEXT("Private-archetype repair preserves asset assignment"),
-        FixedArchetype ? FixedArchetype->AssignedSplineAsset.Get() : nullptr, Asset);
-    TestFalse(TEXT("Safe archetype does not trigger repeated repairs"),
+    LocalArchetypeInstance->AddAssetUserData(TemplateCopy);
+    TestEqual(TEXT("Template initialization retained spline link"),
+        TemplateCopy->AssignedSplineAsset.Get(), Asset);
+    TestEqual(TEXT("Template initialization retained anchor index"),
+        TemplateCopy->AnchorPointIndex, 3);
+    const bool bForeignArchetype =
+        TemplateCopy->GetArchetype() != UStrandSplineUserData::StaticClass()->GetDefaultObject();
+    if (bForeignArchetype)
+    {
+        TestTrue(TEXT("Locally owned metadata with foreign archetype is repaired"),
+            UStrandSplineUserData::EnsureComponentOwned(LocalArchetypeInstance));
+    }
+    else
+    {
+        TestFalse(TEXT("Already-safe local template copy needs no repair"),
+            UStrandSplineUserData::EnsureComponentOwned(LocalArchetypeInstance));
+    }
+    UStrandSplineUserData* CheckedCopy = UStrandSplineUserData::Get(LocalArchetypeInstance);
+    TestTrue(TEXT("Local metadata has component ownership and safe archetype"),
+        CheckedCopy && CheckedCopy->GetOuter() == LocalArchetypeInstance &&
+        CheckedCopy->GetArchetype() == UStrandSplineUserData::StaticClass()->GetDefaultObject());
+    TestEqual(TEXT("Local metadata retains its asset after verification or repair"),
+        CheckedCopy ? CheckedCopy->AssignedSplineAsset.Get() : nullptr, Asset);
+    TestFalse(TEXT("Verified safe local metadata needs no repeated repair"),
         UStrandSplineUserData::EnsureComponentOwned(LocalArchetypeInstance));
 
     // Clearing a null-valued assignment must remove the user-data OBJECT,
@@ -1051,6 +1089,105 @@ bool FStrandSplinePenGeometryTest::RunTest(const FString& Parameters)
     return true;
 }
 
+// The authored relationship between cubic handles is stored per Strand point,
+// not on USplineComponent. Native component geometry must remain compatible.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStrandBezierHandleModesTest,
+    "Strand.Editor.Authoring.BezierHandleModes",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FStrandBezierHandleModesTest::RunTest(const FString& Parameters)
+{
+    namespace Ops = StrandSplineEditOperations;
+    FSplinePointData Point;
+    Point.PointType = ESplinePointType::CurveCustomTangent;
+    Point.ArriveTangent = FVector(30.0, 0.0, 0.0);
+    Point.LeaveTangent = FVector(0.0, 60.0, 0.0);
+    TestEqual(TEXT("Legacy custom tangents default to independently editable Free mode"),
+        Ops::EffectiveHandleMode(Point), EStrandBezierHandleMode::Free);
+    TestTrue(TEXT("Aligned mode can be applied"), Ops::SetHandleMode(Point,
+        EStrandBezierHandleMode::Aligned, Point.ArriveTangent, Point.LeaveTangent));
+    TestTrue(TEXT("Aligned initial handles point in a common direction"),
+        Point.ArriveTangent.GetSafeNormal().Equals(Point.LeaveTangent.GetSafeNormal(), 0.000001));
+    const double IncomingLength = Point.ArriveTangent.Size();
+    TestTrue(TEXT("Aligned incoming edit changes both directions"),
+        Ops::EditHandle(Point, 1, FVector(0.0, 40.0, 0.0)));
+    TestTrue(TEXT("Aligned incoming edit retains outgoing handle length"),
+        FMath::IsNearlyEqual(Point.LeaveTangent.Size(), 60.0) &&
+        FMath::IsNearlyEqual(Point.ArriveTangent.Size(), 40.0));
+    TestTrue(TEXT("Aligned mode persists after drag"),
+        Ops::EffectiveHandleMode(Point) == EStrandBezierHandleMode::Aligned);
+    TestTrue(TEXT("Aligned outgoing edit changes both directions"),
+        Ops::EditHandle(Point, 2, FVector(-40.0, 0.0, 0.0)) &&
+        Point.ArriveTangent.Equals(FVector(-40.0, 0.0, 0.0), 0.000001));
+    TestTrue(TEXT("Aligned editing preserves the initial incoming length on mode conversion"),
+        FMath::IsNearlyEqual(IncomingLength, 30.0));
+
+    TestTrue(TEXT("Mirrored mode can be applied"), Ops::SetHandleMode(Point,
+        EStrandBezierHandleMode::Mirrored, Point.ArriveTangent, Point.LeaveTangent));
+    TestTrue(TEXT("Mirrored mode equalizes handle lengths"),
+        Point.ArriveTangent.Equals(Point.LeaveTangent, 0.000001));
+    TestTrue(TEXT("Mirrored outgoing drag follows on incoming side"),
+        Ops::EditHandle(Point, 2, FVector(2.0, 3.0, 4.0)) &&
+        Point.ArriveTangent.Equals(FVector(2.0, 3.0, 4.0), 0.000001));
+    TestTrue(TEXT("Mirrored incoming drag follows on outgoing side"),
+        Ops::EditHandle(Point, 1, FVector(-7.0, 12.0, 0.0)) &&
+        Point.LeaveTangent.Equals(FVector(-7.0, 12.0, 0.0), 0.000001));
+    TestTrue(TEXT("Mirrored zero handle collapses its counterpart"),
+        Ops::EditHandle(Point, 1, FVector::ZeroVector) &&
+        Point.ArriveTangent.IsNearlyZero() && Point.LeaveTangent.IsNearlyZero());
+
+    TestTrue(TEXT("Corner mode collapses both handles"), Ops::SetHandleMode(Point,
+        EStrandBezierHandleMode::Corner, Point.ArriveTangent, Point.LeaveTangent));
+    TestTrue(TEXT("Corner uses native custom tangent data"),
+        Point.PointType.GetValue() == ESplinePointType::CurveCustomTangent &&
+        Point.ArriveTangent.IsNearlyZero() && Point.LeaveTangent.IsNearlyZero());
+    TestTrue(TEXT("Dragging a corner promotes it to Free"),
+        Ops::EditHandle(Point, 2, FVector(7.0, 0.0, 0.0)) &&
+        Ops::EffectiveHandleMode(Point) == EStrandBezierHandleMode::Free);
+    TestTrue(TEXT("Free mode leaves other handle alone"),
+        Ops::EditHandle(Point, 1, FVector(0.0, 11.0, 0.0)) &&
+        Point.LeaveTangent.Equals(FVector(7.0, 0.0, 0.0), 0.000001));
+
+    TestTrue(TEXT("Auto mode restores native Unreal spline smoothing"), Ops::SetHandleMode(Point,
+        EStrandBezierHandleMode::Auto, FVector(0.0, 11.0, 0.0), FVector(7.0, 0.0, 0.0)));
+    TestEqual(TEXT("Auto mode maps to native Curve interpolation"),
+        Point.PointType.GetValue(), ESplinePointType::Curve);
+    TestEqual(TEXT("Auto mode reports automatically even for legacy Curve anchors"),
+        Ops::EffectiveHandleMode(Point), EStrandBezierHandleMode::Auto);
+    TestTrue(TEXT("Breaking auto preserves evaluated native tangents"), Ops::SetHandleMode(Point,
+        EStrandBezierHandleMode::Free, FVector(12.0, 24.0, 0.0), FVector(12.0, 24.0, 0.0)) &&
+        Point.ArriveTangent.Equals(FVector(12.0, 24.0, 0.0)) &&
+        Point.LeaveTangent.Equals(FVector(12.0, 24.0, 0.0)) &&
+        Point.PointType.GetValue() == ESplinePointType::CurveCustomTangent);
+    TestFalse(TEXT("Repeating unchanged Free mode is a no-op"), Ops::SetHandleMode(Point,
+        EStrandBezierHandleMode::Free, Point.ArriveTangent, Point.LeaveTangent));
+    TestFalse(TEXT("Invalid handle index cannot mutate data"), Ops::EditHandle(Point, 3, FVector(1.0, 0.0, 0.0)));
+
+    USplineDataAsset* Asset = NewObject<USplineDataAsset>(GetTransientPackage());
+    FSplinePointData Second;
+    Second.LocalPosition = FVector(100.0, 0.0, 0.0);
+    Asset->Points = { Point, Second };
+    USplineComponent* Native = NewObject<USplineComponent>(GetTransientPackage());
+    Asset->ApplyToSplineComponent(Native);
+    TestEqual(TEXT("Native spline still receives exactly the authored point count"),
+        Native->GetNumberOfSplinePoints(), 2);
+    TestTrue(TEXT("Native geometry retains authored custom tangents"),
+        Native->GetSplinePointAt(0, ESplineCoordinateSpace::Local).LeaveTangent.Equals(Point.LeaveTangent));
+    TArray<FSplinePointData> Drawn;
+    TestEqual(TEXT("Pen click creates an anchor"),
+        Ops::AppendPenPoint(Drawn, FVector(20.0, 15.0, 0.0), false, false), 0);
+    TestTrue(TEXT("Pen click-only anchors are corners"),
+        Ops::EffectiveHandleMode(Drawn[0]) == EStrandBezierHandleMode::Corner);
+    TestTrue(TEXT("Pen dragging creates symmetrical mirrored handles"),
+        Ops::SetPenHandles(Drawn, 0, FVector(10.0, 20.0, 0.0)) &&
+        Ops::EffectiveHandleMode(Drawn[0]) == EStrandBezierHandleMode::Mirrored &&
+        Drawn[0].ArriveTangent.Equals(Drawn[0].LeaveTangent));
+    TestTrue(TEXT("Strand authoring mode survives a UObject duplicate"),
+        DuplicateObject<USplineDataAsset>(Asset, GetTransientPackage())->Points[0].HandleMode ==
+        EStrandBezierHandleMode::Free);
+    return true;
+}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStrandGroupEditingTest,
     "Strand.Editor.Authoring.GroupEditingOperations",
     EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
@@ -1097,6 +1234,67 @@ bool FStrandGroupEditingTest::RunTest(const FString& Parameters)
     TestTrue(TEXT("Mirrored handles share equal vector"),
         Points[2].ArriveTangent.Equals(SecondTangent) &&
         Points[2].LeaveTangent.Equals(SecondTangent));
+    // Group rotation/scaling also updates tangent vectors (but not position
+    // offsets of unrelated points) and leaves the selection center unchanged.
+    const FVector GroupPivot = StrandSplineEditOperations::SelectionCenter(Points, Selection);
+    const FVector BeforeRotation = Points[1].LocalPosition;
+    Points[1].ArriveTangent = FVector(12, 0, 0);
+    TestTrue(TEXT("Rotate selected around centroid"),
+        StrandSplineEditOperations::RotateSelected(Points, Selection, 2, 90.0));
+    TestTrue(TEXT("Rotation preserves centroid"),
+        StrandSplineEditOperations::SelectionCenter(Points, Selection).Equals(GroupPivot, 0.00001));
+    TestTrue(TEXT("Rotation rotates tangent vectors, not their origins"),
+        Points[1].ArriveTangent.Equals(FVector(0, 12, 0), 0.00001));
+    TestTrue(TEXT("Rotation preserves radial distance"),
+        FMath::IsNearlyEqual((BeforeRotation - GroupPivot).Size(),
+            (Points[1].LocalPosition - GroupPivot).Size(), 0.00001));
+    TestTrue(TEXT("Uniform scale modifies selected geometry"),
+        StrandSplineEditOperations::ScaleSelected(Points, Selection, 2.0));
+    TestTrue(TEXT("Uniform scale doubles tangents"),
+        Points[1].ArriveTangent.Equals(FVector(0, 24, 0), 0.00001));
+    TestTrue(TEXT("Uniform scale retains group centroid"),
+        StrandSplineEditOperations::SelectionCenter(Points, Selection).Equals(GroupPivot, 0.00001));
+    TestTrue(TEXT("Transforms leave unselected endpoints intact"),
+        Points[0].LocalPosition.Equals(UnselectedBefore) && Points[4].LocalPosition.Equals(UnselectedAfter));
+    // Selection math used by screen-space Box Select: replace, extend,
+    // toggle and out-of-range hits must not corrupt the selected point set.
+    TSet<int32> BoxSelection;
+    StrandSplineEditOperations::ApplySelectionHits(BoxSelection, 5, { 1, 2, 2, 99 }, false, false);
+    TestTrue(TEXT("Box replace removes invalid and duplicate hits"),
+        BoxSelection.Num() == 2 && BoxSelection.Contains(1) && BoxSelection.Contains(2));
+    StrandSplineEditOperations::ApplySelectionHits(BoxSelection, 5, { 3 }, true, false);
+    TestTrue(TEXT("Shift box adds without discarding the original selection"),
+        BoxSelection.Num() == 3 && BoxSelection.Contains(1) && BoxSelection.Contains(3));
+    StrandSplineEditOperations::ApplySelectionHits(BoxSelection, 5, { 2, 4 }, false, true);
+    TestTrue(TEXT("Ctrl box toggles hits and retains other anchors"),
+        BoxSelection.Num() == 3 && !BoxSelection.Contains(2) && BoxSelection.Contains(4));
+    StrandSplineEditOperations::ApplySelectionHits(BoxSelection, 5, {}, false, false);
+    TestTrue(TEXT("Empty unmodified box clears selection"), BoxSelection.IsEmpty());
+    // Native transform widget also supports single-point shaping. Rotation
+    // affects tangents and point orientation; scaling affects tangent lengths,
+    // but must not move the anchor itself or unrelated points.
+    {
+        TArray<FSplinePointData> OnePoint = Points;
+        const TArray<int32> One = { 2 };
+        const FVector AnchorBefore = OnePoint[2].LocalPosition;
+        const FVector OtherBefore = OnePoint[1].LocalPosition;
+        OnePoint[2].ArriveTangent = FVector(10.0, 0.0, 0.0);
+        TestTrue(TEXT("Single anchor rotation allowed"),
+            StrandSplineEditOperations::RotateSelected(OnePoint, One, 2, 90.0));
+        TestTrue(TEXT("Single anchor rotates its tangent but stays in place"),
+            OnePoint[2].LocalPosition.Equals(AnchorBefore, 0.00001) &&
+            OnePoint[2].ArriveTangent.Equals(FVector(0, 10, 0), 0.00001));
+        TestTrue(TEXT("Single anchor scale allowed"),
+            StrandSplineEditOperations::ScaleSelected(OnePoint, One, 2.0));
+        TestTrue(TEXT("Single anchor scale affects tangents only"),
+            OnePoint[2].LocalPosition.Equals(AnchorBefore, 0.00001) &&
+            OnePoint[2].ArriveTangent.Equals(FVector(0, 20, 0), 0.00001) &&
+            OnePoint[1].LocalPosition.Equals(OtherBefore, 0.00001));
+    }
+    TestFalse(TEXT("Zero scale rejected"),
+        StrandSplineEditOperations::ScaleSelected(Points, Selection, 0.0));
+    TestFalse(TEXT("Invalid rotation axis rejected"),
+        StrandSplineEditOperations::RotateSelected(Points, Selection, 5, 15.0));
     const TArray<FSplinePointData> Unchanged = Points;
     TestFalse(TEXT("Cannot distribute on invalid axis"),
         StrandSplineEditOperations::DistributeSelected(Points, Selection, 3));

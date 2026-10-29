@@ -53,6 +53,8 @@ private:
     EStrandEditPlane EditPlane = EStrandEditPlane::Free3D;
     int32 SelectedHandle = 0; // 0 anchor, 1 incoming, 2 outgoing.
     bool bPenMode = false;
+    bool bMarqueeMode = false;
+    int32 ActiveWidgetMode = 0; // Move, Rotate, Scale: native Unreal viewport widgets.
     double PenSnapStep = 0.0;
     TUniquePtr<FScopedTransaction> ActivePenTransaction;
     TArray<FSplinePointData> PenPreviousPoints;
@@ -74,6 +76,9 @@ private:
     FReply AddPointAfterSelection();
     FReply RemoveSelectedPoint();
     FReply AlignSelection(int32 Axis);
+    FReply RotateSelection(int32 Axis, double Degrees);
+    FReply ScaleSelection(double Factor);
+    TSharedRef<SWidget> MakeTransformMenu();
     FReply DistributeSelection(int32 Axis);
     FReply MatchSelectedTangents(bool bMirror);
     FReply SelectAllPoints();
@@ -89,6 +94,11 @@ private:
     FReply ToggleClosedLoop();
     FReply ClearSpline();
     void SetPenMode(bool bEnabled);
+    void SetMarqueeMode(bool bEnabled);
+    void SetWidgetMode(int32 Mode);
+    void SelectMarqueePoints(const TArray<int32>& Indices, bool bAdd, bool bToggle);
+    void ApplyViewportRotation(int32 Axis, double Degrees);
+    void ApplyViewportScale(double Factor);
     void SetPenSnapStep(double Step);
     TSharedRef<SWidget> MakePenSnapMenu();
     FText GetPenSnapLabel() const;
@@ -115,6 +125,10 @@ private:
     void ApplyViewportTangentDrag(int32 Handle, const FVector& LocalDelta);
     FReply SetSelectedPointType(ESplinePointType::Type NewType);
     TSharedRef<SWidget> MakePointTypeMenu();
+    FReply SetSelectedHandleMode(EStrandBezierHandleMode Mode);
+    TSharedRef<SWidget> MakeHandleModeMenu();
+    FText GetHandleModeLabel() const;
+    FText GetHandleModeDescription() const;
     FReply CreateActor();
     FReply SelectUsers();
     FReply InspectUsage();

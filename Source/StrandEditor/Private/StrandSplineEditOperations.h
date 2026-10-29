@@ -8,6 +8,104 @@
 // Callers own transactions, notifications, and any required viewport refresh.
 namespace StrandSplineEditOperations
 {
+
+    // Persistent Bezier editor rules. Unreal custom tangent vectors both point in
+    // the forward travel direction; incoming HANDLE is drawn at P - Arrive/3.
+    inline EStrandBezierHandleMode EffectiveHandleMode(const FSplinePointData& Point)
+    {
+        if (Point.PointType.GetValue() == ESplinePointType::Curve ||
+            Point.PointType.GetValue() == ESplinePointType::CurveClamped)
+        {
+            return EStrandBezierHandleMode::Auto;
+        }
+        return Point.HandleMode;
+    }
+
+    // Called after any direct handle edit. The edited handle always wins; the
+    // opposite tangent follows only when the saved mode asks it to.
+    inline bool EditHandle(FSplinePointData& Point, int32 Handle, const FVector& NewTangent)
+    {
+        if ((Handle != 1 && Handle != 2) || NewTangent.ContainsNaN()) { return false; }
+        const EStrandBezierHandleMode Mode = EffectiveHandleMode(Point);
+        // Dragging an automatic or collapsed corner handle breaks it into Free.
+        // Users can subsequently opt into persistent Aligned / Mirrored behavior.
+        if (Mode == EStrandBezierHandleMode::Auto || Mode == EStrandBezierHandleMode::Corner)
+        {
+            Point.HandleMode = EStrandBezierHandleMode::Free;
+        }
+        Point.PointType = ESplinePointType::CurveCustomTangent;
+        FVector& Driver = Handle == 1 ? Point.ArriveTangent : Point.LeaveTangent;
+        FVector& Follower = Handle == 1 ? Point.LeaveTangent : Point.ArriveTangent;
+        const double OtherLength = Follower.Size();
+        const bool bDifferent = !Driver.Equals(NewTangent, 0.000001);
+        Driver = NewTangent;
+        if (Mode == EStrandBezierHandleMode::Mirrored)
+        {
+            const bool bFollowerDifferent = !Follower.Equals(NewTangent, 0.000001);
+            Follower = NewTangent;
+            return bDifferent || bFollowerDifferent;
+        }
+        if (Mode == EStrandBezierHandleMode::Aligned && !NewTangent.IsNearlyZero())
+        {
+            const FVector Aligned = NewTangent.GetSafeNormal() * OtherLength;
+            const bool bFollowerDifferent = !Follower.Equals(Aligned, 0.000001);
+            Follower = Aligned;
+            return bDifferent || bFollowerDifferent;
+        }
+        return bDifferent;
+    }
+
+    // Evaluate old Auto/Clamped geometry BEFORE converting to custom tangents.
+    // This avoids a sudden shape change when switching handle modes.
+    inline bool SetHandleMode(FSplinePointData& Point, EStrandBezierHandleMode Mode,
+        const FVector& EvaluatedArrive, const FVector& EvaluatedLeave)
+    {
+        if (EvaluatedArrive.ContainsNaN() || EvaluatedLeave.ContainsNaN()) { return false; }
+        const EStrandBezierHandleMode OldMode = EffectiveHandleMode(Point);
+        const EStrandBezierHandleMode OldStoredMode = Point.HandleMode;
+        const ESplinePointType::Type OldType = Point.PointType.GetValue();
+        const FVector OldArrive = Point.ArriveTangent;
+        const FVector OldLeave = Point.LeaveTangent;
+        Point.HandleMode = Mode;
+        if (Mode == EStrandBezierHandleMode::Auto)
+        {
+            Point.PointType = ESplinePointType::Curve;
+        }
+        else
+        {
+            if (Point.PointType.GetValue() != ESplinePointType::CurveCustomTangent)
+            {
+                Point.ArriveTangent = EvaluatedArrive;
+                Point.LeaveTangent = EvaluatedLeave;
+            }
+            Point.PointType = ESplinePointType::CurveCustomTangent;
+            if (Mode == EStrandBezierHandleMode::Corner)
+            {
+                Point.ArriveTangent = FVector::ZeroVector;
+                Point.LeaveTangent = FVector::ZeroVector;
+            }
+            else if (Mode == EStrandBezierHandleMode::Aligned || Mode == EStrandBezierHandleMode::Mirrored)
+            {
+                // Prefer the outgoing handle if available. In zero-handle cases,
+                // persist the constraint until the first nonzero user drag.
+                const FVector Driver = !Point.LeaveTangent.IsNearlyZero()
+                    ? Point.LeaveTangent : Point.ArriveTangent;
+                if (!Driver.IsNearlyZero())
+                {
+                    const FVector Axis = Driver.GetSafeNormal();
+                    const double Length = Mode == EStrandBezierHandleMode::Mirrored
+                        ? Driver.Size() : Point.ArriveTangent.Size();
+                    Point.ArriveTangent = Axis * Length;
+                    Point.LeaveTangent = Driver;
+                }
+            }
+        }
+        return OldMode != Mode || OldStoredMode != Point.HandleMode ||
+            OldType != Point.PointType.GetValue() ||
+            !OldArrive.Equals(Point.ArriveTangent, 0.000001) ||
+            !OldLeave.Equals(Point.LeaveTangent, 0.000001);
+    }
+
     inline FVector ReflectVector(FVector Value, int32 Axis)
     {
         if (Axis == 0) { Value.X = -Value.X; }
@@ -61,6 +159,21 @@ namespace StrandSplineEditOperations
             if (bClosed || I < Count - 1)
             {
                 Points[I].PointType = Old[Previous].PointType;
+                // Unreal stores interpolation on the segment START, while
+                // Strand stores handle intent on the geometric anchor.
+                // If a shifted native segment type is auto, native smoothing
+                // takes precedence; never leave an Auto rule on custom data.
+                if (Points[I].PointType.GetValue() == ESplinePointType::CurveCustomTangent &&
+                    Points[I].HandleMode == EStrandBezierHandleMode::Auto)
+                {
+                    Points[I].HandleMode = EStrandBezierHandleMode::Free;
+                }
+                if ((Points[I].PointType.GetValue() == ESplinePointType::Linear ||
+                     Points[I].PointType.GetValue() == ESplinePointType::Constant) &&
+                    Points[I].HandleMode == EStrandBezierHandleMode::Auto)
+                {
+                    Points[I].HandleMode = EStrandBezierHandleMode::Free;
+                }
             }
         }
     }
@@ -86,6 +199,7 @@ namespace StrandSplineEditOperations
         {
             Middle.LocalPosition = FMath::Lerp(A.Position, B.Position, Alpha);
             Middle.PointType = ESplinePointType::Linear;
+            Middle.HandleMode = EStrandBezierHandleMode::Free;
             Middle.ArriveTangent = FVector::ZeroVector;
             Middle.LeaveTangent = FVector::ZeroVector;
         }
@@ -93,6 +207,7 @@ namespace StrandSplineEditOperations
         {
             Middle.LocalPosition = A.Position;
             Middle.PointType = ESplinePointType::Constant;
+            Middle.HandleMode = EStrandBezierHandleMode::Free;
             Middle.ArriveTangent = FVector::ZeroVector;
             Middle.LeaveTangent = FVector::ZeroVector;
         }
@@ -114,9 +229,12 @@ namespace StrandSplineEditOperations
             Points[Segment].PointType = ESplinePointType::CurveCustomTangent;
             Points[Segment].ArriveTangent = A.ArriveTangent;
             Points[Segment].LeaveTangent = 3.0 * (L - A.Position);
+            Points[Segment].HandleMode = EStrandBezierHandleMode::Free;
             Points[Next].PointType = ESplinePointType::CurveCustomTangent;
             Points[Next].ArriveTangent = 3.0 * (B.Position - R);
             Points[Next].LeaveTangent = B.LeaveTangent;
+            Points[Next].HandleMode = EStrandBezierHandleMode::Free;
+            Middle.HandleMode = EStrandBezierHandleMode::Free;
         }
         const int32 InsertIndex = Segment + 1;
         Points.Insert(Middle, InsertIndex);
@@ -130,6 +248,7 @@ namespace StrandSplineEditOperations
         FSplinePointData NewPoint;
         NewPoint.LocalPosition = Position;
         NewPoint.PointType = ESplinePointType::CurveCustomTangent;
+        NewPoint.HandleMode = EStrandBezierHandleMode::Corner;
         if (bPrepend) { Points.Insert(NewPoint, 0); return 0; }
         return Points.Add(NewPoint);
     }
@@ -143,7 +262,22 @@ namespace StrandSplineEditOperations
         Point.PointType = ESplinePointType::CurveCustomTangent;
         Point.ArriveTangent = HandleOffset * 3.0;
         Point.LeaveTangent = HandleOffset * 3.0;
+        Point.HandleMode = EStrandBezierHandleMode::Mirrored;
         return true;
+    }
+
+    // Marquee selection is transient viewport state. Keep the replace/add/
+    // toggle rules in one testable helper, independent of hit testing.
+    inline void ApplySelectionHits(TSet<int32>& Selected, int32 PointCount,
+        const TArray<int32>& Hits, bool bAdd, bool bToggle)
+    {
+        if (!bAdd && !bToggle) { Selected.Reset(); }
+        for (int32 Index : Hits)
+        {
+            if (Index < 0 || Index >= PointCount) { continue; }
+            if (bToggle && Selected.Contains(Index)) { Selected.Remove(Index); }
+            else { Selected.Add(Index); }
+        }
     }
 
     // Selection is editor state, never serialized into a Strand asset. Pure
@@ -171,6 +305,52 @@ namespace StrandSplineEditOperations
                 Points[Index].LocalPosition += Delta;
                 bChanged = true;
             }
+        }
+        return bChanged;
+    }
+
+    // Group transforms use the average selected anchor as pivot. Transform
+    // tangents as vectors, never translate them. Unselected points are untouched.
+    inline bool RotateSelected(TArray<FSplinePointData>& Points, const TArray<int32>& Indices,
+        int32 Axis, double Degrees)
+    {
+        if (Indices.IsEmpty() || Axis < 0 || Axis > 2 || !FMath::IsFinite(Degrees) ||
+            FMath::IsNearlyZero(Degrees, 0.000001)) { return false; }
+        const FVector Pivot = SelectionCenter(Points, Indices);
+        const FVector Basis = Axis == 0 ? FVector::XAxisVector :
+            Axis == 1 ? FVector::YAxisVector : FVector::ZAxisVector;
+        const FQuat Rotation(Basis, FMath::DegreesToRadians(Degrees));
+        bool bChanged = false;
+        for (int32 Index : Indices)
+        {
+            if (!Points.IsValidIndex(Index)) { continue; }
+            FSplinePointData& Point = Points[Index];
+            Point.LocalPosition = Pivot + Rotation.RotateVector(Point.LocalPosition - Pivot);
+            Point.ArriveTangent = Rotation.RotateVector(Point.ArriveTangent);
+            Point.LeaveTangent = Rotation.RotateVector(Point.LeaveTangent);
+            Point.LocalRotation = (Rotation * Point.LocalRotation.Quaternion()).Rotator();
+            bChanged = true;
+        }
+        return bChanged;
+    }
+
+    inline bool ScaleSelected(TArray<FSplinePointData>& Points, const TArray<int32>& Indices,
+        double Factor)
+    {
+        // Negative or zero scales can collapse/reverse curve topology. Provide
+        // positive uniform scaling only; mirroring has its own explicit tools.
+        if (Indices.IsEmpty() || !FMath::IsFinite(Factor) || Factor <= 0.0 ||
+            FMath::IsNearlyEqual(Factor, 1.0, 0.000001)) { return false; }
+        const FVector Pivot = SelectionCenter(Points, Indices);
+        bool bChanged = false;
+        for (int32 Index : Indices)
+        {
+            if (!Points.IsValidIndex(Index)) { continue; }
+            FSplinePointData& Point = Points[Index];
+            Point.LocalPosition = Pivot + (Point.LocalPosition - Pivot) * Factor;
+            Point.ArriveTangent *= Factor;
+            Point.LeaveTangent *= Factor;
+            bChanged = true;
         }
         return bChanged;
     }
@@ -228,6 +408,7 @@ namespace StrandSplineEditOperations
         if (Driver.IsNearlyZero()) { return false; }
         const FVector Direction = Driver.GetSafeNormal();
         Point.PointType = ESplinePointType::CurveCustomTangent;
+        Point.HandleMode = EStrandBezierHandleMode::Free; // one-shot command is not a persistent link
         Point.ArriveTangent = bUseIncoming ? Driver : Direction * (bMirror ? Driver.Size() : Arrive.Size());
         Point.LeaveTangent = bUseIncoming ? Direction * (bMirror ? Driver.Size() : Leave.Size()) : Driver;
         return true;
@@ -238,13 +419,14 @@ namespace StrandSplineEditOperations
         for (FSplinePointData& Point : Points)
         {
             Point.PointType = ESplinePointType::Linear;
+            Point.HandleMode = EStrandBezierHandleMode::Free;
             Point.ArriveTangent = FVector::ZeroVector;
             Point.LeaveTangent = FVector::ZeroVector;
         }
     }
     inline void MakeAllAuto(TArray<FSplinePointData>& Points)
     {
-        for (FSplinePointData& Point : Points) { Point.PointType = ESplinePointType::Curve; }
+        for (FSplinePointData& Point : Points) { Point.PointType = ESplinePointType::Curve; Point.HandleMode = EStrandBezierHandleMode::Auto; }
     }
 
     // Bisect every *evaluated* source segment in one pass. Source is never
@@ -270,6 +452,7 @@ namespace StrandSplineEditOperations
             {
                 Mid.LocalPosition = (A.Position + B.Position) * 0.5;
                 Mid.PointType = ESplinePointType::Linear;
+                Mid.HandleMode = EStrandBezierHandleMode::Free;
                 Mid.ArriveTangent = FVector::ZeroVector;
                 Mid.LeaveTangent = FVector::ZeroVector;
                 Original[I].PointType = ESplinePointType::Linear;
@@ -278,6 +461,7 @@ namespace StrandSplineEditOperations
             {
                 Mid.LocalPosition = A.Position;
                 Mid.PointType = ESplinePointType::Constant;
+                Mid.HandleMode = EStrandBezierHandleMode::Free;
                 Original[I].PointType = ESplinePointType::Constant;
             }
             else
@@ -293,6 +477,9 @@ namespace StrandSplineEditOperations
                 Mid.ArriveTangent = 3.0 * (Mid.LocalPosition - LM);
                 Mid.LeaveTangent = 3.0 * (MR - Mid.LocalPosition);
                 Mid.PointType = ESplinePointType::CurveCustomTangent;
+                Mid.HandleMode = EStrandBezierHandleMode::Free;
+                Original[I].HandleMode = EStrandBezierHandleMode::Free;
+                Original[J].HandleMode = EStrandBezierHandleMode::Free;
                 Original[I].PointType = ESplinePointType::CurveCustomTangent;
                 Original[I].LeaveTangent = 3.0 * (L - A.Position);
                 Original[J].ArriveTangent = 3.0 * (B.Position - R);

@@ -6,6 +6,8 @@
 #include "StrandSplineExport.h"
 #include "StrandSplineEditOperations.h"
 #include "Styling/AppStyle.h"
+#include "Styling/SlateStyle.h"
+#include "Styling/SlateStyleRegistry.h"
 #include "Widgets/Images/SImage.h"
 #include "AssetToolsModule.h"
 #include "IAssetTools.h"
@@ -21,6 +23,7 @@
 #include "Widgets/Docking/SDockTab.h"
 #include "Widgets/Layout/SBorder.h"
 #include "Widgets/Layout/SBox.h"
+#include "Widgets/Layout/SExpandableArea.h"
 #include "Widgets/Layout/SSplitter.h"
 #include "Widgets/Input/SButton.h"
 #include "Widgets/Input/SCheckBox.h"
@@ -42,11 +45,24 @@ namespace
     const FName PreviewTabId(TEXT("StrandSplineEditor_Preview"));
     const FName DetailsTabId(TEXT("StrandSplineEditor_Details"));
 
+    // Reuse Strand's existing registered editor style. It is created and
+    // unregistered by StrandEditorModule, just like the asset/action icons.
+    // Resolving an absent engine brush key produced checkerboards in UE 5.8.
+    const FSlateBrush* AuthoringBrush(const FName& Icon)
+    {
+        if (Icon.ToString().StartsWith(TEXT("Strand.")))
+        {
+            const ISlateStyle* Style = FSlateStyleRegistry::FindSlateStyle(FName(TEXT("StrandEditorStyle")));
+            return Style ? Style->GetBrush(Icon) : FAppStyle::GetBrush(TEXT("Icons.Edit"));
+        }
+        return FAppStyle::GetBrush(Icon);
+    }
+
     TSharedRef<SWidget> ActionContent(const FName Icon, const FText& Label)
     {
         return SNew(SHorizontalBox)
             + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0, 0, 5, 0)
-              [SNew(SImage).Image(FAppStyle::GetBrush(Icon)).DesiredSizeOverride(FVector2D(16.0f, 16.0f))]
+              [SNew(SImage).Image(AuthoringBrush(Icon)).DesiredSizeOverride(FVector2D(16.0f, 16.0f))]
             + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
               [SNew(STextBlock).Text(Label)];
     }
@@ -164,6 +180,9 @@ TSharedRef<SDockTab> FStrandSplineAssetEditor::SpawnPreviewTab(const FSpawnTabAr
         + SVerticalBox::Slot().AutoHeight().Padding(7.0f, 5.0f, 7.0f, 3.0f)
         [
             SNew(SHorizontalBox)
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.0f, 0.0f, 9.0f, 0.0f)
+            [SNew(STextBlock).Text(LOCTEXT("AssetActionsHeading", "ASSET"))
+                .ColorAndOpacity(FSlateColor::UseSubduedForeground())]
             + SHorizontalBox::Slot().AutoWidth().Padding(2.0f)
             [SNew(SButton)
                 .ToolTipText(LOCTEXT("NewSplineTip", "Create and open an independent, editable Strand Spline asset in the same Content Browser folder."))
@@ -204,7 +223,7 @@ TSharedRef<SDockTab> FStrandSplineAssetEditor::SpawnPreviewTab(const FSpawnTabAr
                         FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this]() { InspectUsage(); })));
                     return Menu.MakeWidget();
                 })
-                .ButtonContent()[ActionContent(TEXT("Icons.Actor"), LOCTEXT("ActorsButton", "Actors"))]]
+                .ButtonContent()[ActionContent(TEXT("Strand.Actors"), LOCTEXT("ActorsButton", "Actors"))]]
             + SHorizontalBox::Slot().AutoWidth().Padding(5.0f, 0.0f, 2.0f, 0.0f)
             [SNew(SComboButton)
                 .ToolTipText(LOCTEXT("SplineToolsTip", "Selection modeling, point alignment/distribution, whole-spline operations, and curve refinement."))
@@ -214,26 +233,68 @@ TSharedRef<SDockTab> FStrandSplineAssetEditor::SpawnPreviewTab(const FSpawnTabAr
         + SVerticalBox::Slot().AutoHeight().Padding(7.0f, 1.0f, 7.0f, 5.0f)
         [
             SNew(SHorizontalBox)
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.0f, 0.0f, 9.0f, 0.0f)
+            [SNew(STextBlock).Text(LOCTEXT("ToolGroupHeading", "TOOLS"))
+                .ColorAndOpacity(FSlateColor::UseSubduedForeground())]
             + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.0f)
             [SNew(SCheckBox)
                 .Style(FAppStyle::Get(), "ToggleButtonCheckbox")
-                .IsChecked_Lambda([this]() { return bPenMode ? ECheckBoxState::Unchecked : ECheckBoxState::Checked; })
-                .OnCheckStateChanged_Lambda([this](ECheckBoxState) { SetPenMode(false); })
+                .IsChecked_Lambda([this]() { return (!bPenMode && !bMarqueeMode) ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
+                .OnCheckStateChanged_Lambda([this](ECheckBoxState) { SetMarqueeMode(false); SetPenMode(false); })
                 .ToolTipText(LOCTEXT("SelectModeTip", "Click to select, Shift-click a contiguous range, Ctrl-click to toggle. Ctrl+A selects all; Esc clears. Move selected points together with the gizmo."))
-                [SNew(STextBlock).Text(LOCTEXT("SelectMode", "Select"))]]
+                [ActionContent(TEXT("Strand.Select"), LOCTEXT("SelectMode", "Select"))]]
             + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.0f)
             [SNew(SCheckBox)
                 .Style(FAppStyle::Get(), "ToggleButtonCheckbox")
                 .IsChecked_Lambda([this]() { return bPenMode ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
                 .OnCheckStateChanged_Lambda([this](ECheckBoxState State) { SetPenMode(State == ECheckBoxState::Checked); })
                 .ToolTipText(LOCTEXT("PenModeTip", "Pen: click to add anchors, drag to shape symmetric handles, click a segment to insert, click an endpoint to continue or close; Esc to exit."))
-                [ActionContent(TEXT("Icons.Edit"), LOCTEXT("PenMode", "Pen"))]]
+                [ActionContent(TEXT("Strand.Pen"), LOCTEXT("PenMode", "Pen"))]]
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.0f)
+            [SNew(SCheckBox)
+                .Style(FAppStyle::Get(), "ToggleButtonCheckbox")
+                .IsChecked_Lambda([this]() { return bMarqueeMode ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
+                .OnCheckStateChanged_Lambda([this](ECheckBoxState State) { SetMarqueeMode(State == ECheckBoxState::Checked); })
+                .ToolTipText(LOCTEXT("MarqueeTip", "Box Select: drag a rectangle over anchor markers. Shift adds, Ctrl toggles. Alt+LMB remains camera navigation."))
+                [ActionContent(TEXT("Strand.BoxSelect"), LOCTEXT("MarqueeMode", "Box Select"))]]
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(7.0f, 0.0f, 2.0f, 0.0f)
+            [SNew(STextBlock).Text(LOCTEXT("GizmoModes", "TRANSFORM (Space)"))
+                .ColorAndOpacity(FSlateColor::UseSubduedForeground())]
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(1.0f)
+            [SNew(SCheckBox).Style(FAppStyle::Get(), "ToggleButtonCheckbox")
+                .IsEnabled_Lambda([this]() { return !bPenMode && !bMarqueeMode; })
+                .IsChecked_Lambda([this]() { return ActiveWidgetMode == 0 ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
+                .OnCheckStateChanged_Lambda([this](ECheckBoxState) { SetWidgetMode(0); })
+                .ToolTipText(LOCTEXT("MoveGizmoTip", "Move selected points (Space cycles tools): drag a red X, green Y, or blue Z handle on the selected anchor, tangent, or group."))
+                [ActionContent(TEXT("Strand.Move"), LOCTEXT("MoveTool", "Move"))]]
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(1.0f)
+            [SNew(SCheckBox).Style(FAppStyle::Get(), "ToggleButtonCheckbox")
+                .IsEnabled_Lambda([this]() { return HasSelectedPoint() && !bPenMode && !bMarqueeMode; })
+                .IsChecked_Lambda([this]() { return ActiveWidgetMode == 1 ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
+                .OnCheckStateChanged_Lambda([this](ECheckBoxState) { SetWidgetMode(1); })
+                .ToolTipText(LOCTEXT("RotateGizmoTip", "Rotate (Space cycles): use Unreal's rotation widget. One point rotates its tangents and orientation; multiple points rotate around their shared center."))
+                [ActionContent(TEXT("Strand.Rotate"), LOCTEXT("RotateTool", "Rotate"))]]
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(1.0f)
+            [SNew(SCheckBox).Style(FAppStyle::Get(), "ToggleButtonCheckbox")
+                .IsEnabled_Lambda([this]() { return HasSelectedPoint() && !bPenMode && !bMarqueeMode; })
+                .IsChecked_Lambda([this]() { return ActiveWidgetMode == 2 ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
+                .OnCheckStateChanged_Lambda([this](ECheckBoxState) { SetWidgetMode(2); })
+                .ToolTipText(LOCTEXT("ScaleGizmoTip", "Uniform Scale (Space cycles): drag Unreal's scale widget. One point scales its handles; multiple points scale about their center."))
+                [ActionContent(TEXT("Strand.Scale"), LOCTEXT("ScaleTool", "Scale"))]]
             + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(6.0f, 0.0f, 2.0f, 0.0f)
             [SNew(SComboButton)
                 .ToolTipText(LOCTEXT("SelectionTip", "Select All, Invert Selection, or Clear Selection. Multi-point tools are under Spline Tools."))
                 .OnGetMenuContent(this, &FStrandSplineAssetEditor::MakeSelectionMenu)
                 .ButtonContent()[SNew(STextBlock).Text(LOCTEXT("SelectionDropdown", "Selection"))]]
-            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(7.0f, 0.0f, 2.0f, 0.0f)
+        ]
+        // View and display settings stay on their own navigation row, rather
+        // than competing with the direct editing tools for horizontal space.
+        + SVerticalBox::Slot().AutoHeight().Padding(9.0f, 0.0f, 7.0f, 5.0f)
+        [SNew(SHorizontalBox)
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.0f, 0.0f, 6.0f, 0.0f)
+            [SNew(STextBlock).Text(LOCTEXT("ViewStrip", "VIEW"))
+                .ColorAndOpacity(FSlateColor::UseSubduedForeground())]
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.0f)
             [SNew(SComboButton)
                 .ToolTipText(LOCTEXT("ProjectionTip", "Choose a perspective or orthographic viewport."))
                 .OnGetMenuContent(this, &FStrandSplineAssetEditor::MakeProjectionMenu)
@@ -278,6 +339,8 @@ TSharedRef<SDockTab> FStrandSplineAssetEditor::SpawnPreviewTab(const FSpawnTabAr
                 .ToolTipText(LOCTEXT("TangentsTip", "Display incoming and outgoing tangent directions for the selected point."))
                 [SNew(STextBlock).Text(LOCTEXT("ShowTangents", "Tangents"))]]
         ]
+        // Avoid a third toolbar row duplicating the point inspector and the
+        // Spline Tools menu. Keep the actual viewport as the primary workspace.
         + SVerticalBox::Slot().FillHeight(1.0f).Padding(6.0f, 0.0f)
         [SAssignNew(PreviewWidget, SStrandSplineViewport)]
         + SVerticalBox::Slot().AutoHeight().Padding(9.0f, 6.0f, 9.0f, 2.0f)
@@ -293,6 +356,19 @@ TSharedRef<SDockTab> FStrandSplineAssetEditor::SpawnPreviewTab(const FSpawnTabAr
     {
         PreviewWidget->SetSpline(NativePreview.Get());
         PreviewWidget->SetOnPointSelected([this](int32 Index, bool bShift, bool bCtrl) { SelectPoint(Index, bShift, bCtrl); });
+        PreviewWidget->SetOnMarqueeSelected([this](const TArray<int32>& Points, bool bAdd, bool bToggle)
+            { SelectMarqueePoints(Points, bAdd, bToggle); });
+        PreviewWidget->SetOnMarqueeExit([this]() { SetMarqueeMode(false); });
+        PreviewWidget->SetPointRotationCallback([this](int32 Axis, double Degrees) { ApplyViewportRotation(Axis, Degrees); });
+        PreviewWidget->SetPointScaleCallback([this](double Factor) { ApplyViewportScale(Factor); });
+        PreviewWidget->SetOnWidgetModeChanged([this](int32 Mode) { SetWidgetMode(Mode); });
+        PreviewWidget->SetOnToolShortcut([this](int32 Tool)
+        {
+            if (Tool == 1) { SetPenMode(true); }
+            else if (Tool == 2) { SetMarqueeMode(true); }
+            else { SetPenMode(false); SetMarqueeMode(false); }
+        });
+        PreviewWidget->SetOnDeleteShortcut([this]() { RemoveSelectedPoint(); });
         PreviewWidget->SetOnSelectAll([this]() { SelectAllPoints(); });
         PreviewWidget->SetOnClearSelection([this]() { ClearPointSelection(); });
         PreviewWidget->SetOnTangentSelected([this](int32 Index, int32 Handle) { SelectTangentHandle(Index, Handle); });
@@ -307,6 +383,8 @@ TSharedRef<SDockTab> FStrandSplineAssetEditor::SpawnPreviewTab(const FSpawnTabAr
             [this]() { CancelPenStroke(); },
             [this]() { SetPenMode(false); });
         PreviewWidget->SetPenMode(bPenMode);
+        PreviewWidget->SetMarqueeMode(bMarqueeMode);
+        PreviewWidget->SetWidgetMode(ActiveWidgetMode);
         PreviewWidget->SetPenSnap(PenSnapStep);
         PreviewWidget->SetPenPlane(EditPlane == EStrandEditPlane::XY ? 2 :
             EditPlane == EStrandEditPlane::XZ ? 1 : EditPlane == EStrandEditPlane::YZ ? 0 : -1);
@@ -382,6 +460,23 @@ TSharedRef<SDockTab> FStrandSplineAssetEditor::SpawnDetailsTab(const FSpawnTabAr
                 .Value_Lambda([this]() { return GetPointCoordinate(2); })
                 .OnValueCommitted_Lambda([this](double Value, ETextCommit::Type) { SetPointCoordinate(Value, 2); })]
         ]
+        // Curve-shaping behavior is a first-class authoring control, not a
+        // hidden one-shot command inside Spline Tools. This applies to all
+        // selected anchors, including selections made with Box Select.
+        + SVerticalBox::Slot().AutoHeight().Padding(9.0f, 6.0f, 8.0f, 3.0f)
+        [SNew(SHorizontalBox)
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.0f, 0.0f, 9.0f, 0.0f)
+            [SNew(STextBlock).Text(LOCTEXT("HandleModeHeader", "BEZIER HANDLES"))
+                .ColorAndOpacity(FSlateColor::UseSubduedForeground())]
+            + SHorizontalBox::Slot().FillWidth(1.0f).VAlign(VAlign_Center)
+            [SNew(SComboButton)
+                .IsEnabled(this, &FStrandSplineAssetEditor::HasSelectedPoint)
+                .ToolTipText(LOCTEXT("HandleModeTip", "Stored per-point handle behavior. Free: independent; Aligned: common direction, independent lengths; Mirrored: common direction and length; Auto: Unreal native smoothing; Corner: collapse both handles."))
+                .OnGetMenuContent(this, &FStrandSplineAssetEditor::MakeHandleModeMenu)
+                .ButtonContent()[SNew(STextBlock).Text(this, &FStrandSplineAssetEditor::GetHandleModeLabel)]]]
+        + SVerticalBox::Slot().AutoHeight().Padding(11.0f, 0.0f, 8.0f, 6.0f)
+        [SNew(STextBlock).Text(this, &FStrandSplineAssetEditor::GetHandleModeDescription)
+            .ColorAndOpacity(FSlateColor::UseSubduedForeground()).AutoWrapText(true)]
         + SVerticalBox::Slot().AutoHeight().Padding(8.0f, 0.0f, 8.0f, 7.0f)
         [SNew(SVerticalBox)
             .Visibility_Lambda([this]() { return HasSelectedPoint() && !HasMultipleSelectedPoints() && SelectedHandle != 0 ? EVisibility::Visible : EVisibility::Collapsed; })
@@ -442,11 +537,44 @@ TSharedRef<SDockTab> FStrandSplineAssetEditor::SpawnDetailsTab(const FSpawnTabAr
                 .OnGetMenuContent(this, &FStrandSplineAssetEditor::MakePointTypeMenu)
                 .ButtonContent()[SNew(STextBlock).Text(LOCTEXT("PointType", "Interpolation"))]]
         ]
-        + SVerticalBox::Slot().AutoHeight().Padding(8.0f, 4.0f, 8.0f, 6.0f)
-        [SNew(STextBlock).Text(LOCTEXT("AdvancedProperties", "ASSET SETTINGS"))
-            .ToolTipText(LOCTEXT("AssetSettingsTooltip", "Source and import settings affect Reimport, not the current authored geometry until you reimport."))]
-        + SVerticalBox::Slot().FillHeight(1.0f)
-        [DetailsView.ToSharedRef()]
+        // The right inspector follows the active tool. Showing both numerical
+        // Rotate and Scale fields at once blurred the purpose of each mode.
+        + SVerticalBox::Slot().AutoHeight().Padding(9.f, 8.f, 8.f, 4.f)
+        [SNew(SHorizontalBox)
+            .Visibility_Lambda([this]() { return HasSelectedPoint() && ActiveWidgetMode == 1
+                ? EVisibility::Visible : EVisibility::Collapsed; })
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.f, 0.f, 8.f, 0.f)
+            [SNew(STextBlock).Text(LOCTEXT("RotateSection", "ROTATE SELECTION"))
+                .ColorAndOpacity(FSlateColor::UseSubduedForeground())]
+            + SHorizontalBox::Slot().FillWidth(1.f).Padding(2.f)
+            [SNew(SNumericEntryBox<double>)
+                .Label()[SNew(STextBlock).Text(LOCTEXT("RotateZField", "Z deg"))]
+                .ToolTipText(LOCTEXT("RotateZFieldTip", "Type a relative Z rotation in degrees about the selection center. Or rotate using Unreal's native widget in the viewport."))
+                .Value_Lambda([]() -> TOptional<double> { return 0.0; })
+                .OnValueCommitted_Lambda([this](double Degrees, ETextCommit::Type) { RotateSelection(2, Degrees); })]
+        ]
+        + SVerticalBox::Slot().AutoHeight().Padding(9.f, 8.f, 8.f, 4.f)
+        [SNew(SHorizontalBox)
+            .Visibility_Lambda([this]() { return HasSelectedPoint() && ActiveWidgetMode == 2
+                ? EVisibility::Visible : EVisibility::Collapsed; })
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.f, 0.f, 8.f, 0.f)
+            [SNew(STextBlock).Text(LOCTEXT("UniformScaleSection", "UNIFORM SCALE"))
+                .ColorAndOpacity(FSlateColor::UseSubduedForeground())]
+            + SHorizontalBox::Slot().FillWidth(1.f).Padding(2.f)
+            [SNew(SNumericEntryBox<double>)
+                .Label()[SNew(STextBlock).Text(LOCTEXT("ScaleFactorField", "Factor"))]
+                .ToolTipText(LOCTEXT("ScaleFactorFieldTip", "Positive uniform scale multiplier about the selection center. Or drag Unreal's native scale widget in the viewport."))
+                .Value_Lambda([]() -> TOptional<double> { return 1.0; })
+                .OnValueCommitted_Lambda([this](double Factor, ETextCommit::Type) { ScaleSelection(Factor); })]
+        ]
+        + SVerticalBox::Slot().FillHeight(1.0f).Padding(5.f, 8.f, 5.f, 3.f)
+        [SNew(SExpandableArea)
+            .InitiallyCollapsed(true)
+            .AreaTitle(LOCTEXT("AssetSettingsFoldout", "Asset Properties / Source / Reimport"))
+            .ToolTipText(LOCTEXT("AssetSettingsTooltip", "Advanced asset, source, and import settings. Open this section when changing import behavior."))
+            .BodyContent()
+            [SNew(SBox).MinDesiredHeight(310.f)[DetailsView.ToSharedRef()]]
+        ]
     ];
 }
 
@@ -559,8 +687,9 @@ void FStrandSplineAssetEditor::SetTangentCoordinate(double Value, int32 Axis)
         Saved.LeaveTangent = Evaluated.LeaveTangent;
         Saved.PointType = ESplinePointType::CurveCustomTangent;
     }
-    if (SelectedHandle == 1) { Saved.ArriveTangent[Axis] = Value; }
-    else { Saved.LeaveTangent[Axis] = Value; }
+    FVector Tangent = SelectedHandle == 1 ? Saved.ArriveTangent : Saved.LeaveTangent;
+    Tangent[Axis] = Value;
+    StrandSplineEditOperations::EditHandle(Saved, SelectedHandle, Tangent);
     Current->PostEditChange();
     Current->MarkPackageDirty();
     RebuildNativePreview();
@@ -593,6 +722,39 @@ void FStrandSplineAssetEditor::ApplyViewportPointDrag(const FVector& LocalDelta)
     if (LockedAxis >= 0) { Constrained[LockedAxis] = 0.0; }
     if (Constrained.IsNearlyZero()) { return; }
     if (StrandSplineEditOperations::TranslateSelected(Current->Points, GetSelectedIndices(), Constrained))
+    {
+        bPointChangedDuringDrag = true;
+        Current->PostEditChange();
+        RebuildNativePreview();
+    }
+}
+
+void FStrandSplineAssetEditor::ApplyViewportRotation(int32 Axis, double Degrees)
+{
+    USplineDataAsset* Current = Asset.Get();
+    const int32 PlaneAxis = EditPlane == EStrandEditPlane::XY ? 2 :
+        EditPlane == EStrandEditPlane::XZ ? 1 : EditPlane == EStrandEditPlane::YZ ? 0 : -1;
+    if (!Current || SelectedPointIndices.IsEmpty() ||
+        (PlaneAxis >= 0 && Axis != PlaneAxis) || !FMath::IsFinite(Degrees) ||
+        FMath::IsNearlyZero(Degrees, 0.000001)) { return; }
+    if (!ActivePointDragTransaction) { BeginViewportPointDrag(); }
+    if (!ActivePointDragTransaction) { return; }
+    if (StrandSplineEditOperations::RotateSelected(Current->Points, GetSelectedIndices(), Axis, Degrees))
+    {
+        bPointChangedDuringDrag = true;
+        Current->PostEditChange();
+        RebuildNativePreview();
+    }
+}
+
+void FStrandSplineAssetEditor::ApplyViewportScale(double Factor)
+{
+    USplineDataAsset* Current = Asset.Get();
+    if (!Current || SelectedPointIndices.IsEmpty() || !FMath::IsFinite(Factor) || Factor <= 0.0 ||
+        FMath::IsNearlyEqual(Factor, 1.0, 0.000001)) { return; }
+    if (!ActivePointDragTransaction) { BeginViewportPointDrag(); }
+    if (!ActivePointDragTransaction) { return; }
+    if (StrandSplineEditOperations::ScaleSelected(Current->Points, GetSelectedIndices(), Factor))
     {
         bPointChangedDuringDrag = true;
         Current->PostEditChange();
@@ -638,6 +800,13 @@ bool FStrandSplineAssetEditor::CanDeleteSelection() const
 
 void FStrandSplineAssetEditor::SyncViewportSelection()
 {
+    // A selected anchor may rotate its point orientation/handles or scale
+    // its handles; do not reset the chosen tool merely on single selection.
+    if (!HasSelectedPoint() && ActiveWidgetMode != 0)
+    {
+        ActiveWidgetMode = 0;
+        if (PreviewWidget.IsValid()) { PreviewWidget->SetWidgetMode(0); }
+    }
     if (PreviewWidget.IsValid())
     {
         PreviewWidget->SetSelectedPoints(GetSelectedIndices(), SelectedPointIndex);
@@ -695,6 +864,22 @@ void FStrandSplineAssetEditor::SelectPoint(int32 Index, bool bRange, bool bToggl
         SelectedPointIndices.Reset();
         SelectedPointIndices.Add(Index);
         SelectedPointIndex = Index;
+    }
+    SelectedHandle = 0;
+    SyncViewportSelection();
+}
+
+void FStrandSplineAssetEditor::SelectMarqueePoints(const TArray<int32>& Indices, bool bAdd, bool bToggle)
+{
+    EndViewportPointDrag();
+    const USplineDataAsset* Current = Asset.Get();
+    StrandSplineEditOperations::ApplySelectionHits(SelectedPointIndices,
+        Current ? Current->Points.Num() : 0, Indices, bAdd, bToggle);
+    // Keep the old primary if still selected; otherwise use the last point.
+    if (!SelectedPointIndices.Contains(SelectedPointIndex))
+    {
+        const TArray<int32> Sorted = GetSelectedIndices();
+        SelectedPointIndex = Sorted.IsEmpty() ? INDEX_NONE : Sorted.Last();
     }
     SelectedHandle = 0;
     SyncViewportSelection();
@@ -966,6 +1151,10 @@ FReply FStrandSplineAssetEditor::SetSelectedPointType(ESplinePointType::Type New
             Saved.LeaveTangent = Evaluated.LeaveTangent;
         }
         Saved.PointType = NewType;
+        // Native Auto overrides custom handle rules. A deliberate switch to
+        // Custom starts in Free rather than keeping stale linked constraints.
+        Saved.HandleMode = (NewType == ESplinePointType::Curve || NewType == ESplinePointType::CurveClamped)
+            ? EStrandBezierHandleMode::Auto : EStrandBezierHandleMode::Free;
     }
     Current->PostEditChange();
     Current->MarkPackageDirty();
@@ -990,6 +1179,107 @@ TSharedRef<SWidget> FStrandSplineAssetEditor::MakePointTypeMenu()
     Add(ESplinePointType::Linear, LOCTEXT("LinearPoint", "Linear"));
     Add(ESplinePointType::Constant, LOCTEXT("ConstantPoint", "Constant (not exportable yet)"));
     return Menu.MakeWidget();
+}
+
+FText FStrandSplineAssetEditor::GetHandleModeLabel() const
+{
+    const USplineDataAsset* Current = Asset.Get();
+    if (!Current || SelectedPointIndices.IsEmpty()) { return LOCTEXT("HandlesNoSelection", "Select points"); }
+    bool bHasMode = false;
+    EStrandBezierHandleMode Mode = EStrandBezierHandleMode::Free;
+    for (int32 Index : GetSelectedIndices())
+    {
+        if (!Current->Points.IsValidIndex(Index)) { continue; }
+        const EStrandBezierHandleMode Next = StrandSplineEditOperations::EffectiveHandleMode(Current->Points[Index]);
+        if (bHasMode && Next != Mode) { return LOCTEXT("HandlesMixed", "Mixed modes"); }
+        Mode = Next;
+        bHasMode = true;
+    }
+    if (!bHasMode) { return LOCTEXT("HandlesNoValidSelection", "Select points"); }
+    switch (Mode)
+    {
+    case EStrandBezierHandleMode::Aligned: return LOCTEXT("HandlesAlignedLabel", "Aligned");
+    case EStrandBezierHandleMode::Mirrored: return LOCTEXT("HandlesMirroredLabel", "Mirrored");
+    case EStrandBezierHandleMode::Auto: return LOCTEXT("HandlesAutoLabel", "Auto (Unreal)");
+    case EStrandBezierHandleMode::Corner: return LOCTEXT("HandlesCornerLabel", "Corner");
+    default: return LOCTEXT("HandlesFreeLabel", "Free");
+    }
+}
+
+FText FStrandSplineAssetEditor::GetHandleModeDescription() const
+{
+    if (!HasSelectedPoint()) { return LOCTEXT("HandlesSelectHelp", "Select one or more anchors to shape their handles."); }
+    const USplineDataAsset* Current = Asset.Get();
+    EStrandBezierHandleMode Mode = StrandSplineEditOperations::EffectiveHandleMode(Current->Points[SelectedPointIndex]);
+    for (int32 Index : GetSelectedIndices())
+    {
+        if (Current->Points.IsValidIndex(Index) &&
+            StrandSplineEditOperations::EffectiveHandleMode(Current->Points[Index]) != Mode)
+        {
+            return LOCTEXT("HandlesMixedHelp", "Select a mode to apply it to every selected anchor.");
+        }
+    }
+    switch (Mode)
+    {
+    case EStrandBezierHandleMode::Aligned: return LOCTEXT("HandlesAlignedHelp", "Drag one handle to turn both together. Each keeps its own length.");
+    case EStrandBezierHandleMode::Mirrored: return LOCTEXT("HandlesMirrorHelp", "Drag either handle; the other matches its direction and length.");
+    case EStrandBezierHandleMode::Auto: return LOCTEXT("HandlesAutoHelp", "Unreal automatically calculates smooth tangents. Drag a handle to switch to Free.");
+    case EStrandBezierHandleMode::Corner: return LOCTEXT("HandlesCornerHelp", "Both handles are collapsed to the anchor. Drag to break out into Free.");
+    default: return LOCTEXT("HandlesFreeHelp", "Incoming and outgoing handles move independently.");
+    }
+}
+
+TSharedRef<SWidget> FStrandSplineAssetEditor::MakeHandleModeMenu()
+{
+    FMenuBuilder Menu(true, nullptr);
+    auto Entry = [this, &Menu](EStrandBezierHandleMode Mode, const FText& Label, const FText& Tip)
+    {
+        Menu.AddMenuEntry(Label, Tip, FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this, Mode]()
+        {
+            SetSelectedHandleMode(Mode);
+        })));
+    };
+    Entry(EStrandBezierHandleMode::Free, LOCTEXT("FreeMode", "Free"),
+        LOCTEXT("FreeModeHelp", "Independent incoming and outgoing tangent handles."));
+    Entry(EStrandBezierHandleMode::Aligned, LOCTEXT("AlignedMode", "Aligned"),
+        LOCTEXT("AlignedModeHelp", "Linked direction, independent lengths. Persists through later edits."));
+    Entry(EStrandBezierHandleMode::Mirrored, LOCTEXT("MirroredMode", "Mirrored"),
+        LOCTEXT("MirroredModeHelp", "Linked direction and length. Persists through later edits."));
+    Entry(EStrandBezierHandleMode::Auto, LOCTEXT("AutoMode", "Auto (Unreal)"),
+        LOCTEXT("AutoModeHelp", "Use Unreal's native automatic spline tangent calculation."));
+    Entry(EStrandBezierHandleMode::Corner, LOCTEXT("CornerMode", "Corner"),
+        LOCTEXT("CornerModeHelp", "Collapse both cubic handles to zero at this anchor."));
+    return Menu.MakeWidget();
+}
+
+FReply FStrandSplineAssetEditor::SetSelectedHandleMode(EStrandBezierHandleMode Mode)
+{
+    USplineDataAsset* Current = Asset.Get();
+    if (!HasSelectedPoint() || !NativePreview.IsValid()) { return FReply::Handled(); }
+    EndViewportPointDrag();
+    const TArray<int32> Indices = GetSelectedIndices();
+    // Evaluate once before any edits. A Curve/Clamped key has computed native
+    // tangents which must be copied before its type changes to Custom.
+    TArray<FSplinePoint> Evaluated;
+    Evaluated.Reserve(Indices.Num());
+    for (int32 Index : Indices)
+    {
+        Evaluated.Add(NativePreview->GetSplinePointAt(Index, ESplineCoordinateSpace::Local));
+    }
+    FScopedTransaction Transaction(LOCTEXT("SetBezierModeUndo", "Change Strand Bezier Handle Mode"));
+    Current->Modify();
+    bool bChanged = false;
+    for (int32 I = 0; I < Indices.Num(); ++I)
+    {
+        bChanged |= StrandSplineEditOperations::SetHandleMode(Current->Points[Indices[I]],
+            Mode, Evaluated[I].ArriveTangent, Evaluated[I].LeaveTangent);
+    }
+    if (!bChanged) { Transaction.Cancel(); return FReply::Handled(); }
+    Current->PostEditChange();
+    Current->MarkPackageDirty();
+    RebuildNativePreview();
+    if (DetailsView.IsValid()) { DetailsView->ForceRefresh(); }
+    return FReply::Handled();
 }
 
 FText FStrandSplineAssetEditor::GetEditPlaneLabel() const
@@ -1061,8 +1351,9 @@ void FStrandSplineAssetEditor::ApplyViewportTangentDrag(int32 Handle, const FVec
         Point.LeaveTangent = Evaluated.LeaveTangent;
         Point.PointType = ESplinePointType::CurveCustomTangent;
     }
-    if (Handle == 1) { Point.ArriveTangent -= Constrained * 3.0; }
-    else { Point.LeaveTangent += Constrained * 3.0; }
+    const FVector Target = Handle == 1 ? Point.ArriveTangent - Constrained * 3.0
+        : Point.LeaveTangent + Constrained * 3.0;
+    if (!StrandSplineEditOperations::EditHandle(Point, Handle, Target)) { return; }
     bPointChangedDuringDrag = true;
     Current->PostEditChange();
     RebuildNativePreview();
@@ -1092,6 +1383,7 @@ FReply FStrandSplineAssetEditor::ExtendStart()
     const FVector Direction = First.LocalPosition - Current->Points[1].LocalPosition;
     First.LocalPosition += Direction * 0.5;
     First.PointType = ESplinePointType::Curve;
+    First.HandleMode = EStrandBezierHandleMode::Auto;
     First.ArriveTangent = FVector::ZeroVector;
     First.LeaveTangent = FVector::ZeroVector;
     Current->Points.Insert(First, 0);
@@ -1190,6 +1482,66 @@ FReply FStrandSplineAssetEditor::AlignSelection(int32 Axis)
         if (DetailsView.IsValid()) { DetailsView->ForceRefresh(); }
     }
     return FReply::Handled();
+}
+
+FReply FStrandSplineAssetEditor::RotateSelection(int32 Axis, double Degrees)
+{
+    USplineDataAsset* Current = Asset.Get();
+    if (!Current || SelectedPointIndices.IsEmpty() || Axis < 0 || Axis > 2 ||
+        !FMath::IsFinite(Degrees) || FMath::IsNearlyZero(Degrees)) { return FReply::Handled(); }
+    EndViewportPointDrag();
+    const FScopedTransaction Transaction(LOCTEXT("RotateSelectedUndo", "Rotate Strand Spline Selection"));
+    Current->Modify();
+    if (StrandSplineEditOperations::RotateSelected(Current->Points, GetSelectedIndices(), Axis, Degrees))
+    {
+        Current->PostEditChange();
+        Current->MarkPackageDirty();
+        RebuildNativePreview();
+        if (DetailsView.IsValid()) { DetailsView->ForceRefresh(); }
+    }
+    return FReply::Handled();
+}
+
+FReply FStrandSplineAssetEditor::ScaleSelection(double Factor)
+{
+    USplineDataAsset* Current = Asset.Get();
+    if (!Current || SelectedPointIndices.IsEmpty() || !FMath::IsFinite(Factor) || Factor <= 0.0 ||
+        FMath::IsNearlyEqual(Factor, 1.0)) { return FReply::Handled(); }
+    EndViewportPointDrag();
+    const FScopedTransaction Transaction(LOCTEXT("ScaleSelectedUndo", "Scale Strand Spline Selection"));
+    Current->Modify();
+    if (StrandSplineEditOperations::ScaleSelected(Current->Points, GetSelectedIndices(), Factor))
+    {
+        Current->PostEditChange();
+        Current->MarkPackageDirty();
+        RebuildNativePreview();
+        if (DetailsView.IsValid()) { DetailsView->ForceRefresh(); }
+    }
+    return FReply::Handled();
+}
+
+TSharedRef<SWidget> FStrandSplineAssetEditor::MakeTransformMenu()
+{
+    FMenuBuilder Menu(true, nullptr);
+    Menu.BeginSection(TEXT("Rotate"), LOCTEXT("RotateSelectionSection", "Rotate Selection Around Center"));
+    for (int32 Axis = 0; Axis < 3; ++Axis)
+    {
+        const TCHAR* AxisName = Axis == 0 ? TEXT("X") : Axis == 1 ? TEXT("Y") : TEXT("Z");
+        const FText AxisLabel = FText::FromString(FString::Printf(TEXT("Rotate %s +15 degrees"), AxisName));
+        const FText ReverseLabel = FText::FromString(FString::Printf(TEXT("Rotate %s -15 degrees"), AxisName));
+        Menu.AddMenuEntry(AxisLabel, LOCTEXT("RotateStepTip", "Rotate only selected anchors and tangents about their center. Undoable."),
+            FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this, Axis]() { RotateSelection(Axis, 15.0); })));
+        Menu.AddMenuEntry(ReverseLabel, FText::GetEmpty(), FSlateIcon(),
+            FUIAction(FExecuteAction::CreateLambda([this, Axis]() { RotateSelection(Axis, -15.0); })));
+    }
+    Menu.EndSection();
+    Menu.BeginSection(TEXT("Scale"), LOCTEXT("ScaleSelectionSection", "Uniform Scale Around Center"));
+    Menu.AddMenuEntry(LOCTEXT("HalfSize", "Scale 50%"), FText::GetEmpty(), FSlateIcon(),
+        FUIAction(FExecuteAction::CreateLambda([this]() { ScaleSelection(0.5); })));
+    Menu.AddMenuEntry(LOCTEXT("DoubleSize", "Scale 200%"), FText::GetEmpty(), FSlateIcon(),
+        FUIAction(FExecuteAction::CreateLambda([this]() { ScaleSelection(2.0); })));
+    Menu.EndSection();
+    return Menu.MakeWidget();
 }
 
 FReply FStrandSplineAssetEditor::DistributeSelection(int32 Axis)
@@ -1303,82 +1655,163 @@ FReply FStrandSplineAssetEditor::FlattenSpline(int32 Axis)
 
 TSharedRef<SWidget> FStrandSplineAssetEditor::MakeSplineToolsMenu()
 {
+    // A short command taxonomy replaces the old ~20-item root menu. The
+    // active editing modes remain visible on the authoring strip; these are
+    // less frequent operations grouped by what the designer is doing.
     FMenuBuilder Menu(true, nullptr);
-    auto Entry = [&Menu](const FText& Label, const FText& Tip, TFunction<void()> Action)
+    auto AddAction = [](FMenuBuilder& Target, const FText& Label, const FText& Tip,
+        TFunction<void()> Action)
     {
-        const TSharedRef<TFunction<void()>> SharedAction = MakeShared<TFunction<void()>>(MoveTemp(Action));
-        Menu.AddMenuEntry(Label, Tip, FSlateIcon(),
-            FUIAction(FExecuteAction::CreateLambda([SharedAction]() { (*SharedAction)(); })));
+        const TSharedRef<TFunction<void()>> Shared = MakeShared<TFunction<void()>>(MoveTemp(Action));
+        Target.AddMenuEntry(Label, Tip, FSlateIcon(),
+            FUIAction(FExecuteAction::CreateLambda([Shared]() { (*Shared)(); })));
     };
-    Menu.BeginSection(TEXT("SelectionTools"), LOCTEXT("SelectionToolsSection", "Selected Points"));
-    Menu.AddSubMenu(LOCTEXT("AlignSubMenu", "Align Points"),
-        LOCTEXT("AlignTip", "Move selected anchors to their shared center on one axis. Tangents follow their anchors."),
-        FNewMenuDelegate::CreateLambda([this](FMenuBuilder& Sub)
+    Menu.AddSubMenu(LOCTEXT("PointMenu", "Selected Points"),
+        LOCTEXT("PointMenuHelp", "Align, distribute, snap or adjust selected control points."),
+        FNewMenuDelegate::CreateLambda([this, AddAction](FMenuBuilder& Sub)
         {
-            Sub.AddMenuEntry(LOCTEXT("AlignX", "Align X"), FText::GetEmpty(), FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this]() { AlignSelection(0); })));
-            Sub.AddMenuEntry(LOCTEXT("AlignY", "Align Y"), FText::GetEmpty(), FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this]() { AlignSelection(1); })));
-            Sub.AddMenuEntry(LOCTEXT("AlignZ", "Align Z"), FText::GetEmpty(), FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this]() { AlignSelection(2); })));
+            Sub.AddSubMenu(LOCTEXT("AlignSubMenu", "Align"),
+                LOCTEXT("AlignTip", "Align selected anchors to their shared center along an axis."),
+                FNewMenuDelegate::CreateLambda([this](FMenuBuilder& Axis)
+                {
+                    for (int32 I = 0; I < 3; ++I)
+                    {
+                        const FText Label = I == 0 ? LOCTEXT("AlignX", "Align X")
+                            : I == 1 ? LOCTEXT("AlignY", "Align Y") : LOCTEXT("AlignZ", "Align Z");
+                        Axis.AddMenuEntry(Label, FText::GetEmpty(), FSlateIcon(),
+                            FUIAction(FExecuteAction::CreateLambda([this, I]() { AlignSelection(I); })));
+                    }
+                }));
+            Sub.AddSubMenu(LOCTEXT("DistributeSubMenu", "Distribute"),
+                LOCTEXT("DistributeTip", "Space at least three selected anchors evenly along an axis."),
+                FNewMenuDelegate::CreateLambda([this](FMenuBuilder& Axis)
+                {
+                    for (int32 I = 0; I < 3; ++I)
+                    {
+                        const FText Label = I == 0 ? LOCTEXT("DistributeX", "Distribute X")
+                            : I == 1 ? LOCTEXT("DistributeY", "Distribute Y") : LOCTEXT("DistributeZ", "Distribute Z");
+                        Axis.AddMenuEntry(Label, FText::GetEmpty(), FSlateIcon(),
+                            FUIAction(FExecuteAction::CreateLambda([this, I]() { DistributeSelection(I); })));
+                    }
+                }));
+            Sub.AddSubMenu(LOCTEXT("SnapPointMenu", "Snap Anchors"),
+                LOCTEXT("SnapPointTip", "Round selected positions to the chosen centimeter increment."),
+                FNewMenuDelegate::CreateLambda([this](FMenuBuilder& Steps)
+                {
+                    for (const double Step : { 1.0, 10.0, 100.0 })
+                    {
+                        const FText Label = FText::FromString(FString::Printf(TEXT("%.0f cm"), Step));
+                        Steps.AddMenuEntry(Label, FText::GetEmpty(), FSlateIcon(),
+                            FUIAction(FExecuteAction::CreateLambda([this, Step]() { SnapSelectedPoint(Step); })));
+                    }
+                }));
+            Sub.AddMenuSeparator();
+            AddAction(Sub, LOCTEXT("AlignHandles", "Align Tangents Once"),
+                LOCTEXT("AlignHandlesTip", "One-time alignment. For linked editing use inspector > Bezier Handles > Aligned."),
+                [this]() { MatchSelectedTangents(false); });
+            AddAction(Sub, LOCTEXT("MirrorHandles", "Mirror Tangents Once"),
+                LOCTEXT("MirrorHandlesTip", "One-time mirroring. For linked editing use inspector > Bezier Handles > Mirrored."),
+                [this]() { MatchSelectedTangents(true); });
         }));
-    Menu.AddSubMenu(LOCTEXT("DistributeSubMenu", "Distribute Points"),
-        LOCTEXT("DistributeTip", "Space at least three selected anchors evenly along an axis, ordered by their coordinate."),
-        FNewMenuDelegate::CreateLambda([this](FMenuBuilder& Sub)
+    Menu.AddSubMenu(LOCTEXT("PathMenu", "Create and Path"),
+        LOCTEXT("PathMenuHelp", "Draw, extend, close, reverse, or clear a spline."),
+        FNewMenuDelegate::CreateLambda([this, AddAction](FMenuBuilder& Sub)
         {
-            Sub.AddMenuEntry(LOCTEXT("DistributeX", "Distribute X"), FText::GetEmpty(), FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this]() { DistributeSelection(0); })));
-            Sub.AddMenuEntry(LOCTEXT("DistributeY", "Distribute Y"), FText::GetEmpty(), FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this]() { DistributeSelection(1); })));
-            Sub.AddMenuEntry(LOCTEXT("DistributeZ", "Distribute Z"), FText::GetEmpty(), FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this]() { DistributeSelection(2); })));
+            AddAction(Sub, LOCTEXT("StartPenMenu", "Activate Spline Pen"),
+                LOCTEXT("StartPenTip", "Click to create or extend a spline directly in the viewport."),
+                [this]() { SetPenMode(true); });
+            AddAction(Sub, LOCTEXT("ExtendStartMenu", "Extend Start"),
+                LOCTEXT("ExtendStartTip", "Add an anchor before the first point of an open spline."),
+                [this]() { ExtendStart(); });
+            AddAction(Sub, LOCTEXT("ExtendEndMenu", "Extend End"),
+                LOCTEXT("ExtendEndTip", "Append an endpoint to an open spline."),
+                [this]() { if (USplineDataAsset* Current = Asset.Get())
+                { if (!Current->bIsClosedLoop && Current->Points.Num() >= 2)
+                { SelectPoint(Current->Points.Num() - 1); AddPointAfterSelection(); } } });
+            AddAction(Sub, LOCTEXT("ReverseMenu", "Reverse Direction"),
+                LOCTEXT("ReverseTip", "Reverse point sequence, with inverted incoming/outgoing tangents."),
+                [this]() { ReverseSpline(); });
+            AddAction(Sub, LOCTEXT("FirstPointMenu", "Set Selected as First (Closed)"),
+                LOCTEXT("FirstPointTip", "Change the start point of a closed spline without moving geometry."),
+                [this]() { SetSelectedAsFirst(); });
+            AddAction(Sub, LOCTEXT("ToggleClosedMenu", "Toggle Closed Loop"),
+                LOCTEXT("ToggleClosedTip", "Join or separate the spline endpoints."),
+                [this]() { ToggleClosedLoop(); });
+            Sub.AddMenuSeparator();
+            AddAction(Sub, LOCTEXT("ClearSplineMenu", "Clear All Points..."),
+                LOCTEXT("ClearSplineTip", "Clear the entire asset to draw a new path; asks for confirmation."),
+                [this]() { ClearSpline(); });
         }));
-    Entry(LOCTEXT("AlignHandles", "Align Primary Tangents"),
-        LOCTEXT("AlignHandlesTip", "One-shot tangent alignment preserving each handle length; the selected handle drives the direction."),
-        [this]() { MatchSelectedTangents(false); });
-    Entry(LOCTEXT("MirrorHandles", "Mirror Primary Tangents"),
-        LOCTEXT("MirrorHandlesTip", "One-shot matched tangent directions and lengths. Does not automatically link later edits."),
-        [this]() { MatchSelectedTangents(true); });
-    Menu.EndSection();
-    Menu.BeginSection(TEXT("Build"), LOCTEXT("BuildToolsSection", "Create and Refine"));
-    Entry(LOCTEXT("StartPenMenu", "Activate Spline Pen"), LOCTEXT("StartPenTip", "Click to draw splines directly in the viewport."), [this]() { SetPenMode(true); });
-    Entry(LOCTEXT("ClearSplineMenu", "Clear All Points"), LOCTEXT("ClearSplineTip", "Remove all points so you can draw a new spline from scratch. Undoable and requires confirmation."), [this]() { ClearSpline(); });
-    Entry(LOCTEXT("ExtendStartMenu", "Extend Start"), LOCTEXT("ExtendStartTip", "Add an anchor before the first point of an open spline."), [this]() { ExtendStart(); });
-    Entry(LOCTEXT("ExtendEndMenu", "Extend End"), LOCTEXT("ExtendEndTip", "Select the final anchor then Insert to extend an open spline."),
-        [this]() { if (USplineDataAsset* Current = Asset.Get()) { if (!Current->bIsClosedLoop && Current->Points.Num() >= 2) { SelectPoint(Current->Points.Num() - 1); AddPointAfterSelection(); } } });
-    Entry(LOCTEXT("SubdivideMenu", "Subdivide All Segments"), LOCTEXT("SubdivideTip", "Insert an anchor halfway along every segment, preserving evaluated cubic geometry."), [this]() { SubdivideSpline(); });
-    Entry(LOCTEXT("ReverseMenu", "Reverse Direction"), LOCTEXT("ReverseTip", "Reverse point order, with inverted incoming/outgoing handles."), [this]() { ReverseSpline(); });
-    Entry(LOCTEXT("FirstPointMenu", "Set Selected as First (Closed)"), LOCTEXT("FirstPointTip", "For closed loops, change the starting anchor without changing the shape."), [this]() { SetSelectedAsFirst(); });
-    Menu.AddSubMenu(LOCTEXT("SnapPointMenu", "Snap Selected Points"), LOCTEXT("SnapPointTip", "Snap all selected point positions to a grid increment (cm). Active 2D editing plane is respected."),
-        FNewMenuDelegate::CreateLambda([this](FMenuBuilder& Sub)
+    Menu.AddSubMenu(LOCTEXT("RefineMenu", "Refine and Shape"),
+        LOCTEXT("RefineMenuHelp", "Subdivide, linearize, smooth, mirror, or flatten the entire spline."),
+        FNewMenuDelegate::CreateLambda([this, AddAction](FMenuBuilder& Sub)
         {
-            Sub.AddMenuEntry(LOCTEXT("Snap1", "1 cm"), FText::GetEmpty(), FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this]() { SnapSelectedPoint(1.0); })));
-            Sub.AddMenuEntry(LOCTEXT("Snap10", "10 cm"), FText::GetEmpty(), FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this]() { SnapSelectedPoint(10.0); })));
-            Sub.AddMenuEntry(LOCTEXT("Snap100", "100 cm"), FText::GetEmpty(), FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this]() { SnapSelectedPoint(100.0); })));
+            AddAction(Sub, LOCTEXT("SubdivideMenu", "Subdivide All Segments"),
+                LOCTEXT("SubdivideTip", "Insert an anchor at each segment midpoint, preserving cubic geometry."),
+                [this]() { SubdivideSpline(); });
+            AddAction(Sub, LOCTEXT("LinearAllMenu", "Linearize All"),
+                LOCTEXT("LinearAllTip", "Turn every segment into straight edges; changes the curve."),
+                [this]() { LinearizeSpline(); });
+            AddAction(Sub, LOCTEXT("AutoAllMenu", "Auto-Smooth All"),
+                LOCTEXT("AutoAllTip", "Apply Unreal native automatic cubic tangents to every point."),
+                [this]() { SmoothSpline(); });
+            Sub.AddSubMenu(LOCTEXT("MirrorSubMenu", "Mirror Spline"),
+                LOCTEXT("MirrorTip", "Reflect all positions and tangents around the spline bounds center."),
+                FNewMenuDelegate::CreateLambda([this](FMenuBuilder& Axes)
+                {
+                    for (int32 Axis = 0; Axis < 3; ++Axis)
+                    {
+                        const FText Label = Axis == 0 ? LOCTEXT("MirrorX", "Mirror X")
+                            : Axis == 1 ? LOCTEXT("MirrorY", "Mirror Y") : LOCTEXT("MirrorZ", "Mirror Z");
+                        Axes.AddMenuEntry(Label, FText::GetEmpty(), FSlateIcon(),
+                            FUIAction(FExecuteAction::CreateLambda([this, Axis]() { MirrorSpline(Axis); })));
+                    }
+                }));
+            Sub.AddSubMenu(LOCTEXT("FlattenSubMenu", "Flatten to Plane..."),
+                LOCTEXT("FlattenTip", "Discard one dimension from positions and handles; confirmation required."),
+                FNewMenuDelegate::CreateLambda([this](FMenuBuilder& Axes)
+                {
+                    for (int32 Axis = 0; Axis < 3; ++Axis)
+                    {
+                        const FText Label = Axis == 2 ? LOCTEXT("FlattenXY", "Top (XY), discard Z")
+                            : Axis == 1 ? LOCTEXT("FlattenXZ", "Front (XZ), discard Y")
+                            : LOCTEXT("FlattenYZ", "Side (YZ), discard X");
+                        Axes.AddMenuEntry(Label, FText::GetEmpty(), FSlateIcon(),
+                            FUIAction(FExecuteAction::CreateLambda([this, Axis]() { FlattenSpline(Axis); })));
+                    }
+                }));
         }));
-    Entry(LOCTEXT("ToggleClosedMenu", "Toggle Closed Loop"), LOCTEXT("ToggleClosedTip", "Join or separate the spline endpoints."), [this]() { ToggleClosedLoop(); });
-    Menu.EndSection();
-    Menu.BeginSection(TEXT("Shape"), LOCTEXT("ShapeToolsSection", "Shape"));
-    Entry(LOCTEXT("LinearAllMenu", "Linearize All"), LOCTEXT("LinearAllTip", "Turn all segments into straight edges. This changes the geometry."), [this]() { LinearizeSpline(); });
-    Entry(LOCTEXT("AutoAllMenu", "Auto-Smooth All"), LOCTEXT("AutoAllTip", "Use Unreal's native automatic cubic tangents on every point. This changes the geometry."), [this]() { SmoothSpline(); });
-    Menu.AddSubMenu(LOCTEXT("MirrorSubMenu", "Mirror"), LOCTEXT("MirrorTip", "Reflect positions and tangents around the spline's control-point bounds center."),
-        FNewMenuDelegate::CreateLambda([this](FMenuBuilder& Sub)
-        {
-            Sub.AddMenuEntry(LOCTEXT("MirrorX", "Mirror X"), FText::GetEmpty(), FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this]() { MirrorSpline(0); })));
-            Sub.AddMenuEntry(LOCTEXT("MirrorY", "Mirror Y"), FText::GetEmpty(), FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this]() { MirrorSpline(1); })));
-            Sub.AddMenuEntry(LOCTEXT("MirrorZ", "Mirror Z"), FText::GetEmpty(), FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this]() { MirrorSpline(2); })));
-        }));
-    Menu.AddSubMenu(LOCTEXT("FlattenSubMenu", "Flatten to Plane"), LOCTEXT("FlattenTip", "Project points AND handles to a 2D plane. Requires confirmation; Undo supported."),
-        FNewMenuDelegate::CreateLambda([this](FMenuBuilder& Sub)
-        {
-            Sub.AddMenuEntry(LOCTEXT("FlattenXY", "Top (XY), discard Z"), FText::GetEmpty(), FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this]() { FlattenSpline(2); })));
-            Sub.AddMenuEntry(LOCTEXT("FlattenXZ", "Front (XZ), discard Y"), FText::GetEmpty(), FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this]() { FlattenSpline(1); })));
-            Sub.AddMenuEntry(LOCTEXT("FlattenYZ", "Side (YZ), discard X"), FText::GetEmpty(), FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this]() { FlattenSpline(0); })));
-        }));
-    Menu.EndSection();
     return Menu.MakeWidget();
 }
 
+
+void FStrandSplineAssetEditor::SetWidgetMode(int32 Mode)
+{
+    EndViewportPointDrag();
+    ActiveWidgetMode = FMath::Clamp(Mode, 0, 2);
+    if (ActiveWidgetMode != 0 && SelectedHandle != 0)
+    {
+        // Rotating/scaling shapes the anchor, not one isolated handle.
+        SelectedHandle = 0;
+        if (PreviewWidget.IsValid()) { PreviewWidget->SetSelectedHandle(0); }
+    }
+    if (PreviewWidget.IsValid()) { PreviewWidget->SetWidgetMode(ActiveWidgetMode); }
+}
+
+void FStrandSplineAssetEditor::SetMarqueeMode(bool bEnabled)
+{
+    if (bEnabled && bPenMode) { SetPenMode(false); }
+    EndViewportPointDrag();
+    bMarqueeMode = bEnabled;
+    if (PreviewWidget.IsValid()) { PreviewWidget->SetMarqueeMode(bEnabled); }
+}
 
 void FStrandSplineAssetEditor::SetPenMode(bool bEnabled)
 {
     if (!bEnabled) { EndPenStroke(); }
     EndViewportPointDrag();
     if (bEnabled && HasMultipleSelectedPoints()) { SelectPoint(SelectedPointIndex); }
+    if (bEnabled && bMarqueeMode) { SetMarqueeMode(false); }
     bPenMode = bEnabled;
     if (PreviewWidget.IsValid())
     {
@@ -1417,6 +1850,10 @@ FText FStrandSplineAssetEditor::GetPenSnapLabel() const
 
 FText FStrandSplineAssetEditor::GetEditorHint() const
 {
+    if (bMarqueeMode)
+    {
+        return LOCTEXT("MarqueeStatus", "Box Select  |  Drag rectangle to select anchors  |  Shift: add  |  Ctrl: toggle  |  Alt+LMB: orbit");
+    }
     if (bPenMode)
     {
         if (const USplineDataAsset* Current = Asset.Get())
@@ -1428,7 +1865,23 @@ FText FStrandSplineAssetEditor::GetEditorHint() const
         }
         return LOCTEXT("PenModeStatus", "Pen  |  Click: draw / insert  |  Drag: handles  |  Endpoint: extend / close  |  Esc: Select");
     }
-    return LOCTEXT("SelectModeStatus", "Select  |  Click: single  |  Shift-click: range  |  Ctrl-click: toggle  |  Ctrl+A: all  |  Esc: clear");
+    if (HasSelectedPoint())
+    {
+        if (ActiveWidgetMode == 1)
+        {
+            return HasMultipleSelectedPoints()
+                ? LOCTEXT("RotateStatus", "ROTATE  |  Native Unreal rotation widget  |  Group pivot: selection center  |  Space: Scale  |  RMB+WASD: fly")
+                : LOCTEXT("RotateSingleStatus", "ROTATE  |  Rotate selected anchor tangents/orientation  |  Space: Scale  |  RMB+WASD: fly");
+        }
+        if (ActiveWidgetMode == 2)
+        {
+            return HasMultipleSelectedPoints()
+                ? LOCTEXT("ScaleStatus", "UNIFORM SCALE  |  Native Unreal scale widget  |  Group pivot: selection center  |  Space: Move  |  RMB+WASD: fly")
+                : LOCTEXT("ScaleSingleStatus", "UNIFORM SCALE  |  Scale selected anchor's tangents  |  Space: Move  |  RMB+WASD: fly");
+        }
+        return LOCTEXT("MoveStatus", "MOVE  |  Native Unreal XYZ widget  |  Space: Rotate  |  RMB+WASD: fly  |  F: frame  |  Delete: remove");
+    }
+    return LOCTEXT("SelectModeStatus", "Select anchors to transform  |  Shift: range  Ctrl: toggle  |  Space: cycle Move/Rotate/Scale  |  P: Pen  B: Box Select");
 }
 
 FReply FStrandSplineAssetEditor::ClearSpline()

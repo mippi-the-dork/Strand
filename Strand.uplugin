@@ -1,9 +1,9 @@
 {
   "FileVersion": 3,
-  "Version": 38,
-  "VersionName": "0.6.5",
+  "Version": 44,
+  "VersionName": "0.6.11",
   "FriendlyName": "Strand",
-  "Description": "Native UE5 spline assets, multi-point viewport authoring, Spline Pen, editing tools, and SVG/Alembic interchange.",
+  "Description": "Native Unreal spline asset authoring with engine transform widgets, Spacebar mode cycling, direct B\u00e9zier editing, Blueprint-safe links, SVG/Alembic interchange and PCG.",
   "Category": "Editor",
   "CreatedBy": "Strand",
   "CanContainContent": false,

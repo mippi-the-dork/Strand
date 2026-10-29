@@ -98,7 +98,11 @@ public:
         SetViewMode(VMI_Unlit);
         SetRealtime(false);
         bDrawAxes = true;
+        // Draw Unreal's real transform widget in this standalone asset editor.
+        // Strand supplies the selection pivot/mode and handles widget deltas,
+        // without changing the Level Editor's mode manager or actor selection.
         ShowWidget(true);
+        EngineShowFlags.SetModeWidgets(true);
         // The spline preview draws a bounded local floor below the geometry, not a world-Z=0 ceiling.
         EngineShowFlags.SetGrid(false);
         SetViewLocation(FVector(-350.0, -350.0, 270.0));
@@ -128,6 +132,39 @@ public:
         Invalidate();
     }
     void SetSelectedHandle(int32 InHandle) { SelectedHandle = FMath::Clamp(InHandle, 0, 2); Invalidate(); }
+    void SetMarqueeMode(bool bEnable)
+    {
+        bMarqueeMode = bEnable;
+        bMarqueeDragging = false;
+        Invalidate();
+    }
+    void SetStrandWidgetMode(int32 Mode)
+    {
+        WidgetMode = FMath::Clamp(Mode, 0, 2);
+        Invalidate();
+    }
+    void SetOnMarqueeSelected(TFunction<void(const TArray<int32>&, bool, bool)> Callback)
+    {
+        OnMarqueeSelected = MoveTemp(Callback);
+    }
+    void SetOnMarqueeExit(TFunction<void()> Callback)
+    {
+        OnMarqueeExit = MoveTemp(Callback);
+    }
+    void SetPointRotationCallback(TFunction<void(int32, double)> Callback)
+    {
+        OnPointRotation = MoveTemp(Callback);
+    }
+    void SetPointScaleCallback(TFunction<void(double)> Callback)
+    {
+        OnPointScale = MoveTemp(Callback);
+    }
+    void SetOnWidgetModeChanged(TFunction<void(int32)> Callback)
+    {
+        OnWidgetModeChanged = MoveTemp(Callback);
+    }
+    void SetOnToolShortcut(TFunction<void(int32)> Callback) { OnToolShortcut = MoveTemp(Callback); }
+    void SetOnDeleteShortcut(TFunction<void()> Callback) { OnDeleteShortcut = MoveTemp(Callback); }
     void SetPenMode(bool bEnable)
     {
         if (!bEnable && bPenDragging && OnPenCancel) { OnPenCancel(); }
@@ -190,8 +227,11 @@ public:
     virtual UE::Widget::EWidgetMode GetWidgetMode() const override
     {
         const USplineComponent* Native = Spline.Get();
-        return !bPenMode && bShowPoints && Native && SelectedPoint >= 0 && SelectedPoint < Native->GetNumberOfSplinePoints()
-            ? UE::Widget::WM_Translate : UE::Widget::WM_None;
+        return !bPenMode && !bMarqueeMode && bShowPoints && Native && SelectedPoint >= 0 && SelectedPoint < Native->GetNumberOfSplinePoints()
+            ? (SelectedHandle != 0 ? UE::Widget::WM_Translate :
+                WidgetMode == 1 ? UE::Widget::WM_Rotate :
+                WidgetMode == 2 ? UE::Widget::WM_Scale :
+                UE::Widget::WM_Translate) : UE::Widget::WM_None;
     }
 
     virtual FMatrix GetWidgetCoordSystem() const override { return FMatrix::Identity; }
@@ -205,7 +245,28 @@ public:
         {
             return FEditorViewportClient::InputWidgetDelta(InViewport, CurrentAxis, Drag, Rot, Scale);
         }
-        if (!Drag.IsNearlyZero() && OnPointDragDelta)
+        if (SelectedHandle == 0 && WidgetMode == 1 && OnPointRotation)
+        {
+            // Unreal's rotation deltas use Pitch=Y, Yaw=Z, Roll=X.
+            const double Degrees[3] = { Rot.Roll, Rot.Pitch, Rot.Yaw };
+            for (int32 Axis = 0; Axis < 3; ++Axis)
+            {
+                if (FMath::Abs(Degrees[Axis]) > 0.000001) { OnPointRotation(Axis, Degrees[Axis]); }
+            }
+        }
+        else if (SelectedHandle == 0 && WidgetMode == 2 && OnPointScale)
+        {
+            // The Strand group scale is uniform: the active widget axis controls
+            // one proportional factor, while all anchor offsets/tangents scale.
+            double Delta = Scale.X;
+            if (FMath::Abs(Scale.Y) > FMath::Abs(Delta)) { Delta = Scale.Y; }
+            if (FMath::Abs(Scale.Z) > FMath::Abs(Delta)) { Delta = Scale.Z; }
+            if (FMath::IsFinite(Delta) && FMath::Abs(Delta) > 0.000001)
+            {
+                OnPointScale(FMath::Clamp(1.0 + Delta, 0.01, 100.0));
+            }
+        }
+        else if (!Drag.IsNearlyZero() && OnPointDragDelta)
         {
             if (SelectedHandle != 0 && OnTangentDragDelta) { OnTangentDragDelta(SelectedHandle, Drag); }
             else { OnPointDragDelta(Drag); }
@@ -250,9 +311,47 @@ public:
     // standard click-on-release selection path in ProcessClick.
     virtual bool InputKey(const FInputKeyEventArgs& EventArgs) override
     {
+        if (EventArgs.Event == IE_Pressed)
+        {
+            const FModifierKeysState Mods = FSlateApplication::Get().GetModifierKeys();
+            if (!EventArgs.Viewport->KeyState(EKeys::RightMouseButton) &&
+                !Mods.IsControlDown() && !Mods.IsAltDown() && !Mods.IsShiftDown())
+            {
+                if (EventArgs.Key == EKeys::P && OnToolShortcut) { OnToolShortcut(1); return true; }
+                if (EventArgs.Key == EKeys::B && OnToolShortcut) { OnToolShortcut(2); return true; }
+                if (EventArgs.Key == EKeys::V && OnToolShortcut) { OnToolShortcut(0); return true; }
+                if (!bPenMode && (EventArgs.Key == EKeys::Delete || EventArgs.Key == EKeys::BackSpace) && OnDeleteShortcut)
+                {
+                    OnDeleteShortcut();
+                    return true;
+                }
+            }
+        }
         if (!bPenMode && EventArgs.Event == IE_Pressed)
         {
             const FModifierKeysState Mods = FSlateApplication::Get().GetModifierKeys();
+            // RMB + WASD is Unreal's viewport flight navigation. Never consume
+            // movement/transform shortcuts while the camera is being driven.
+            const bool bFlying = EventArgs.Viewport->KeyState(EKeys::RightMouseButton);
+            if (!bFlying && !Mods.IsControlDown() && !Mods.IsAltDown() && !Mods.IsShiftDown())
+            {
+                // Unreal's standard Spacebar cycle, scoped to Strand's viewport.
+                // W/E/R are intentionally NOT intercepted: they belong to the
+                // engine camera controls when RMB is held.
+                if (EventArgs.Key == EKeys::SpaceBar && !bMarqueeMode)
+                {
+                    // Consume the shortcut even when nothing is selected, so
+                    // the base viewport cannot silently change another mode.
+                    if (SelectedPoint != INDEX_NONE)
+                    {
+                        const int32 Next = (WidgetMode + 1) % 3;
+                        if (OnWidgetModeChanged) { OnWidgetModeChanged(Next); }
+                        else { SetStrandWidgetMode(Next); }
+                    }
+                    return true;
+                }
+                if (EventArgs.Key == EKeys::F) { FrameSpline(); return true; }
+            }
             if (EventArgs.Key == EKeys::A && Mods.IsControlDown() && !Mods.IsAltDown())
             {
                 if (OnSelectAll) { OnSelectAll(); }
@@ -260,6 +359,7 @@ public:
             }
             if (EventArgs.Key == EKeys::Escape)
             {
+                if (bMarqueeMode && OnMarqueeExit) { OnMarqueeExit(); return true; }
                 if (OnClearSelection) { OnClearSelection(); }
                 return true;
             }
@@ -272,6 +372,74 @@ public:
             if (OnPenExit) { OnPenExit(); }
             Invalidate();
             return true;
+        }
+        if (bMarqueeMode && EventArgs.Key == EKeys::LeftMouseButton)
+        {
+            if (EventArgs.Event == IE_Pressed)
+            {
+                if (EventArgs.Viewport->KeyState(EKeys::LeftAlt) || EventArgs.Viewport->KeyState(EKeys::RightAlt))
+                {
+                    bDelegatedMarqueeCameraClick = true;
+                    return FEditorViewportClient::InputKey(EventArgs);
+                }
+                bMarqueeDragging = true;
+                MarqueeStart = FIntPoint(EventArgs.Viewport->GetMouseX(), EventArgs.Viewport->GetMouseY());
+                MarqueeEnd = MarqueeStart;
+                const FModifierKeysState Mods = FSlateApplication::Get().GetModifierKeys();
+                bMarqueeAdd = Mods.IsShiftDown();
+                bMarqueeToggle = Mods.IsControlDown();
+                Invalidate();
+                return true;
+            }
+            if (EventArgs.Event == IE_Released && bDelegatedMarqueeCameraClick)
+            {
+                bDelegatedMarqueeCameraClick = false;
+                return FEditorViewportClient::InputKey(EventArgs);
+            }
+            if (EventArgs.Event == IE_Released && bMarqueeDragging)
+            {
+                bMarqueeDragging = false;
+                if (OnMarqueeSelected)
+                {
+                    TArray<int32> Indices;
+                    const int32 MinX = FMath::Min(MarqueeStart.X, MarqueeEnd.X);
+                    const int32 MaxX = FMath::Max(MarqueeStart.X, MarqueeEnd.X);
+                    const int32 MinY = FMath::Min(MarqueeStart.Y, MarqueeEnd.Y);
+                    const int32 MaxY = FMath::Max(MarqueeStart.Y, MarqueeEnd.Y);
+                    // A click without a drag behaves like Select, including
+                    // additive/toggle modifiers. It must not clear all anchors.
+                    if (MaxX - MinX < 4 && MaxY - MinY < 4)
+                    {
+                        int32 ClickedIndex = INDEX_NONE;
+                        if (HHitProxy* ClickProxy = EventArgs.Viewport->GetHitProxy(MarqueeStart.X, MarqueeStart.Y))
+                        {
+                            if (ClickProxy->IsA(HStrandSplinePointProxy::StaticGetType()))
+                            {
+                                ClickedIndex = static_cast<HStrandSplinePointProxy*>(ClickProxy)->PointIndex;
+                            }
+                        }
+                        if (OnPointSelected) { OnPointSelected(ClickedIndex, bMarqueeAdd, bMarqueeToggle); }
+                        Invalidate();
+                        return true;
+                    }
+                    if (const USplineComponent* Native = Spline.Get())
+                    {
+                        for (int32 Index = 0; Index < Native->GetNumberOfSplinePoints(); ++Index)
+                        {
+                            FVector2D Screen;
+                            if (ProjectAnchor(Native->GetLocationAtSplinePoint(Index, ESplineCoordinateSpace::Local), Screen) &&
+                                Screen.X >= MinX && Screen.X <= MaxX && Screen.Y >= MinY && Screen.Y <= MaxY)
+                            {
+                                Indices.Add(Index);
+                            }
+                        }
+                    }
+                    OnMarqueeSelected(Indices, bMarqueeAdd, bMarqueeToggle);
+                }
+                Invalidate();
+                return true;
+            }
+            if (EventArgs.Event == IE_Released) { return true; }
         }
         if (bPenMode && EventArgs.Key == EKeys::LeftMouseButton)
         {
@@ -323,6 +491,15 @@ public:
             }
             if (EventArgs.Event == IE_Released) { return true; }
         }
+        // Suppress the viewport's built-in W/E/R transform shortcuts when not
+        // flying. Strand uses Spacebar instead, but RMB+WASD must always reach
+        // the base camera controller unchanged (press, repeat and release).
+        if (!EventArgs.Viewport->KeyState(EKeys::RightMouseButton) &&
+            (EventArgs.Key == EKeys::W || EventArgs.Key == EKeys::E || EventArgs.Key == EKeys::R) &&
+            EventArgs.Event == IE_Pressed)
+        {
+            return false;
+        }
         return FEditorViewportClient::InputKey(EventArgs);
     }
 
@@ -330,15 +507,16 @@ public:
     {
         // Consuming press/release alone is insufficient: native viewport mouse
         // deltas can still move the camera during an active Pen drag.
-        if (bPenMode && bPenDragging) { return true; }
+        if ((bPenMode && bPenDragging) || bMarqueeDragging) { return true; }
         return FEditorViewportClient::InputAxis(EventArgs);
     }
 
     virtual void MouseMove(FViewport* InViewport, int32 X, int32 Y) override
     {
         PenMouseX = X; PenMouseY = Y;
+        if (bMarqueeDragging) { MarqueeEnd = FIntPoint(X, Y); Invalidate(); }
         UpdatePenMouse();
-        if (!bPenMode || !bPenDragging)
+        if ((!bPenMode || !bPenDragging) && !bMarqueeDragging)
         {
             FEditorViewportClient::MouseMove(InViewport, X, Y);
         }
@@ -347,8 +525,9 @@ public:
     virtual void CapturedMouseMove(FViewport* InViewport, int32 X, int32 Y) override
     {
         PenMouseX = X; PenMouseY = Y;
+        if (bMarqueeDragging) { MarqueeEnd = FIntPoint(X, Y); Invalidate(); }
         UpdatePenMouse();
-        if (!bPenMode || !bPenDragging)
+        if ((!bPenMode || !bPenDragging) && !bMarqueeDragging)
         {
             FEditorViewportClient::CapturedMouseMove(InViewport, X, Y);
         }
@@ -359,11 +538,11 @@ public:
     virtual void ProcessClick(FSceneView& View, HHitProxy* HitProxy, FKey Key,
         EInputEvent Event, uint32 HitX, uint32 HitY) override
     {
-        if (bPenMode && Key == EKeys::LeftMouseButton) { return; }
+        if ((bPenMode || bMarqueeMode) && Key == EKeys::LeftMouseButton) { return; }
         if (Key == EKeys::LeftMouseButton)
         {
-            // Axis hit proxies belong to Unreal's transform gizmo. Forward these
-            // clicks to the base client without clearing the spline selection.
+            // Preserve native gizmo hit testing. Widget drags belong to the
+            // engine; only spline anchors/tangents belong to Strand.
             if (HitProxy && HitProxy->IsA(HWidgetAxis::StaticGetType()))
             {
                 FEditorViewportClient::ProcessClick(View, HitProxy, Key, Event, HitX, HitY);
@@ -400,11 +579,36 @@ public:
         FEditorViewportClient::Draw(View, PDI);
         if (!PDI || !View) { return; }
         CachedInvViewProjection = View->ViewMatrices.GetClipToWorld();
+        CachedWorldToClip = CachedInvViewProjection.InverseFast();
         CachedViewRect = View->UnscaledViewRect;
         bHasCachedView = true;
         const USplineComponent* Native = Spline.Get();
         if (!IsValid(Native)) { return; }
         const int32 PointCount = Native->GetNumberOfSplinePoints();
+
+        // Foreground marquee uses four projected cursor rays, so it works in
+        // perspective and all orthographic viewport projections.
+        if (bMarqueeDragging && bHasCachedView)
+        {
+            const int32 MinX = FMath::Min(MarqueeStart.X, MarqueeEnd.X);
+            const int32 MaxX = FMath::Max(MarqueeStart.X, MarqueeEnd.X);
+            const int32 MinY = FMath::Min(MarqueeStart.Y, MarqueeEnd.Y);
+            const int32 MaxY = FMath::Max(MarqueeStart.Y, MarqueeEnd.Y);
+            const FIntPoint Corners[4] = { {MinX, MinY}, {MaxX, MinY}, {MaxX, MaxY}, {MinX, MaxY} };
+            FVector WorldCorners[4];
+            for (int32 I = 0; I < 4; ++I)
+            {
+                FVector Origin, Direction;
+                FSceneView::DeprojectScreenToWorld(FVector2D(Corners[I].X, Corners[I].Y),
+                    CachedViewRect, CachedInvViewProjection, Origin, Direction);
+                WorldCorners[I] = Origin + Direction.GetSafeNormal() * 100.0;
+            }
+            for (int32 I = 0; I < 4; ++I)
+            {
+                PDI->DrawLine(WorldCorners[I], WorldCorners[(I + 1) % 4],
+                    StrandSelectedColor, SDPG_Foreground, 1.5f);
+            }
+        }
 
         if (bShowGrid)
         {
@@ -570,9 +774,22 @@ public:
                 SelectedHandle == 2 ? 13.0f : 9.0f, SDPG_Foreground);
             PDI->SetHitProxy(nullptr);
         }
+
     }
 
 private:
+    bool ProjectAnchor(const FVector& WorldPosition, FVector2D& Screen) const
+    {
+        if (!bHasCachedView || CachedViewRect.Width() <= 0 || CachedViewRect.Height() <= 0) { return false; }
+        const FVector4 Clip = CachedWorldToClip.TransformFVector4(FVector4(WorldPosition.X, WorldPosition.Y, WorldPosition.Z, 1.0));
+        if (Clip.W <= 0.000001 || !FMath::IsFinite(Clip.W)) { return false; }
+        const double X = Clip.X / Clip.W;
+        const double Y = Clip.Y / Clip.W;
+        Screen.X = CachedViewRect.Min.X + (X * 0.5 + 0.5) * CachedViewRect.Width();
+        Screen.Y = CachedViewRect.Min.Y + (0.5 - Y * 0.5) * CachedViewRect.Height();
+        return FMath::IsFinite(Screen.X) && FMath::IsFinite(Screen.Y);
+    }
+
     double RefineSegmentHit(const USplineComponent* Native, int32 Segment, double Alpha,
         int32 X, int32 Y) const
     {
@@ -659,6 +876,13 @@ private:
     TFunction<void(int32, bool, bool)> OnPointSelected;
     TFunction<void()> OnSelectAll;
     TFunction<void()> OnClearSelection;
+    TFunction<void(const TArray<int32>&, bool, bool)> OnMarqueeSelected;
+    TFunction<void()> OnMarqueeExit;
+    TFunction<void(int32, double)> OnPointRotation;
+    TFunction<void(double)> OnPointScale;
+    TFunction<void(int32)> OnWidgetModeChanged;
+    TFunction<void(int32)> OnToolShortcut;
+    TFunction<void()> OnDeleteShortcut;
     TSet<int32> SelectedPoints;
     TFunction<void(int32, int32)> OnTangentSelected;
     TFunction<void(int32, const FVector&)> OnTangentDragDelta;
@@ -670,6 +894,14 @@ private:
     bool bShowGrid = true;
     bool bShowTangents = true;
     bool bPenMode = false;
+    bool bMarqueeMode = false;
+    bool bMarqueeDragging = false;
+    bool bMarqueeAdd = false;
+    bool bMarqueeToggle = false;
+    bool bDelegatedMarqueeCameraClick = false;
+    int32 WidgetMode = 0;
+    FIntPoint MarqueeStart = FIntPoint::ZeroValue;
+    FIntPoint MarqueeEnd = FIntPoint::ZeroValue;
     bool bPenDragging = false;
     bool bDelegatedPenCameraClick = false;
     bool bHasCachedView = false;
@@ -679,6 +911,7 @@ private:
     int32 PenMouseY = 0;
     double PenSnap = 0.0;
     FMatrix CachedInvViewProjection = FMatrix::Identity;
+    FMatrix CachedWorldToClip = FMatrix::Identity;
     FIntRect CachedViewRect;
     FVector PenHover = FVector::ZeroVector;
     FVector PenAnchor = FVector::ZeroVector;
@@ -777,6 +1010,42 @@ void SStrandSplineViewport::SetTangentDragCallback(TFunction<void(int32, const F
     if (StrandViewportClient.IsValid()) { StrandViewportClient->SetTangentDragCallback(MoveTemp(InCallback)); }
 }
 
+void SStrandSplineViewport::SetMarqueeMode(bool bEnabled)
+{
+    if (StrandViewportClient.IsValid()) { StrandViewportClient->SetMarqueeMode(bEnabled); }
+}
+void SStrandSplineViewport::SetWidgetMode(int32 Mode)
+{
+    if (StrandViewportClient.IsValid()) { StrandViewportClient->SetStrandWidgetMode(Mode); }
+}
+void SStrandSplineViewport::SetOnMarqueeSelected(TFunction<void(const TArray<int32>&, bool, bool)> Callback)
+{
+    if (StrandViewportClient.IsValid()) { StrandViewportClient->SetOnMarqueeSelected(MoveTemp(Callback)); }
+}
+void SStrandSplineViewport::SetOnMarqueeExit(TFunction<void()> Callback)
+{
+    if (StrandViewportClient.IsValid()) { StrandViewportClient->SetOnMarqueeExit(MoveTemp(Callback)); }
+}
+void SStrandSplineViewport::SetPointRotationCallback(TFunction<void(int32, double)> Callback)
+{
+    if (StrandViewportClient.IsValid()) { StrandViewportClient->SetPointRotationCallback(MoveTemp(Callback)); }
+}
+void SStrandSplineViewport::SetPointScaleCallback(TFunction<void(double)> Callback)
+{
+    if (StrandViewportClient.IsValid()) { StrandViewportClient->SetPointScaleCallback(MoveTemp(Callback)); }
+}
+void SStrandSplineViewport::SetOnWidgetModeChanged(TFunction<void(int32)> Callback)
+{
+    if (StrandViewportClient.IsValid()) { StrandViewportClient->SetOnWidgetModeChanged(MoveTemp(Callback)); }
+}
+void SStrandSplineViewport::SetOnToolShortcut(TFunction<void(int32)> Callback)
+{
+    if (StrandViewportClient.IsValid()) { StrandViewportClient->SetOnToolShortcut(MoveTemp(Callback)); }
+}
+void SStrandSplineViewport::SetOnDeleteShortcut(TFunction<void()> Callback)
+{
+    if (StrandViewportClient.IsValid()) { StrandViewportClient->SetOnDeleteShortcut(MoveTemp(Callback)); }
+}
 void SStrandSplineViewport::SetPenMode(bool bEnabled)
 {
     if (StrandViewportClient.IsValid()) { StrandViewportClient->SetPenMode(bEnabled); }

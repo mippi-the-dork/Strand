@@ -26,6 +26,9 @@ void USplineDataAsset::SerializeFromSplineComponent(const USplineComponent* Sour
         Data.LocalRotation = Point.Rotation;
         Data.LocalScale = Point.Scale;
         Data.PointType = SourceComponent->GetSplinePointType(I);
+        Data.HandleMode = (Data.PointType.GetValue() == ESplinePointType::Curve ||
+            Data.PointType.GetValue() == ESplinePointType::CurveClamped)
+            ? EStrandBezierHandleMode::Auto : EStrandBezierHandleMode::Free;
         Points.Add(Data);
     }
     bIsClosedLoop = SourceComponent->IsClosedLoop();

@@ -10,7 +10,7 @@ public class StrandEditor : ModuleRules
         PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine", "Strand" });
         PrivateDependencyModuleNames.AddRange(new string[] {
             "UnrealEd", "InputCore", "Slate", "SlateCore", "XmlParser", "AssetTools",
-            "AssetRegistry", "ContentBrowser", "PlacementMode", "PropertyEditor", "ToolMenus", "LevelEditor",
+            "AssetRegistry", "ContentBrowser", "PlacementMode", "PropertyEditor", "DetailCustomizations", "ToolMenus", "LevelEditor",
             "EditorFramework", "Landscape", "Projects", "ApplicationCore", "DesktopPlatform", "AlembicLib", "AlembicLibrary"
         });
     }

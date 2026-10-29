@@ -22,6 +22,8 @@
 #include "UObject/StrongObjectPtr.h"
 #include "StrandSplineComponentCustomization.h"
 #include "StrandSplineMeshCustomization.h"
+#include "StrandActorSplineLinks.h"
+#include "ActorDetailsDelegates.h"
 #include "StrandActorDetails.h"
 #include "IPlacementModeModule.h"
 #include "Components/SplineMeshComponent.h"
@@ -117,25 +119,12 @@ public:
         AssetTools.RegisterAssetTypeActions(AssetActions.ToSharedRef());
 
         FPropertyEditorModule& PropertyEditor = FModuleManager::LoadModuleChecked<FPropertyEditorModule>("PropertyEditor");
-        // Register native spline variants explicitly: class layouts on some derived
-        // components are not guaranteed to inherit the base customization.
-        for (TObjectIterator<UClass> It; It; ++It)
-        {
-            UClass* Class = *It;
-            if (!Class || Class->HasAnyClassFlags(CLASS_Deprecated | CLASS_NewerVersionExists)) { continue; }
-            if (Class->IsChildOf(USplineComponent::StaticClass()))
-            {
-                PropertyEditor.RegisterCustomClassLayout(Class->GetFName(),
-                    FOnGetDetailCustomizationInstance::CreateStatic(&FStrandSplineComponentCustomization::MakeInstance));
-                RegisteredDetailClasses.Add(Class->GetFName());
-            }
-            else if (Class->IsChildOf(USplineMeshComponent::StaticClass()))
-            {
-                PropertyEditor.RegisterCustomClassLayout(Class->GetFName(),
-                    FOnGetDetailCustomizationInstance::CreateStatic(&FStrandSplineMeshCustomization::MakeInstance));
-                RegisteredDetailClasses.Add(Class->GetFName());
-            }
-        }
+        // Never replace Unreal's native USplineComponent / USplineMeshComponent
+        // Details customizations. In UE 5.8, replacing them hides stock spline
+        // point selection and can interfere with component visualizer controls.
+        // Strand link controls extend the actor's details independently instead.
+        ActorDetailsExtensionHandle = OnExtendActorDetails.AddStatic(
+            &StrandActorSplineLinks::ExtendActorDetails);
         PropertyEditor.RegisterCustomClassLayout(AStrandSplineActor::StaticClass()->GetFName(),
             FOnGetDetailCustomizationInstance::CreateStatic(&FStrandActorDetails::MakeInstance));
         RegisteredDetailClasses.Add(AStrandSplineActor::StaticClass()->GetFName());
@@ -194,12 +183,27 @@ public:
             TEXT("Repair Strand asset user data on native spline components in the active editor world."),
             FConsoleCommandDelegate::CreateRaw(this, &FStrandEditorModule::RepairCurrentEditorWorld),
             ECVF_Default);
+        AuditCommand = IConsoleManager::Get().RegisterConsoleCommand(
+            TEXT("Strand.AuditUserData"),
+            TEXT("Read-only inventory of Strand metadata ownership and archetype references in loaded editor actors."),
+            FConsoleCommandDelegate::CreateRaw(this, &FStrandEditorModule::AuditCurrentEditorWorld),
+            ECVF_Default);
         UToolMenus::RegisterStartupCallback(FSimpleMulticastDelegate::FDelegate::CreateRaw(
             this, &FStrandEditorModule::RegisterMenus));
     }
 
     virtual void ShutdownModule() override
     {
+        if (ActorDetailsExtensionHandle.IsValid())
+        {
+            OnExtendActorDetails.Remove(ActorDetailsExtensionHandle);
+            ActorDetailsExtensionHandle.Reset();
+        }
+        if (AuditCommand)
+        {
+            IConsoleManager::Get().UnregisterConsoleObject(AuditCommand);
+            AuditCommand = nullptr;
+        }
         if (RepairCommand)
         {
             IConsoleManager::Get().UnregisterConsoleObject(RepairCommand);
@@ -275,10 +279,12 @@ public:
     }
 
 private:
+    FDelegateHandle ActorDetailsExtensionHandle;
     FDelegateHandle ActorsDroppedHandle;
     FDelegateHandle PreSaveExternalActorsHandle;
     FDelegateHandle ObjectPreSaveHandle;
     IConsoleObject* RepairCommand = nullptr;
+    IConsoleObject* AuditCommand = nullptr;
 
     static int32 RepairActor(AActor* Actor)
     {
@@ -342,6 +348,81 @@ private:
         }
     }
 
+    struct FStrandUserDataAudit
+    {
+        int32 Actors = 0;
+        int32 Components = 0;
+        int32 Metadata = 0;
+        int32 Foreign = 0;
+        int32 Linked = 0;
+    };
+
+    static void AuditComponent(UActorComponent* Component, UStrandSplineUserData* Data,
+        FStrandUserDataAudit& Result)
+    {
+        ++Result.Components;
+        if (!IsValid(Data)) { return; }
+        ++Result.Metadata;
+        if (IsValid(Data->AssignedSplineAsset)) { ++Result.Linked; }
+        const bool bForeignOwner = Data->GetOuter() != Component;
+        const bool bForeignArchetype = Data->GetArchetype() !=
+            UStrandSplineUserData::StaticClass()->GetDefaultObject();
+        if (bForeignOwner || bForeignArchetype)
+        {
+            ++Result.Foreign;
+            UE_LOG(LogTemp, Warning,
+                TEXT("Strand metadata: component '%s' has %s owner / %s archetype; metadata '%s', archetype '%s'."),
+                *Component->GetPathName(),
+                bForeignOwner ? TEXT("FOREIGN") : TEXT("local"),
+                bForeignArchetype ? TEXT("FOREIGN") : TEXT("CDO"),
+                *Data->GetPathName(), *GetPathNameSafe(Data->GetArchetype()));
+        }
+    }
+
+    static FStrandUserDataAudit AuditWorld(UWorld* World)
+    {
+        FStrandUserDataAudit Result;
+        if (!IsValid(World) || World->WorldType != EWorldType::Editor) { return Result; }
+        for (TActorIterator<AActor> It(World); It; ++It)
+        {
+            AActor* Actor = *It;
+            if (!IsValid(Actor) || Actor->IsTemplate()) { continue; }
+            ++Result.Actors;
+            TArray<USplineComponent*> Splines;
+            Actor->GetComponents<USplineComponent>(Splines);
+            for (USplineComponent* Component : Splines)
+            {
+                if (IsValid(Component))
+                {
+                    AuditComponent(Component, UStrandSplineUserData::Get(Component), Result);
+                }
+            }
+            TArray<USplineMeshComponent*> Meshes;
+            Actor->GetComponents<USplineMeshComponent>(Meshes);
+            for (USplineMeshComponent* Component : Meshes)
+            {
+                if (IsValid(Component))
+                {
+                    AuditComponent(Component, UStrandSplineUserData::GetOnSplineMesh(Component), Result);
+                }
+            }
+        }
+        UE_LOG(LogTemp, Display,
+            TEXT("Strand metadata audit: %d actors, %d native spline/spline-mesh components, %d metadata entries (%d linked), %d unsafe owners/archetypes. Loaded editor world only."),
+            Result.Actors, Result.Components, Result.Metadata, Result.Linked, Result.Foreign);
+        return Result;
+    }
+
+    void AuditCurrentEditorWorld()
+    {
+        if (!GEditor)
+        {
+            UE_LOG(LogTemp, Warning, TEXT("Strand.AuditUserData: no editor instance."));
+            return;
+        }
+        AuditWorld(GEditor->GetEditorWorldContext().World());
+    }
+
     void RepairCurrentEditorWorld()
     {
         if (!GEditor)
@@ -355,14 +436,16 @@ private:
             UE_LOG(LogTemp, Warning, TEXT("Strand.RepairUserData: no active editor world."));
             return;
         }
+        const FStrandUserDataAudit Before = AuditWorld(World);
         int32 Count = 0;
         for (TActorIterator<AActor> It(World); It; ++It)
         {
             Count += RepairActor(*It);
         }
         UE_LOG(LogTemp, Display,
-            TEXT("Strand.RepairUserData: repaired %d native spline/spline-mesh metadata owners in loaded editor actors. Save the level to persist repairs."),
-            Count);
+            TEXT("Strand.RepairUserData: repaired %d / %d unsafe metadata references across %d scanned components. Save the level to persist repairs; 0 repairs means no unsafe entries were detected in loaded actors."),
+            Count, Before.Foreign, Before.Components);
+        if (Count > 0) { AuditWorld(World); }
     }
 
     void OnNewActorsDropped(const TArray<UObject*>& DroppedObjects,
@@ -510,6 +593,31 @@ private:
             new FSlateVectorImageBrush(FPaths::Combine(ResourceDirectory, TEXT("StrandActionNew.svg")), FVector2D(16, 16)));
         AssetStyle->Set(TEXT("Strand.Action.Compare"),
             new FSlateVectorImageBrush(FPaths::Combine(ResourceDirectory, TEXT("StrandActionCompare.svg")), FVector2D(16, 16)));
+        // Tool icons use the SAME registered style and shutdown lifecycle as
+        // the Strand Content Browser and actor icons, not a second style set.
+        struct FToolBrush { const TCHAR* Key; const TCHAR* Filename; };
+        const FToolBrush ToolIcons[] = {
+            { TEXT("Strand.Actors"), TEXT("StrandToolActors.svg") },
+            { TEXT("Strand.Select"), TEXT("StrandToolSelect.svg") },
+            { TEXT("Strand.BoxSelect"), TEXT("StrandToolBoxSelect.svg") },
+            { TEXT("Strand.Pen"), TEXT("StrandToolPen.svg") },
+            { TEXT("Strand.Move"), TEXT("StrandToolMove.svg") },
+            { TEXT("Strand.Rotate"), TEXT("StrandToolRotate.svg") },
+            { TEXT("Strand.Scale"), TEXT("StrandToolScale.svg") },
+        };
+        for (const FToolBrush& Icon : ToolIcons)
+        {
+            const FString Path = FPaths::Combine(ResourceDirectory, Icon.Filename);
+            if (FPaths::FileExists(Path))
+            {
+                AssetStyle->Set(Icon.Key, new FSlateVectorImageBrush(Path,
+                    FVector2D(16.0f, 16.0f), FLinearColor::White, ESlateBrushTileType::NoTile));
+            }
+            else
+            {
+                UE_LOG(LogTemp, Warning, TEXT("Strand: Missing authoring toolbar icon %s"), *Path);
+            }
+        }
         FSlateStyleRegistry::RegisterSlateStyle(*AssetStyle);
     }
 
