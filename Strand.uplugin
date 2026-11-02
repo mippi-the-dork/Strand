@@ -1,9 +1,9 @@
 {
   "FileVersion": 3,
-  "Version": 44,
-  "VersionName": "0.6.11",
+  "Version": 57,
+  "VersionName": "0.6.24",
   "FriendlyName": "Strand",
-  "Description": "Native Unreal spline asset authoring with engine transform widgets, Spacebar mode cycling, direct B\u00e9zier editing, Blueprint-safe links, SVG/Alembic interchange and PCG.",
+  "Description": "Native Unreal spline asset editor with direct Ctrl-drag segment reshaping, aspect-safe modeling toolbar icons, precision spline insertion, live path statistics, directional tangent handles, editable primitives, and SVG/Alembic interchange.",
   "Category": "Editor",
   "CreatedBy": "Strand",
   "CanContainContent": false,

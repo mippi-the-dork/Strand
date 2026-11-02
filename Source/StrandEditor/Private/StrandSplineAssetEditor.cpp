@@ -22,19 +22,29 @@
 #include "Modules/ModuleManager.h"
 #include "Widgets/Docking/SDockTab.h"
 #include "Widgets/Layout/SBorder.h"
+#include "Widgets/SOverlay.h"
+#include "Widgets/SNullWidget.h"
 #include "Widgets/Layout/SBox.h"
 #include "Widgets/Layout/SExpandableArea.h"
 #include "Widgets/Layout/SSplitter.h"
+#include "Widgets/Layout/SSeparator.h"
+#include "Widgets/Layout/SSpacer.h"
 #include "Widgets/Input/SButton.h"
 #include "Widgets/Input/SCheckBox.h"
 #include "Widgets/Input/SComboButton.h"
 #include "Widgets/Input/SNumericEntryBox.h"
+#include "Math/RotationMatrix.h"
 #include "Framework/MultiBox/MultiBoxBuilder.h"
+#include "ToolMenus.h"
+#include "ToolMenu.h"
+#include "ToolMenuEntry.h"
+#include "ToolMenuSection.h"
 #include "Framework/Commands/UIAction.h"
 #include "ScopedTransaction.h"
 #include "Widgets/Text/STextBlock.h"
 #include "Widgets/SBoxPanel.h"
 #include "Misc/Paths.h"
+#include "Misc/ConfigCacheIni.h"
 #include "Misc/MessageDialog.h"
 #include "UObject/UnrealType.h"
 
@@ -44,6 +54,7 @@ namespace
 {
     const FName PreviewTabId(TEXT("StrandSplineEditor_Preview"));
     const FName DetailsTabId(TEXT("StrandSplineEditor_Details"));
+    const FName SourceTabId(TEXT("StrandSplineEditor_Source"));
 
     // Reuse Strand's existing registered editor style. It is created and
     // unregistered by StrandEditorModule, just like the asset/action icons.
@@ -56,6 +67,18 @@ namespace
             return Style ? Style->GetBrush(Icon) : FAppStyle::GetBrush(TEXT("Icons.Edit"));
         }
         return FAppStyle::GetBrush(Icon);
+    }
+
+    TSharedRef<SWidget> CompactIcon(const FName Icon)
+    {
+        // The vertical rail uses 36px-high native Slate buttons. Their built-in
+        // padding leaves less than 30px for content. Keep the art square and
+        // smaller than the *actual content rectangle*; otherwise Slate stretches
+        // it vertically while the already-fixed top toolbar looks correct.
+        return SNew(SBox).WidthOverride(24.0f).HeightOverride(24.0f)
+            .HAlign(HAlign_Center).VAlign(VAlign_Center)
+            [SNew(SImage).Image(AuthoringBrush(Icon))
+                .DesiredSizeOverride(FVector2D(24.0f, 24.0f))];
     }
 
     TSharedRef<SWidget> ActionContent(const FName Icon, const FText& Label)
@@ -92,6 +115,10 @@ void FStrandSplineAssetEditor::Init(USplineDataAsset* InAsset, const TSharedPtr<
 {
     check(InAsset);
     Asset = InAsset;
+    // Editor-only per-user setting, deliberately not stored on the shared spline asset.
+    GConfig->GetInt(TEXT("StrandSplineEditor"), TEXT("LastResamplePointCount"),
+        ResampleTargetCount, GEditorPerProjectIni);
+    ResampleTargetCount = FMath::Clamp(ResampleTargetCount, 2, 4096);
     NativePreview.Reset(NewObject<USplineComponent>(GetTransientPackage(), NAME_None, RF_Transient));
     RebuildNativePreview();
 
@@ -108,6 +135,13 @@ void FStrandSplineAssetEditor::Init(USplineDataAsset* InAsset, const TSharedPtr<
     DetailsView->SetIsPropertyVisibleDelegate(FIsPropertyVisible::CreateLambda(
         [this](const FPropertyAndParent& PropertyAndParent)
         {
+            // Point geometry and loop state are edited in Spline Details/viewport,
+            // not exposed redundantly under the Source & Import tab.
+            if (PropertyAndParent.Property.GetFName() == GET_MEMBER_NAME_CHECKED(USplineDataAsset, Points) ||
+                PropertyAndParent.Property.GetFName() == GET_MEMBER_NAME_CHECKED(USplineDataAsset, bIsClosedLoop))
+            {
+                return false;
+            }
 #if WITH_EDITORONLY_DATA
             const USplineDataAsset* Current = Asset.Get();
             if (Current)
@@ -142,17 +176,43 @@ void FStrandSplineAssetEditor::Init(USplineDataAsset* InAsset, const TSharedPtr<
     DetailsView->SetObject(InAsset);
     DetailsView->OnFinishedChangingProperties().AddSP(this, &FStrandSplineAssetEditor::OnPropertyChanged);
 
-    const TSharedRef<FTabManager::FLayout> Layout = FTabManager::NewLayout("StrandSplineEditor_Layout_v6")
-        ->AddArea(FTabManager::NewPrimaryArea()->SetOrientation(Orient_Vertical)
-            ->Split(FTabManager::NewSplitter()->SetOrientation(Orient_Horizontal)
+    // UE 5.8 renders the asset toolbar in the standalone toolkit host, not as
+    // a dockable tab. GetToolbarTabId() now returns NAME_None and is deprecated.
+    // Keep only actual dock tabs in this layout; the standalone host renders
+    // the native toolbar separately from the tab manager.
+    // v9 replaces the previously persisted v8 layout containing the invalid tab.
+    const TSharedRef<FTabManager::FLayout> Layout = FTabManager::NewLayout("StrandSplineEditor_Layout_v9")
+        ->AddArea(FTabManager::NewPrimaryArea()->SetOrientation(Orient_Horizontal)
                 ->Split(FTabManager::NewStack()->SetSizeCoefficient(0.71f)
                     ->AddTab(PreviewTabId, ETabState::OpenedTab)->SetHideTabWell(true))
                 ->Split(FTabManager::NewStack()->SetSizeCoefficient(0.29f)
-                    ->AddTab(DetailsTabId, ETabState::OpenedTab)->SetHideTabWell(true))));
+                    ->AddTab(DetailsTabId, ETabState::OpenedTab)
+                    ->AddTab(SourceTabId, ETabState::OpenedTab)
+                    ->SetForegroundTab(DetailsTabId)
+                    ->SetHideTabWell(false)));
+    // The UE 5.8 toolkit builds the native toolbar during InitAssetEditor.
+    // Strand actions are installed in PostRegenerateMenusAndToolbars(), because
+    // the base RegenerateMenusAndToolbars() clears ToolbarWidgets each time.
     TArray<UObject*> ObjectsToEdit;
     ObjectsToEdit.Add(InAsset);
     InitAssetEditor(InHost.IsValid() ? EToolkitMode::WorldCentric : EToolkitMode::Standalone,
         InHost, TEXT("StrandSplineEditor"), Layout, true, true, ObjectsToEdit);
+
+    // Refresh once after initialization. Our post-regeneration hook installs
+    // the right-aligned Strand actions after the base toolkit clears its widget
+    // list, then regenerates the final native toolbar before host attachment.
+    RegenerateMenusAndToolbars();
+}
+
+void FStrandSplineAssetEditor::PostRegenerateMenusAndToolbars()
+{
+    // Source verified against UE 5.8 AssetEditorToolkit.cpp:
+    // RegenerateMenusAndToolbars() first calls RemoveAllToolbarWidgets(), then
+    // GenerateToolbar(), then this hook, and finally host->SetToolbar(Toolbar).
+    // The second GenerateToolbar() includes the Strand action group in the
+    // dedicated right-aligned MiscWidgets slot beside Save/Browse.
+    AddToolbarWidget(BuildAssetActionToolbar());
+    GenerateToolbar();
 }
 
 void FStrandSplineAssetEditor::RegisterTabSpawners(const TSharedRef<FTabManager>& InTabManager)
@@ -162,32 +222,38 @@ void FStrandSplineAssetEditor::RegisterTabSpawners(const TSharedRef<FTabManager>
         .SetDisplayName(LOCTEXT("PreviewTab", "Spline Preview"));
     InTabManager->RegisterTabSpawner(DetailsTabId, FOnSpawnTab::CreateSP(this, &FStrandSplineAssetEditor::SpawnDetailsTab))
         .SetDisplayName(LOCTEXT("DetailsTab", "Spline Details"));
+    InTabManager->RegisterTabSpawner(SourceTabId, FOnSpawnTab::CreateSP(this, &FStrandSplineAssetEditor::SpawnSourceTab))
+        .SetDisplayName(LOCTEXT("SourceTab", "Source & Import"));
 }
 
 void FStrandSplineAssetEditor::UnregisterTabSpawners(const TSharedRef<FTabManager>& InTabManager)
 {
     InTabManager->UnregisterTabSpawner(PreviewTabId);
     InTabManager->UnregisterTabSpawner(DetailsTabId);
+    InTabManager->UnregisterTabSpawner(SourceTabId);
     FAssetEditorToolkit::UnregisterTabSpawners(InTabManager);
 }
 
-TSharedRef<SDockTab> FStrandSplineAssetEditor::SpawnPreviewTab(const FSpawnTabArgs& Args)
+UToolMenu* FStrandSplineAssetEditor::GenerateCommonActionsToolbar(FToolMenuContext& MenuContext)
 {
-    TSharedRef<SDockTab> Tab = SNew(SDockTab).Label(LOCTEXT("PreviewTab", "Viewport"))
-    [
-        SNew(SVerticalBox)
-        // Asset creation and export are first-class Strand operations; Save remains in the native toolkit toolbar.
-        + SVerticalBox::Slot().AutoHeight().Padding(7.0f, 5.0f, 7.0f, 3.0f)
-        [
-            SNew(SHorizontalBox)
-            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.0f, 0.0f, 9.0f, 0.0f)
-            [SNew(STextBlock).Text(LOCTEXT("AssetActionsHeading", "ASSET"))
-                .ColorAndOpacity(FSlateColor::UseSubduedForeground())]
+    // Preserve the standard Save/Browse section. Strand actions are installed
+    // into the right-hand widget slot during PostRegenerateMenusAndToolbars().
+    return FAssetEditorToolkit::GenerateCommonActionsToolbar(MenuContext);
+}
+
+TSharedRef<SWidget> FStrandSplineAssetEditor::BuildAssetActionToolbar()
+{
+    return SNew(SHorizontalBox)
             + SHorizontalBox::Slot().AutoWidth().Padding(2.0f)
             [SNew(SButton)
                 .ToolTipText(LOCTEXT("NewSplineTip", "Create and open an independent, editable Strand Spline asset in the same Content Browser folder."))
                 .OnClicked(this, &FStrandSplineAssetEditor::NewSplineAsset)
                 [ActionContent(TEXT("Icons.Plus"), LOCTEXT("NewSpline", "New Spline"))]]
+            + SHorizontalBox::Slot().AutoWidth().Padding(2.0f)
+            [SNew(SComboButton)
+                .ToolTipText(LOCTEXT("PrimitivesTip", "Create a NEW, separate Strand spline asset (Circle, Rectangle, or Helix) in the current Content Browser folder. Does not modify the asset currently open."))
+                .OnGetMenuContent(this, &FStrandSplineAssetEditor::MakePrimitiveMenu)
+                .ButtonContent()[ActionContent(TEXT("Strand.Primitives"), LOCTEXT("PrimitivesLabel", "Primitives"))]]
             + SHorizontalBox::Slot().AutoWidth().Padding(2.0f)
             [SNew(SComboButton)
                 .ToolTipText(LOCTEXT("ExportTip", "Export this native spline geometry without modifying the Strand asset."))
@@ -223,126 +289,419 @@ TSharedRef<SDockTab> FStrandSplineAssetEditor::SpawnPreviewTab(const FSpawnTabAr
                         FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this]() { InspectUsage(); })));
                     return Menu.MakeWidget();
                 })
-                .ButtonContent()[ActionContent(TEXT("Strand.Actors"), LOCTEXT("ActorsButton", "Actors"))]]
-            + SHorizontalBox::Slot().AutoWidth().Padding(5.0f, 0.0f, 2.0f, 0.0f)
-            [SNew(SComboButton)
-                .ToolTipText(LOCTEXT("SplineToolsTip", "Selection modeling, point alignment/distribution, whole-spline operations, and curve refinement."))
-                .OnGetMenuContent(this, &FStrandSplineAssetEditor::MakeSplineToolsMenu)
-                .ButtonContent()[ActionContent(TEXT("Icons.Edit"), LOCTEXT("SplineToolsLabel", "Spline Tools"))]]
-        ]
-        + SVerticalBox::Slot().AutoHeight().Padding(7.0f, 1.0f, 7.0f, 5.0f)
-        [
-            SNew(SHorizontalBox)
-            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.0f, 0.0f, 9.0f, 0.0f)
-            [SNew(STextBlock).Text(LOCTEXT("ToolGroupHeading", "TOOLS"))
-                .ColorAndOpacity(FSlateColor::UseSubduedForeground())]
+                .ButtonContent()[ActionContent(TEXT("Strand.Actors"), LOCTEXT("ActorsButton", "Actors"))]];
+}
+
+TSharedRef<SDockTab> FStrandSplineAssetEditor::SpawnPreviewTab(const FSpawnTabArgs& Args)
+{
+    TSharedRef<SDockTab> Tab = SNew(SDockTab).Label(LOCTEXT("PreviewTab", "Viewport"))
+        .ToolTipText(LOCTEXT("ViewportTabTip", "Edit the Strand spline in a native Unreal 3D preview. RMB+WASD flies the camera; Space cycles transforms."))
+    [
+        SNew(SVerticalBox)
+        // Compact tool strips mirror familiar 3D/curve editors: selection on
+        // the upper left, transform/display on upper right, modeling down the
+        // left edge. Every icon has a descriptive tooltip and keyboard shortcut.
+        + SVerticalBox::Slot().AutoHeight().Padding(7.0f, 5.0f, 7.0f, 4.0f)
+        [SNew(SHorizontalBox)
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
+            [SNew(SHorizontalBox)
             + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.0f)
-            [SNew(SCheckBox)
-                .Style(FAppStyle::Get(), "ToggleButtonCheckbox")
-                .IsChecked_Lambda([this]() { return (!bPenMode && !bMarqueeMode) ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
-                .OnCheckStateChanged_Lambda([this](ECheckBoxState) { SetMarqueeMode(false); SetPenMode(false); })
-                .ToolTipText(LOCTEXT("SelectModeTip", "Click to select, Shift-click a contiguous range, Ctrl-click to toggle. Ctrl+A selects all; Esc clears. Move selected points together with the gizmo."))
-                [ActionContent(TEXT("Strand.Select"), LOCTEXT("SelectMode", "Select"))]]
+            [SNew(SBox).WidthOverride(48.0f).HeightOverride(36.0f)
+                .HAlign(HAlign_Fill).VAlign(VAlign_Fill)
+                [SNew(SOverlay)
+                    + SOverlay::Slot()
+                    [SNew(SCheckBox).Style(FAppStyle::Get(), "ToggleButtonCheckbox")
+                .IsChecked_Lambda([this]() { return !bPenMode && !bMarqueeMode ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
+                .OnCheckStateChanged_Lambda([this](ECheckBoxState) { SetPenMode(false); SetMarqueeMode(false); })
+                .ToolTipText(LOCTEXT("DirectSelectionTip", "Select anchors, segments, and tangent handles (V). Shift-click segments to insert; Ctrl-click anchors to toggle."))
+                [SNullWidget::NullWidget]]
+                    + SOverlay::Slot().HAlign(HAlign_Center).VAlign(VAlign_Center)
+                    [SNew(SBox).WidthOverride(28.0f).HeightOverride(28.0f)
+                        .HAlign(HAlign_Center).VAlign(VAlign_Center)
+                        .Visibility(EVisibility::HitTestInvisible)
+                        [SNew(SImage).Image(AuthoringBrush(TEXT("Strand.Select")))
+                            .DesiredSizeOverride(FVector2D(28.0f, 28.0f))]]]]
             + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.0f)
-            [SNew(SCheckBox)
-                .Style(FAppStyle::Get(), "ToggleButtonCheckbox")
-                .IsChecked_Lambda([this]() { return bPenMode ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
-                .OnCheckStateChanged_Lambda([this](ECheckBoxState State) { SetPenMode(State == ECheckBoxState::Checked); })
-                .ToolTipText(LOCTEXT("PenModeTip", "Pen: click to add anchors, drag to shape symmetric handles, click a segment to insert, click an endpoint to continue or close; Esc to exit."))
-                [ActionContent(TEXT("Strand.Pen"), LOCTEXT("PenMode", "Pen"))]]
-            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.0f)
-            [SNew(SCheckBox)
-                .Style(FAppStyle::Get(), "ToggleButtonCheckbox")
+            [SNew(SBox).WidthOverride(48.0f).HeightOverride(36.0f)
+                .HAlign(HAlign_Fill).VAlign(VAlign_Fill)
+                [SNew(SOverlay)
+                    + SOverlay::Slot()
+                    [SNew(SCheckBox).Style(FAppStyle::Get(), "ToggleButtonCheckbox")
                 .IsChecked_Lambda([this]() { return bMarqueeMode ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
                 .OnCheckStateChanged_Lambda([this](ECheckBoxState State) { SetMarqueeMode(State == ECheckBoxState::Checked); })
-                .ToolTipText(LOCTEXT("MarqueeTip", "Box Select: drag a rectangle over anchor markers. Shift adds, Ctrl toggles. Alt+LMB remains camera navigation."))
-                [ActionContent(TEXT("Strand.BoxSelect"), LOCTEXT("MarqueeMode", "Box Select"))]]
-            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(7.0f, 0.0f, 2.0f, 0.0f)
-            [SNew(STextBlock).Text(LOCTEXT("GizmoModes", "TRANSFORM (Space)"))
-                .ColorAndOpacity(FSlateColor::UseSubduedForeground())]
-            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(1.0f)
-            [SNew(SCheckBox).Style(FAppStyle::Get(), "ToggleButtonCheckbox")
-                .IsEnabled_Lambda([this]() { return !bPenMode && !bMarqueeMode; })
-                .IsChecked_Lambda([this]() { return ActiveWidgetMode == 0 ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
-                .OnCheckStateChanged_Lambda([this](ECheckBoxState) { SetWidgetMode(0); })
-                .ToolTipText(LOCTEXT("MoveGizmoTip", "Move selected points (Space cycles tools): drag a red X, green Y, or blue Z handle on the selected anchor, tangent, or group."))
-                [ActionContent(TEXT("Strand.Move"), LOCTEXT("MoveTool", "Move"))]]
-            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(1.0f)
-            [SNew(SCheckBox).Style(FAppStyle::Get(), "ToggleButtonCheckbox")
-                .IsEnabled_Lambda([this]() { return HasSelectedPoint() && !bPenMode && !bMarqueeMode; })
-                .IsChecked_Lambda([this]() { return ActiveWidgetMode == 1 ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
-                .OnCheckStateChanged_Lambda([this](ECheckBoxState) { SetWidgetMode(1); })
-                .ToolTipText(LOCTEXT("RotateGizmoTip", "Rotate (Space cycles): use Unreal's rotation widget. One point rotates its tangents and orientation; multiple points rotate around their shared center."))
-                [ActionContent(TEXT("Strand.Rotate"), LOCTEXT("RotateTool", "Rotate"))]]
-            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(1.0f)
-            [SNew(SCheckBox).Style(FAppStyle::Get(), "ToggleButtonCheckbox")
-                .IsEnabled_Lambda([this]() { return HasSelectedPoint() && !bPenMode && !bMarqueeMode; })
-                .IsChecked_Lambda([this]() { return ActiveWidgetMode == 2 ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
-                .OnCheckStateChanged_Lambda([this](ECheckBoxState) { SetWidgetMode(2); })
-                .ToolTipText(LOCTEXT("ScaleGizmoTip", "Uniform Scale (Space cycles): drag Unreal's scale widget. One point scales its handles; multiple points scale about their center."))
-                [ActionContent(TEXT("Strand.Scale"), LOCTEXT("ScaleTool", "Scale"))]]
-            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(6.0f, 0.0f, 2.0f, 0.0f)
-            [SNew(SComboButton)
-                .ToolTipText(LOCTEXT("SelectionTip", "Select All, Invert Selection, or Clear Selection. Multi-point tools are under Spline Tools."))
-                .OnGetMenuContent(this, &FStrandSplineAssetEditor::MakeSelectionMenu)
-                .ButtonContent()[SNew(STextBlock).Text(LOCTEXT("SelectionDropdown", "Selection"))]]
-        ]
-        // View and display settings stay on their own navigation row, rather
-        // than competing with the direct editing tools for horizontal space.
-        + SVerticalBox::Slot().AutoHeight().Padding(9.0f, 0.0f, 7.0f, 5.0f)
-        [SNew(SHorizontalBox)
-            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.0f, 0.0f, 6.0f, 0.0f)
-            [SNew(STextBlock).Text(LOCTEXT("ViewStrip", "VIEW"))
-                .ColorAndOpacity(FSlateColor::UseSubduedForeground())]
+                .ToolTipText(LOCTEXT("BoxSelectIconTip", "Box selection tool (B). Drag to select; Shift adds, Ctrl toggles."))
+                [SNullWidget::NullWidget]]
+                    + SOverlay::Slot().HAlign(HAlign_Center).VAlign(VAlign_Center)
+                    [SNew(SBox).WidthOverride(28.0f).HeightOverride(28.0f)
+                        .HAlign(HAlign_Center).VAlign(VAlign_Center)
+                        .Visibility(EVisibility::HitTestInvisible)
+                        [SNew(SImage).Image(AuthoringBrush(TEXT("Strand.BoxSelect")))
+                            .DesiredSizeOverride(FVector2D(28.0f, 28.0f))]]]]
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(6.0f, 4.0f)
+            [SNew(SSeparator).Orientation(Orient_Vertical)]
             + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.0f)
-            [SNew(SComboButton)
-                .ToolTipText(LOCTEXT("ProjectionTip", "Choose a perspective or orthographic viewport."))
+            [SNew(SBox).WidthOverride(48.0f).HeightOverride(36.0f)
+                .HAlign(HAlign_Fill).VAlign(VAlign_Fill)
+                [SNew(SOverlay)
+                    + SOverlay::Slot()
+                    [SNew(SButton).ContentPadding(FMargin(2.0f))
+                .ToolTipText(LOCTEXT("SelectAllIconTip", "Select all control points (Ctrl+A)."))
+                .OnClicked(this, &FStrandSplineAssetEditor::SelectAllPoints)
+                [SNullWidget::NullWidget]]
+                    + SOverlay::Slot().HAlign(HAlign_Center).VAlign(VAlign_Center)
+                    [SNew(SBox).WidthOverride(28.0f).HeightOverride(28.0f)
+                        .HAlign(HAlign_Center).VAlign(VAlign_Center)
+                        .Visibility(EVisibility::HitTestInvisible)
+                        [SNew(SImage).Image(AuthoringBrush(TEXT("Strand.SelectAll")))
+                            .DesiredSizeOverride(FVector2D(28.0f, 28.0f))]]]]
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.0f)
+            [SNew(SBox).WidthOverride(48.0f).HeightOverride(36.0f)
+                .HAlign(HAlign_Fill).VAlign(VAlign_Fill)
+                [SNew(SOverlay)
+                    + SOverlay::Slot()
+                    [SNew(SButton).ContentPadding(FMargin(2.0f))
+                .ToolTipText(LOCTEXT("InvertSelectionIconTip", "Invert anchor selection."))
+                .OnClicked(this, &FStrandSplineAssetEditor::InvertPointSelection)
+                [SNullWidget::NullWidget]]
+                    + SOverlay::Slot().HAlign(HAlign_Center).VAlign(VAlign_Center)
+                    [SNew(SBox).WidthOverride(28.0f).HeightOverride(28.0f)
+                        .HAlign(HAlign_Center).VAlign(VAlign_Center)
+                        .Visibility(EVisibility::HitTestInvisible)
+                        [SNew(SImage).Image(AuthoringBrush(TEXT("Strand.Invert")))
+                            .DesiredSizeOverride(FVector2D(28.0f, 28.0f))]]]]
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.0f)
+            [SNew(SBox).WidthOverride(48.0f).HeightOverride(36.0f)
+                .HAlign(HAlign_Fill).VAlign(VAlign_Fill)
+                [SNew(SOverlay)
+                    + SOverlay::Slot()
+                    [SNew(SButton).ContentPadding(FMargin(2.0f))
+                .ToolTipText(LOCTEXT("ClearSelectionIconTip", "Clear selected anchors (Esc)."))
+                .OnClicked(this, &FStrandSplineAssetEditor::ClearPointSelection)
+                [SNullWidget::NullWidget]]
+                    + SOverlay::Slot().HAlign(HAlign_Center).VAlign(VAlign_Center)
+                    [SNew(SBox).WidthOverride(28.0f).HeightOverride(28.0f)
+                        .HAlign(HAlign_Center).VAlign(VAlign_Center)
+                        .Visibility(EVisibility::HitTestInvisible)
+                        [SNew(SImage).Image(AuthoringBrush(TEXT("Strand.ClearSelection")))
+                            .DesiredSizeOverride(FVector2D(28.0f, 28.0f))]]]]]
+            + SHorizontalBox::Slot().FillWidth(1.0f)
+            [SNew(SSpacer)]
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
+            [SNew(SHorizontalBox)
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.0f)
+            [SNew(SBox).WidthOverride(48.0f).HeightOverride(36.0f)
+                .HAlign(HAlign_Fill).VAlign(VAlign_Fill)
+                [SNew(SOverlay)
+                    + SOverlay::Slot()
+                    [SNew(SCheckBox).Style(FAppStyle::Get(), "ToggleButtonCheckbox")
+                .IsChecked_Lambda([this]() { return HasSelectedPoint() && PreviewWidget.IsValid() && PreviewWidget->GetShowControlPoints() && !bPenMode && !bMarqueeMode && ActiveWidgetMode == 0 ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
+                .IsEnabled_Lambda([this]() { return HasSelectedPoint() && PreviewWidget.IsValid() && PreviewWidget->GetShowControlPoints() && !bPenMode && !bMarqueeMode; })
+                .OnCheckStateChanged_Lambda([this](ECheckBoxState) { SetWidgetMode(0); })
+                .ToolTipText(LOCTEXT("MoveIconTip", "Move using the native Unreal gizmo (Space cycles Move, Rotate, Scale)."))
+                [SNullWidget::NullWidget]]
+                    + SOverlay::Slot().HAlign(HAlign_Center).VAlign(VAlign_Center)
+                    [SNew(SBox).WidthOverride(28.0f).HeightOverride(28.0f)
+                        .HAlign(HAlign_Center).VAlign(VAlign_Center)
+                        .Visibility(EVisibility::HitTestInvisible)
+                        [SNew(SImage).Image(AuthoringBrush(TEXT("Strand.Move")))
+                            .ColorAndOpacity_Lambda([this]() { return (HasSelectedPoint() && PreviewWidget.IsValid() && PreviewWidget->GetShowControlPoints() && !bPenMode && !bMarqueeMode)
+                                ? FSlateColor(FLinearColor::White) : FSlateColor(FLinearColor(1.0f, 1.0f, 1.0f, 0.32f)); })
+                            .DesiredSizeOverride(FVector2D(28.0f, 28.0f))]]]]
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.0f)
+            [SNew(SBox).WidthOverride(48.0f).HeightOverride(36.0f)
+                .HAlign(HAlign_Fill).VAlign(VAlign_Fill)
+                [SNew(SOverlay)
+                    + SOverlay::Slot()
+                    [SNew(SCheckBox).Style(FAppStyle::Get(), "ToggleButtonCheckbox")
+                .IsChecked_Lambda([this]() { return HasSelectedPoint() && PreviewWidget.IsValid() && PreviewWidget->GetShowControlPoints() && !bPenMode && !bMarqueeMode && ActiveWidgetMode == 1 ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
+                .IsEnabled_Lambda([this]() { return HasSelectedPoint() && PreviewWidget.IsValid() && PreviewWidget->GetShowControlPoints() && !bPenMode && !bMarqueeMode; })
+                .OnCheckStateChanged_Lambda([this](ECheckBoxState) { SetWidgetMode(1); })
+                .ToolTipText(LOCTEXT("RotateIconTip", "Rotate using the native Unreal gizmo (Space cycles Move, Rotate, Scale)."))
+                [SNullWidget::NullWidget]]
+                    + SOverlay::Slot().HAlign(HAlign_Center).VAlign(VAlign_Center)
+                    [SNew(SBox).WidthOverride(28.0f).HeightOverride(28.0f)
+                        .HAlign(HAlign_Center).VAlign(VAlign_Center)
+                        .Visibility(EVisibility::HitTestInvisible)
+                        [SNew(SImage).Image(AuthoringBrush(TEXT("Strand.Rotate")))
+                            .ColorAndOpacity_Lambda([this]() { return (HasSelectedPoint() && PreviewWidget.IsValid() && PreviewWidget->GetShowControlPoints() && !bPenMode && !bMarqueeMode)
+                                ? FSlateColor(FLinearColor::White) : FSlateColor(FLinearColor(1.0f, 1.0f, 1.0f, 0.32f)); })
+                            .DesiredSizeOverride(FVector2D(28.0f, 28.0f))]]]]
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.0f)
+            [SNew(SBox).WidthOverride(48.0f).HeightOverride(36.0f)
+                .HAlign(HAlign_Fill).VAlign(VAlign_Fill)
+                [SNew(SOverlay)
+                    + SOverlay::Slot()
+                    [SNew(SCheckBox).Style(FAppStyle::Get(), "ToggleButtonCheckbox")
+                .IsChecked_Lambda([this]() { return HasSelectedPoint() && PreviewWidget.IsValid() && PreviewWidget->GetShowControlPoints() && !bPenMode && !bMarqueeMode && ActiveWidgetMode == 2 ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
+                .IsEnabled_Lambda([this]() { return HasSelectedPoint() && PreviewWidget.IsValid() && PreviewWidget->GetShowControlPoints() && !bPenMode && !bMarqueeMode; })
+                .OnCheckStateChanged_Lambda([this](ECheckBoxState) { SetWidgetMode(2); })
+                .ToolTipText(LOCTEXT("ScaleIconTip", "Scale using the native Unreal gizmo (Space cycles Move, Rotate, Scale)."))
+                [SNullWidget::NullWidget]]
+                    + SOverlay::Slot().HAlign(HAlign_Center).VAlign(VAlign_Center)
+                    [SNew(SBox).WidthOverride(28.0f).HeightOverride(28.0f)
+                        .HAlign(HAlign_Center).VAlign(VAlign_Center)
+                        .Visibility(EVisibility::HitTestInvisible)
+                        [SNew(SImage).Image(AuthoringBrush(TEXT("Strand.Scale")))
+                            .ColorAndOpacity_Lambda([this]() { return (HasSelectedPoint() && PreviewWidget.IsValid() && PreviewWidget->GetShowControlPoints() && !bPenMode && !bMarqueeMode)
+                                ? FSlateColor(FLinearColor::White) : FSlateColor(FLinearColor(1.0f, 1.0f, 1.0f, 0.32f)); })
+                            .DesiredSizeOverride(FVector2D(28.0f, 28.0f))]]]]
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(6.0f, 4.0f)
+            [SNew(SSeparator).Orientation(Orient_Vertical)]
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.0f)
+            [SNew(SBox).WidthOverride(48.0f).HeightOverride(36.0f)
+                .HAlign(HAlign_Fill).VAlign(VAlign_Fill)
+                [SNew(SOverlay)
+                    + SOverlay::Slot()
+                    [SNew(SCheckBox).Style(FAppStyle::Get(), "ToggleButtonCheckbox")
+                .IsChecked_Lambda([this]() { return !bWidgetLocal ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
+                .OnCheckStateChanged_Lambda([this](ECheckBoxState) { SetWidgetLocal(false); })
+                .ToolTipText(LOCTEXT("WorldIconTip", "World axes. Local X follows the selected anchor outgoing tangent."))
+                [SNullWidget::NullWidget]]
+                    + SOverlay::Slot().HAlign(HAlign_Center).VAlign(VAlign_Center)
+                    [SNew(SBox).WidthOverride(28.0f).HeightOverride(28.0f)
+                        .HAlign(HAlign_Center).VAlign(VAlign_Center)
+                        .Visibility(EVisibility::HitTestInvisible)
+                        [SNew(SImage).Image(AuthoringBrush(TEXT("Strand.World")))
+                            .DesiredSizeOverride(FVector2D(28.0f, 28.0f))]]]]
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.0f)
+            [SNew(SBox).WidthOverride(48.0f).HeightOverride(36.0f)
+                .HAlign(HAlign_Fill).VAlign(VAlign_Fill)
+                [SNew(SOverlay)
+                    + SOverlay::Slot()
+                    [SNew(SCheckBox).Style(FAppStyle::Get(), "ToggleButtonCheckbox")
+                .IsChecked_Lambda([this]() { return bWidgetLocal ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
+                .OnCheckStateChanged_Lambda([this](ECheckBoxState) { SetWidgetLocal(true); })
+                .ToolTipText(LOCTEXT("LocalIconTip", "Local axes. Local X follows the selected anchor outgoing tangent."))
+                [SNullWidget::NullWidget]]
+                    + SOverlay::Slot().HAlign(HAlign_Center).VAlign(VAlign_Center)
+                    [SNew(SBox).WidthOverride(28.0f).HeightOverride(28.0f)
+                        .HAlign(HAlign_Center).VAlign(VAlign_Center)
+                        .Visibility(EVisibility::HitTestInvisible)
+                        [SNew(SImage).Image(AuthoringBrush(TEXT("Strand.Local")))
+                            .DesiredSizeOverride(FVector2D(28.0f, 28.0f))]]]]
+]
+            // Flexible space on both sides centers the transform group while
+            // retaining the selection tools on the left and view tools right.
+            + SHorizontalBox::Slot().FillWidth(1.0f)
+            [SNew(SSpacer)]
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(8.0f, 0.0f)
+            [SNew(SHorizontalBox)
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.0f)
+            [SNew(SBox).WidthOverride(60.0f).HeightOverride(36.0f)
+                .HAlign(HAlign_Fill).VAlign(VAlign_Fill)
+                [SNew(SComboButton).ContentPadding(FMargin(0.0f)).ToolTipText(LOCTEXT("ProjectionIconTip", "Choose perspective or orthographic viewport."))
                 .OnGetMenuContent(this, &FStrandSplineAssetEditor::MakeProjectionMenu)
-                .ButtonContent()
-                [SNew(STextBlock).Text(this, &FStrandSplineAssetEditor::GetProjectionLabel)]]
-            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(7.0f, 0.0f, 2.0f, 0.0f)
-            [SNew(SComboButton)
-                .ToolTipText(LOCTEXT("EditPlaneTip", "Constrain point and tangent movement to a 2D plane, or use unrestricted 3D editing. Choosing a plane does not flatten existing geometry."))
+                .ButtonContent()[CompactIcon(TEXT("Strand.View"))]]]
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.0f)
+            [SNew(SBox).WidthOverride(60.0f).HeightOverride(36.0f)
+                .HAlign(HAlign_Fill).VAlign(VAlign_Fill)
+                [SNew(SComboButton).ContentPadding(FMargin(0.0f)).ToolTipText(LOCTEXT("EditPlaneIconTip", "Choose free 3D or XY, XZ, YZ constrained editing."))
                 .OnGetMenuContent(this, &FStrandSplineAssetEditor::MakeEditPlaneMenu)
-                .ButtonContent()[SNew(STextBlock).Text(this, &FStrandSplineAssetEditor::GetEditPlaneLabel)]]
-            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(4.0f, 0.0f, 2.0f, 0.0f)
-            [SNew(SComboButton)
-                .IsEnabled_Lambda([this]() { return bPenMode; })
-                .ToolTipText(LOCTEXT("PenSnapTip", "Pen anchor and handle snapping in centimeters. Does not modify existing spline geometry."))
+                .ButtonContent()[CompactIcon(TEXT("Strand.Plane"))]]]
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.0f)
+            [SNew(SBox).WidthOverride(60.0f).HeightOverride(36.0f)
+                .HAlign(HAlign_Fill).VAlign(VAlign_Fill)
+                [SNew(SComboButton).ContentPadding(FMargin(0.0f)).IsEnabled_Lambda([this]() { return bPenMode; })
+                .ToolTipText(LOCTEXT("SnapIconTip", "Pen snapping distance in centimeters."))
                 .OnGetMenuContent(this, &FStrandSplineAssetEditor::MakePenSnapMenu)
-                .ButtonContent()[SNew(STextBlock).Text(this, &FStrandSplineAssetEditor::GetPenSnapLabel)]]
-            + SHorizontalBox::Slot().AutoWidth().Padding(7.0f, 0.0f, 2.0f, 0.0f)
-            [SNew(SButton).Text(LOCTEXT("Frame", "Frame All"))
-                .ToolTipText(LOCTEXT("FrameTip", "Fit the entire spline in the viewport. Shortcut: F."))
-                .OnClicked_Lambda([this]() { if (PreviewWidget.IsValid()) { PreviewWidget->FrameSpline(); } return FReply::Handled(); })]
-            + SHorizontalBox::Slot().AutoWidth().Padding(2.0f)
-            [SNew(SButton).Text(LOCTEXT("FramePoint", "Frame Primary"))
+                .ButtonContent()[CompactIcon(TEXT("Strand.Snap"))]]]
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.0f)
+            [SNew(SBox).WidthOverride(48.0f).HeightOverride(36.0f)
+                .HAlign(HAlign_Fill).VAlign(VAlign_Fill)
+                [SNew(SOverlay)
+                    + SOverlay::Slot()
+                    [SNew(SButton).ContentPadding(FMargin(2.0f))
+                .ToolTipText(LOCTEXT("FrameAllIconTip", "Frame entire spline (F)."))
+                .OnClicked_Lambda([this]() { if (PreviewWidget.IsValid()) { PreviewWidget->FrameSpline(); } return FReply::Handled(); })
+                [SNullWidget::NullWidget]]
+                    + SOverlay::Slot().HAlign(HAlign_Center).VAlign(VAlign_Center)
+                    [SNew(SBox).WidthOverride(28.0f).HeightOverride(28.0f)
+                        .HAlign(HAlign_Center).VAlign(VAlign_Center)
+                        .Visibility(EVisibility::HitTestInvisible)
+                        [SNew(SImage).Image(AuthoringBrush(TEXT("Strand.FrameAll")))
+                            .DesiredSizeOverride(FVector2D(28.0f, 28.0f))]]]]
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.0f)
+            [SNew(SBox).WidthOverride(48.0f).HeightOverride(36.0f)
+                .HAlign(HAlign_Fill).VAlign(VAlign_Fill)
+                [SNew(SOverlay)
+                    + SOverlay::Slot()
+                    [SNew(SButton).ContentPadding(FMargin(2.0f))
+                .ToolTipText(LOCTEXT("FrameSelectedIconTip", "Frame the primary selected anchor."))
                 .IsEnabled(this, &FStrandSplineAssetEditor::HasSelectedPoint)
-                .ToolTipText(LOCTEXT("FramePointTip", "Center the camera on the primary selected point."))
-                .OnClicked_Lambda([this]() { if (PreviewWidget.IsValid()) { PreviewWidget->FrameSelectedPoint(); } return FReply::Handled(); })]
-            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(13.0f, 0.0f, 2.0f, 0.0f)
-            [SNew(SCheckBox)
+                .OnClicked_Lambda([this]() { if (PreviewWidget.IsValid()) { PreviewWidget->FrameSelectedPoint(); } return FReply::Handled(); })
+                [SNullWidget::NullWidget]]
+                    + SOverlay::Slot().HAlign(HAlign_Center).VAlign(VAlign_Center)
+                    [SNew(SBox).WidthOverride(28.0f).HeightOverride(28.0f)
+                        .HAlign(HAlign_Center).VAlign(VAlign_Center)
+                        .Visibility(EVisibility::HitTestInvisible)
+                        [SNew(SImage).Image(AuthoringBrush(TEXT("Strand.FrameSelected")))
+                            .ColorAndOpacity_Lambda([this]() { return (HasSelectedPoint())
+                                ? FSlateColor(FLinearColor::White) : FSlateColor(FLinearColor(1.0f, 1.0f, 1.0f, 0.32f)); })
+                            .DesiredSizeOverride(FVector2D(28.0f, 28.0f))]]]]
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(6.0f, 4.0f)
+            [SNew(SSeparator).Orientation(Orient_Vertical)]
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.0f)
+            [SNew(SBox).WidthOverride(48.0f).HeightOverride(36.0f)
+                .HAlign(HAlign_Fill).VAlign(VAlign_Fill)
+                [SNew(SOverlay)
+                    + SOverlay::Slot()
+                    [SNew(SCheckBox).Style(FAppStyle::Get(), "ToggleButtonCheckbox")
                 .IsChecked_Lambda([this]() { return PreviewWidget.IsValid() && PreviewWidget->GetShowControlPoints() ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
-                .OnCheckStateChanged_Lambda([this](ECheckBoxState State) { if (PreviewWidget.IsValid()) { PreviewWidget->SetShowControlPoints(State == ECheckBoxState::Checked); } })
-                .ToolTipText(LOCTEXT("PointVisibilityTip", "Show clickable spline control points. Very dense splines display a representative set."))
-                [SNew(STextBlock).Text(LOCTEXT("ShowPoints", "Points"))]]
-            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(8.0f, 0.0f, 2.0f, 0.0f)
-            [SNew(SCheckBox)
+                .OnCheckStateChanged_Lambda([this](ECheckBoxState State) { if (PreviewWidget.IsValid()) { PreviewWidget->SetShowControlPoints(State == ECheckBoxState::Checked); }; })
+                .ToolTipText(LOCTEXT("TogglePointsIconTip", "Show/hide points in the viewport."))
+                [SNullWidget::NullWidget]]
+                    + SOverlay::Slot().HAlign(HAlign_Center).VAlign(VAlign_Center)
+                    [SNew(SBox).WidthOverride(28.0f).HeightOverride(28.0f)
+                        .HAlign(HAlign_Center).VAlign(VAlign_Center)
+                        .Visibility(EVisibility::HitTestInvisible)
+                        [SNew(SImage).Image(AuthoringBrush(TEXT("Strand.Points")))
+                            .DesiredSizeOverride(FVector2D(28.0f, 28.0f))]]]]
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.0f)
+            [SNew(SBox).WidthOverride(48.0f).HeightOverride(36.0f)
+                .HAlign(HAlign_Fill).VAlign(VAlign_Fill)
+                [SNew(SOverlay)
+                    + SOverlay::Slot()
+                    [SNew(SCheckBox).Style(FAppStyle::Get(), "ToggleButtonCheckbox")
                 .IsChecked_Lambda([this]() { return PreviewWidget.IsValid() && PreviewWidget->GetShowGrid() ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
-                .OnCheckStateChanged_Lambda([this](ECheckBoxState State) { if (PreviewWidget.IsValid()) { PreviewWidget->SetShowGrid(State == ECheckBoxState::Checked); } })
-                .ToolTipText(LOCTEXT("GridVisibilityTip", "Show a bounded XY reference floor under the spline, rather than at world Z=0."))
-                [SNew(STextBlock).Text(LOCTEXT("ShowGrid", "Grid"))]]
-            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(8.0f, 0.0f, 2.0f, 0.0f)
-            [SNew(SCheckBox)
+                .OnCheckStateChanged_Lambda([this](ECheckBoxState State) { if (PreviewWidget.IsValid()) { PreviewWidget->SetShowGrid(State == ECheckBoxState::Checked); }; })
+                .ToolTipText(LOCTEXT("ToggleGridIconTip", "Show/hide grid in the viewport."))
+                [SNullWidget::NullWidget]]
+                    + SOverlay::Slot().HAlign(HAlign_Center).VAlign(VAlign_Center)
+                    [SNew(SBox).WidthOverride(28.0f).HeightOverride(28.0f)
+                        .HAlign(HAlign_Center).VAlign(VAlign_Center)
+                        .Visibility(EVisibility::HitTestInvisible)
+                        [SNew(SImage).Image(AuthoringBrush(TEXT("Strand.Grid")))
+                            .DesiredSizeOverride(FVector2D(28.0f, 28.0f))]]]]
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.0f)
+            [SNew(SBox).WidthOverride(48.0f).HeightOverride(36.0f)
+                .HAlign(HAlign_Fill).VAlign(VAlign_Fill)
+                [SNew(SOverlay)
+                    + SOverlay::Slot()
+                    [SNew(SCheckBox).Style(FAppStyle::Get(), "ToggleButtonCheckbox")
                 .IsChecked_Lambda([this]() { return PreviewWidget.IsValid() && PreviewWidget->GetShowTangents() ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
-                .OnCheckStateChanged_Lambda([this](ECheckBoxState State) { if (PreviewWidget.IsValid()) { PreviewWidget->SetShowTangents(State == ECheckBoxState::Checked); } })
-                .ToolTipText(LOCTEXT("TangentsTip", "Display incoming and outgoing tangent directions for the selected point."))
-                [SNew(STextBlock).Text(LOCTEXT("ShowTangents", "Tangents"))]]
+                .OnCheckStateChanged_Lambda([this](ECheckBoxState State) { if (PreviewWidget.IsValid()) { PreviewWidget->SetShowTangents(State == ECheckBoxState::Checked); }; })
+                .ToolTipText(LOCTEXT("ToggleTangentsIconTip", "Show/hide tangents in the viewport."))
+                [SNullWidget::NullWidget]]
+                    + SOverlay::Slot().HAlign(HAlign_Center).VAlign(VAlign_Center)
+                    [SNew(SBox).WidthOverride(28.0f).HeightOverride(28.0f)
+                        .HAlign(HAlign_Center).VAlign(VAlign_Center)
+                        .Visibility(EVisibility::HitTestInvisible)
+                        [SNew(SImage).Image(AuthoringBrush(TEXT("Strand.Tangents")))
+                            .DesiredSizeOverride(FVector2D(28.0f, 28.0f))]]]]]
         ]
-        // Avoid a third toolbar row duplicating the point inspector and the
-        // Spline Tools menu. Keep the actual viewport as the primary workspace.
         + SVerticalBox::Slot().FillHeight(1.0f).Padding(6.0f, 0.0f)
-        [SAssignNew(PreviewWidget, SStrandSplineViewport)]
+        [SNew(SHorizontalBox)
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Top).Padding(0.0f, 5.0f, 5.0f, 0.0f)
+            [SNew(SVerticalBox)
+            + SVerticalBox::Slot().AutoHeight().Padding(1.0f, 4.0f)
+            [SNew(SSeparator)]
+            + SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center).Padding(3.0f)
+            [SNew(SBox).WidthOverride(48.0f).HeightOverride(36.0f)
+                .HAlign(HAlign_Fill).VAlign(VAlign_Fill)
+                [SNew(SCheckBox).Style(FAppStyle::Get(), "ToggleButtonCheckbox")
+                .IsChecked_Lambda([this]() { return bPenMode ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
+                .OnCheckStateChanged_Lambda([this](ECheckBoxState State) { SetPenMode(State == ECheckBoxState::Checked); })
+                .ToolTipText(LOCTEXT("DrawPenTip", "Pen tool (P). Click to create anchors; drag to create Bezier handles. Esc to finish."))
+                [CompactIcon(TEXT("Strand.Pen"))]]]
+            + SVerticalBox::Slot().AutoHeight().Padding(1.0f, 5.0f)
+            [SNew(SSeparator)]
+            + SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center).Padding(3.0f)
+            [SNew(SBox).WidthOverride(48.0f).HeightOverride(36.0f)
+                .HAlign(HAlign_Fill).VAlign(VAlign_Fill)
+                [SNew(SButton).ContentPadding(FMargin(2.0f))
+                .ToolTipText(LOCTEXT("StrandInsertTip", "Insert a point after the selected anchor."))
+                .IsEnabled(this, &FStrandSplineAssetEditor::HasSelectedPoint)
+                .OnClicked(this, &FStrandSplineAssetEditor::AddPointAfterSelection)
+                [CompactIcon(TEXT("Strand.Insert"))]]]
+            + SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center).Padding(3.0f)
+            [SNew(SBox).WidthOverride(48.0f).HeightOverride(36.0f)
+                .HAlign(HAlign_Fill).VAlign(VAlign_Fill)
+                [SNew(SButton).ContentPadding(FMargin(2.0f))
+                .ToolTipText(LOCTEXT("StrandDeleteTip", "Delete selected spline anchors (Delete)."))
+                .IsEnabled(this, &FStrandSplineAssetEditor::CanDeleteSelection)
+                .OnClicked(this, &FStrandSplineAssetEditor::RemoveSelectedPoint)
+                [CompactIcon(TEXT("Strand.Delete"))]]]
+            + SVerticalBox::Slot().AutoHeight().Padding(1.0f, 5.0f)
+            [SNew(SSeparator)]
+            + SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center).Padding(3.0f)
+            [SNew(SBox).WidthOverride(48.0f).HeightOverride(36.0f)
+                .HAlign(HAlign_Fill).VAlign(VAlign_Fill)
+                [SNew(SButton).ContentPadding(FMargin(2.0f))
+                .ToolTipText(LOCTEXT("StrandSubdivideTip", "Subdivide all spline segments, preserving curve shape."))
+                .OnClicked(this, &FStrandSplineAssetEditor::SubdivideSpline)
+                [CompactIcon(TEXT("Strand.Subdivide"))]]]
+            + SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center).Padding(3.0f)
+            [SNew(SBox).WidthOverride(48.0f).HeightOverride(36.0f)
+                .HAlign(HAlign_Fill).VAlign(VAlign_Fill)
+                [SNew(SButton).ContentPadding(FMargin(2.0f))
+                .ToolTipText(LOCTEXT("StrandSmoothTip", "Auto-smooth the spline tangents."))
+                .OnClicked(this, &FStrandSplineAssetEditor::SmoothSpline)
+                [CompactIcon(TEXT("Strand.Smooth"))]]]
+            + SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center).Padding(3.0f)
+            [SNew(SBox).WidthOverride(48.0f).HeightOverride(36.0f)
+                .HAlign(HAlign_Fill).VAlign(VAlign_Fill)
+                [SNew(SButton).ContentPadding(FMargin(2.0f))
+                .ToolTipText(LOCTEXT("StrandLinearTip", "Linearize all segments."))
+                .OnClicked(this, &FStrandSplineAssetEditor::LinearizeSpline)
+                [CompactIcon(TEXT("Strand.Linear"))]]]
+            + SVerticalBox::Slot().AutoHeight().Padding(1.0f, 5.0f)
+            [SNew(SSeparator)]
+            + SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center).Padding(3.0f)
+            [SNew(SBox).WidthOverride(48.0f).HeightOverride(36.0f)
+                .HAlign(HAlign_Fill).VAlign(VAlign_Fill)
+                [SNew(SButton).ContentPadding(FMargin(2.0f))
+                .ToolTipText(LOCTEXT("StrandReverseTip", "Reverse spline point order and tangents."))
+                .OnClicked(this, &FStrandSplineAssetEditor::ReverseSpline)
+                [CompactIcon(TEXT("Strand.Reverse"))]]]
+            + SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center).Padding(3.0f)
+            [SNew(SBox).WidthOverride(48.0f).HeightOverride(36.0f)
+                .HAlign(HAlign_Fill).VAlign(VAlign_Fill)
+                [SNew(SButton).ContentPadding(FMargin(2.0f))
+                .ToolTipText_Lambda([this]() { return Asset.IsValid() && Asset->bIsClosedLoop
+                    ? LOCTEXT("StrandOpenLoopTip", "Open spline: break the connection between the final and first anchor. Undoable.")
+                    : LOCTEXT("StrandCloseLoopTip", "Close spline: connect the final anchor to the first. Undoable."); })
+                .OnClicked(this, &FStrandSplineAssetEditor::ToggleClosedLoop)
+                [SNew(SBox).WidthOverride(24.0f).HeightOverride(24.0f)
+                    .HAlign(HAlign_Center).VAlign(VAlign_Center)
+                    [SNew(SImage).DesiredSizeOverride(FVector2D(24.0f, 24.0f))
+                        .Image_Lambda([this]() { return AuthoringBrush(Asset.IsValid() && Asset->bIsClosedLoop
+                            ? FName(TEXT("Strand.OpenPath")) : FName(TEXT("Strand.ClosedPath"))); })]]]]
+            + SVerticalBox::Slot().AutoHeight().Padding(1.0f, 5.0f)
+            [SNew(SSeparator)]
+            + SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center).Padding(3.0f)
+            [SNew(SBox).WidthOverride(60.0f).HeightOverride(36.0f)
+                .HAlign(HAlign_Fill).VAlign(VAlign_Fill)
+                [SNew(SComboButton).ContentPadding(FMargin(0.0f))
+                .IsEnabled(this, &FStrandSplineAssetEditor::HasSelectedPoint)
+                .ToolTipText(LOCTEXT("HandleQuickToolTip", "Bezier handles: Free, Aligned, Mirrored, Auto, or Corner. Choose a persistent handle constraint for selected anchors."))
+                .OnGetMenuContent(this, &FStrandSplineAssetEditor::MakeHandleModeMenu)
+                .ButtonContent()[CompactIcon(TEXT("Strand.Handles"))]]]
+            + SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center).Padding(3.0f)
+            [SNew(SBox).WidthOverride(60.0f).HeightOverride(36.0f)
+                .HAlign(HAlign_Fill).VAlign(VAlign_Fill)
+                [SNew(SComboButton).ContentPadding(FMargin(0.0f))
+                .IsEnabled(this, &FStrandSplineAssetEditor::HasSelectedPoint)
+                .ToolTipText(LOCTEXT("InterpolationQuickToolTip", "Change selected anchor interpolation: Linear, Curve, Curve Clamped, Constant or Custom."))
+                .OnGetMenuContent(this, &FStrandSplineAssetEditor::MakePointTypeMenu)
+                .ButtonContent()[CompactIcon(TEXT("Strand.Interpolation"))]]]
+            + SVerticalBox::Slot().AutoHeight().Padding(1.0f, 5.0f)
+            [SNew(SSeparator)]
+            + SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center).Padding(3.0f)
+            [SNew(SBox).WidthOverride(60.0f).HeightOverride(36.0f)
+                .HAlign(HAlign_Fill).VAlign(VAlign_Fill)
+                [SNew(SComboButton).ContentPadding(FMargin(0.0f))
+                .ToolTipText(LOCTEXT("ReplacePrimitiveStripTip", "Replace THIS asset's spline with a Circle, Rectangle, or Helix. Supports Undo/Redo; removes any external-source reimport link."))
+                .OnGetMenuContent(this, &FStrandSplineAssetEditor::MakeReplacePrimitiveMenu)
+                .ButtonContent()[CompactIcon(TEXT("Strand.ReplaceShape"))]]]
+            + SVerticalBox::Slot().AutoHeight().Padding(4.0f, 8.0f)
+            [SNew(SBox).WidthOverride(60.0f).HeightOverride(36.0f)
+                .HAlign(HAlign_Fill).VAlign(VAlign_Fill)
+                [SNew(SComboButton).ContentPadding(FMargin(0.0f)).ToolTipText(LOCTEXT("MoreAuthoringTip", "More spline modeling operations, tangent and point tools."))
+                .OnGetMenuContent(this, &FStrandSplineAssetEditor::MakeSplineToolsMenu)
+                .ButtonContent()[CompactIcon(TEXT("Strand.More"))]]]]
+            + SHorizontalBox::Slot().FillWidth(1.0f)
+            [SAssignNew(PreviewWidget, SStrandSplineViewport)]
+        ]
         + SVerticalBox::Slot().AutoHeight().Padding(9.0f, 6.0f, 9.0f, 2.0f)
         [SNew(STextBlock)
             .Text(this, &FStrandSplineAssetEditor::GetSummary)
@@ -356,10 +715,20 @@ TSharedRef<SDockTab> FStrandSplineAssetEditor::SpawnPreviewTab(const FSpawnTabAr
     {
         PreviewWidget->SetSpline(NativePreview.Get());
         PreviewWidget->SetOnPointSelected([this](int32 Index, bool bShift, bool bCtrl) { SelectPoint(Index, bShift, bCtrl); });
+        PreviewWidget->SetOnSegmentInsert([this](int32 Segment, double Alpha) { InsertPointOnViewportSegment(Segment, Alpha); });
+        PreviewWidget->SetSegmentBendCallbacks(
+            [this](int32 Segment, double Alpha) { BeginViewportSegmentBend(Segment, Alpha); },
+            [this](const FVector& Delta) { UpdateViewportSegmentBend(Delta); },
+            [this]() { EndViewportSegmentBend(); });
+        PreviewWidget->SetOnContextMenu([this](int32 Point, int32 Segment, double Alpha)
+        {
+            return MakeViewportContextMenu(Point, Segment, Alpha);
+        });
+        PreviewWidget->SetOnNudge([this](const FVector& Delta) { NudgeSelectedPoints(Delta); });
         PreviewWidget->SetOnMarqueeSelected([this](const TArray<int32>& Points, bool bAdd, bool bToggle)
             { SelectMarqueePoints(Points, bAdd, bToggle); });
         PreviewWidget->SetOnMarqueeExit([this]() { SetMarqueeMode(false); });
-        PreviewWidget->SetPointRotationCallback([this](int32 Axis, double Degrees) { ApplyViewportRotation(Axis, Degrees); });
+        PreviewWidget->SetPointRotationCallback([this](const FQuat& Delta) { ApplyViewportRotation(Delta); });
         PreviewWidget->SetPointScaleCallback([this](double Factor) { ApplyViewportScale(Factor); });
         PreviewWidget->SetOnWidgetModeChanged([this](int32 Mode) { SetWidgetMode(Mode); });
         PreviewWidget->SetOnToolShortcut([this](int32 Tool)
@@ -385,6 +754,7 @@ TSharedRef<SDockTab> FStrandSplineAssetEditor::SpawnPreviewTab(const FSpawnTabAr
         PreviewWidget->SetPenMode(bPenMode);
         PreviewWidget->SetMarqueeMode(bMarqueeMode);
         PreviewWidget->SetWidgetMode(ActiveWidgetMode);
+        PreviewWidget->SetWidgetLocal(bWidgetLocal);
         PreviewWidget->SetPenSnap(PenSnapStep);
         PreviewWidget->SetPenPlane(EditPlane == EStrandEditPlane::XY ? 2 :
             EditPlane == EStrandEditPlane::XZ ? 1 : EditPlane == EStrandEditPlane::YZ ? 0 : -1);
@@ -396,6 +766,7 @@ TSharedRef<SDockTab> FStrandSplineAssetEditor::SpawnDetailsTab(const FSpawnTabAr
 {
     check(DetailsView.IsValid());
     return SNew(SDockTab).Label(LOCTEXT("DetailsTab", "Spline Details"))
+        .ToolTipText(LOCTEXT("DetailsTabTip", "Point selection, position, authored orientation, Bezier handles, and interpolation."))
     [
         SNew(SVerticalBox)
         + SVerticalBox::Slot().AutoHeight().Padding(8.0f, 8.0f, 8.0f, 2.0f)
@@ -424,11 +795,28 @@ TSharedRef<SDockTab> FStrandSplineAssetEditor::SpawnDetailsTab(const FSpawnTabAr
                 .OnClicked(this, &FStrandSplineAssetEditor::ClearPointSelection)]
         ]
         + SVerticalBox::Slot().AutoHeight().Padding(10.0f, 0.0f, 8.0f, 3.0f)
-        [SNew(STextBlock)
-            .Text_Lambda([this]() { return HasMultipleSelectedPoints()
-                ? LOCTEXT("GroupCoordinates", "SELECTION CENTER (local cm, edit to move group)")
-                : LOCTEXT("SingleCoordinates", "POINT POSITION (local cm)"); })
-            .ColorAndOpacity(FSlateColor::UseSubduedForeground())]
+        [SNew(SHorizontalBox)
+            + SHorizontalBox::Slot().FillWidth(1.0f).VAlign(VAlign_Center)
+            [SNew(STextBlock)
+                .Text_Lambda([this]() { return bRelativePositionEntry
+                    ? LOCTEXT("OffsetCoordinates", "MOVE BY (asset cm, applied on Enter)")
+                    : HasMultipleSelectedPoints()
+                        ? LOCTEXT("GroupCoordinates", "SELECTION CENTER (asset cm)")
+                        : LOCTEXT("SingleCoordinates", "POINT POSITION (asset cm)"); })
+                .ColorAndOpacity(FSlateColor::UseSubduedForeground())]
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.0f)
+            [SNew(SCheckBox).Style(FAppStyle::Get(), "ToggleButtonCheckbox")
+                .IsChecked_Lambda([this]() { return !bRelativePositionEntry ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
+                .OnCheckStateChanged_Lambda([this](ECheckBoxState) { bRelativePositionEntry = false; })
+                .ToolTipText(LOCTEXT("AbsolutePositionTip", "Set an exact point position or selection-center location in asset coordinates."))
+                [SNew(STextBlock).Text(LOCTEXT("AbsolutePosition", "Absolute"))]]
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.0f)
+            [SNew(SCheckBox).Style(FAppStyle::Get(), "ToggleButtonCheckbox")
+                .IsChecked_Lambda([this]() { return bRelativePositionEntry ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
+                .OnCheckStateChanged_Lambda([this](ECheckBoxState) { bRelativePositionEntry = true; })
+                .ToolTipText(LOCTEXT("RelativePositionTip", "Enter an offset to add to every selected point; returns to zero after each commit."))
+                [SNew(STextBlock).Text(LOCTEXT("RelativePosition", "Relative"))]]
+        ]
         + SVerticalBox::Slot().AutoHeight().Padding(8.0f, 0.0f, 8.0f, 9.0f)
         [
             SNew(SHorizontalBox).IsEnabled(this, &FStrandSplineAssetEditor::HasSelectedPoint)
@@ -439,6 +827,7 @@ TSharedRef<SDockTab> FStrandSplineAssetEditor::SpawnDetailsTab(const FSpawnTabAr
                 .LabelVAlign(VAlign_Center)
                 .Label()[SNew(STextBlock).Text(FText::FromString(TEXT("X")))]
                 .IsEnabled_Lambda([this]() { return EditPlane != EStrandEditPlane::YZ; })
+                .ToolTipText(FText::FromString(TEXT("X position in asset centimeters. Enter commits absolute or relative movement depending on the mode.")))
                 .Value_Lambda([this]() { return GetPointCoordinate(0); })
                 .OnValueCommitted_Lambda([this](double Value, ETextCommit::Type) { SetPointCoordinate(Value, 0); })]
             + SHorizontalBox::Slot().FillWidth(1.0f).Padding(2.0f)
@@ -448,6 +837,7 @@ TSharedRef<SDockTab> FStrandSplineAssetEditor::SpawnDetailsTab(const FSpawnTabAr
                 .LabelVAlign(VAlign_Center)
                 .Label()[SNew(STextBlock).Text(FText::FromString(TEXT("Y")))]
                 .IsEnabled_Lambda([this]() { return EditPlane != EStrandEditPlane::XZ; })
+                .ToolTipText(FText::FromString(TEXT("Y position in asset centimeters. Enter commits absolute or relative movement depending on the mode.")))
                 .Value_Lambda([this]() { return GetPointCoordinate(1); })
                 .OnValueCommitted_Lambda([this](double Value, ETextCommit::Type) { SetPointCoordinate(Value, 1); })]
             + SHorizontalBox::Slot().FillWidth(1.0f).Padding(2.0f)
@@ -457,8 +847,48 @@ TSharedRef<SDockTab> FStrandSplineAssetEditor::SpawnDetailsTab(const FSpawnTabAr
                 .LabelVAlign(VAlign_Center)
                 .Label()[SNew(STextBlock).Text(FText::FromString(TEXT("Z")))]
                 .IsEnabled_Lambda([this]() { return EditPlane != EStrandEditPlane::XY; })
+                .ToolTipText(FText::FromString(TEXT("Z position in asset centimeters. Enter commits absolute or relative movement depending on the mode.")))
                 .Value_Lambda([this]() { return GetPointCoordinate(2); })
                 .OnValueCommitted_Lambda([this](double Value, ETextCommit::Type) { SetPointCoordinate(Value, 2); })]
+        ]
+        // Authored anchor rotation is intentionally separate from the curve's
+        // tangent direction. Local X follows the outgoing tangent; saved rotation guides up/roll.
+        + SVerticalBox::Slot().AutoHeight().Padding(10.0f, 2.0f, 8.0f, 3.0f)
+        [SNew(STextBlock)
+            .Text(LOCTEXT("AuthorOrientationHeader", "ANCHOR ORIENTATION (degrees)"))
+            .ToolTipText(LOCTEXT("AuthorOrientationTip", "Saved point orientation, independent of curve tangents. Local gizmo X follows the outgoing tangent; this orientation supplies its up/roll reference."))
+            .ColorAndOpacity(FSlateColor::UseSubduedForeground())]
+        + SVerticalBox::Slot().AutoHeight().Padding(8.0f, 0.0f, 8.0f, 3.0f)
+        [SNew(SHorizontalBox).IsEnabled_Lambda([this]() { return HasSelectedPoint() && !HasMultipleSelectedPoints(); })
+            + SHorizontalBox::Slot().FillWidth(1.0f).Padding(2.0f)
+            [SNew(SNumericEntryBox<double>).MinFractionalDigits(0).MaxFractionalDigits(2)
+                .Label()[SNew(STextBlock).Text(LOCTEXT("PitchLabel", "P"))]
+                .ToolTipText(FText::FromString(TEXT("Pitch: authored anchor rotation in degrees. Does not change spline tangents.")))
+                .Value_Lambda([this]() { return GetAnchorRotationCoordinate(0); })
+                .OnValueCommitted_Lambda([this](double V, ETextCommit::Type) { SetAnchorRotationCoordinate(V, 0); })]
+            + SHorizontalBox::Slot().FillWidth(1.0f).Padding(2.0f)
+            [SNew(SNumericEntryBox<double>).MinFractionalDigits(0).MaxFractionalDigits(2)
+                .Label()[SNew(STextBlock).Text(LOCTEXT("YawLabel", "Y"))]
+                .ToolTipText(FText::FromString(TEXT("Yaw: authored anchor rotation in degrees. Does not change spline tangents.")))
+                .Value_Lambda([this]() { return GetAnchorRotationCoordinate(1); })
+                .OnValueCommitted_Lambda([this](double V, ETextCommit::Type) { SetAnchorRotationCoordinate(V, 1); })]
+            + SHorizontalBox::Slot().FillWidth(1.0f).Padding(2.0f)
+            [SNew(SNumericEntryBox<double>).MinFractionalDigits(0).MaxFractionalDigits(2)
+                .Label()[SNew(STextBlock).Text(LOCTEXT("RollLabel", "R"))]
+                .ToolTipText(FText::FromString(TEXT("Roll: authored anchor rotation in degrees. Does not change spline tangents.")))
+                .Value_Lambda([this]() { return GetAnchorRotationCoordinate(2); })
+                .OnValueCommitted_Lambda([this](double V, ETextCommit::Type) { SetAnchorRotationCoordinate(V, 2); })]
+        ]
+        + SVerticalBox::Slot().AutoHeight().Padding(10.0f, 1.0f, 8.0f, 5.0f)
+        [SNew(SHorizontalBox).IsEnabled(this, &FStrandSplineAssetEditor::HasSelectedPoint)
+            + SHorizontalBox::Slot().AutoWidth().Padding(2.0f)
+            [SNew(SButton).Text(LOCTEXT("ResetAnchorOrientation", "Reset Rotation"))
+                .ToolTipText(LOCTEXT("ResetAnchorOrientationTip", "Set selected anchor rotations to zero without modifying positions, tangents, or spline interpolation."))
+                .OnClicked(this, &FStrandSplineAssetEditor::ResetSelectedOrientations)]
+            + SHorizontalBox::Slot().AutoWidth().Padding(2.0f)
+            [SNew(SButton).Text(LOCTEXT("AlignAnchorToCurve", "Align to Curve"))
+                .ToolTipText(LOCTEXT("AlignAnchorToCurveTip", "Explicitly orient selected anchors with X forward along the spline tangent and Z approximately up. Does not alter tangents."))
+                .OnClicked(this, &FStrandSplineAssetEditor::AlignSelectedOrientationsToCurve)]
         ]
         // Curve-shaping behavior is a first-class authoring control, not a
         // hidden one-shot command inside Spline Tools. This applies to all
@@ -489,19 +919,22 @@ TSharedRef<SDockTab> FStrandSplineAssetEditor::SpawnDetailsTab(const FSpawnTabAr
                 [SNew(SNumericEntryBox<double>).MinFractionalDigits(0).MaxFractionalDigits(3)
                     .IsEnabled_Lambda([this]() { return EditPlane != EStrandEditPlane::YZ; })
                     .Label()[SNew(STextBlock).Text(FText::FromString(TEXT("X")))]
-                    .Value_Lambda([this]() { return GetTangentCoordinate(0); })
+                    .ToolTipText(FText::FromString(TEXT("Selected incoming/outgoing Bezier tangent X component (centimeters per spline key).")))
+                .Value_Lambda([this]() { return GetTangentCoordinate(0); })
                     .OnValueCommitted_Lambda([this](double Value, ETextCommit::Type) { SetTangentCoordinate(Value, 0); })]
                 + SHorizontalBox::Slot().FillWidth(1.0f).Padding(2.0f)
                 [SNew(SNumericEntryBox<double>).MinFractionalDigits(0).MaxFractionalDigits(3)
                     .IsEnabled_Lambda([this]() { return EditPlane != EStrandEditPlane::XZ; })
                     .Label()[SNew(STextBlock).Text(FText::FromString(TEXT("Y")))]
-                    .Value_Lambda([this]() { return GetTangentCoordinate(1); })
+                    .ToolTipText(FText::FromString(TEXT("Selected incoming/outgoing Bezier tangent Y component (centimeters per spline key).")))
+                .Value_Lambda([this]() { return GetTangentCoordinate(1); })
                     .OnValueCommitted_Lambda([this](double Value, ETextCommit::Type) { SetTangentCoordinate(Value, 1); })]
                 + SHorizontalBox::Slot().FillWidth(1.0f).Padding(2.0f)
                 [SNew(SNumericEntryBox<double>).MinFractionalDigits(0).MaxFractionalDigits(3)
                     .IsEnabled_Lambda([this]() { return EditPlane != EStrandEditPlane::XY; })
                     .Label()[SNew(STextBlock).Text(FText::FromString(TEXT("Z")))]
-                    .Value_Lambda([this]() { return GetTangentCoordinate(2); })
+                    .ToolTipText(FText::FromString(TEXT("Selected incoming/outgoing Bezier tangent Z component (centimeters per spline key).")))
+                .Value_Lambda([this]() { return GetTangentCoordinate(2); })
                     .OnValueCommitted_Lambda([this](double Value, ETextCommit::Type) { SetTangentCoordinate(Value, 2); })]
             ]
         ]
@@ -510,11 +943,11 @@ TSharedRef<SDockTab> FStrandSplineAssetEditor::SpawnDetailsTab(const FSpawnTabAr
             .Visibility_Lambda([this]() { return HasSelectedPoint() && !HasMultipleSelectedPoints() ? EVisibility::Visible : EVisibility::Collapsed; })
             + SHorizontalBox::Slot().AutoWidth().Padding(2.0f)
             [SNew(SButton).Text(LOCTEXT("IncomingHandleButton", "Incoming Handle"))
-                .ToolTipText(LOCTEXT("IncomingHandleTip", "Select the incoming Bezier handle for numeric or gizmo editing. Tangent visibility must be enabled."))
+                .ToolTipText(LOCTEXT("IncomingHandleTip", "Select the ORANGE incoming (Arrive) Bezier handle for numeric or gizmo editing. Tangent visibility must be enabled."))
                 .OnClicked_Lambda([this]() { SelectTangentHandle(SelectedPointIndex, 1); return FReply::Handled(); })]
             + SHorizontalBox::Slot().AutoWidth().Padding(2.0f)
             [SNew(SButton).Text(LOCTEXT("OutgoingHandleButton", "Outgoing Handle"))
-                .ToolTipText(LOCTEXT("OutgoingHandleTip", "Select the outgoing Bezier handle for numeric or gizmo editing. Tangent visibility must be enabled."))
+                .ToolTipText(LOCTEXT("OutgoingHandleTip", "Select the BLUE outgoing (Leave) Bezier handle for numeric or gizmo editing. Tangent visibility must be enabled."))
                 .OnClicked_Lambda([this]() { SelectTangentHandle(SelectedPointIndex, 2); return FReply::Handled(); })]
         ]
         + SVerticalBox::Slot().AutoHeight().Padding(8.0f, 1.0f, 8.0f, 4.0f)
@@ -534,6 +967,7 @@ TSharedRef<SDockTab> FStrandSplineAssetEditor::SpawnDetailsTab(const FSpawnTabAr
             + SHorizontalBox::Slot().AutoWidth().Padding(2.0f)
             [SNew(SComboButton)
                 .IsEnabled(this, &FStrandSplineAssetEditor::HasSelectedPoint)
+                .ToolTipText(LOCTEXT("InspectorInterpolationTip", "Choose the spline interpolation type for selected anchors. Custom Tangents preserves individual Bezier handles; Constant creates stepped, non-exportable interpolation."))
                 .OnGetMenuContent(this, &FStrandSplineAssetEditor::MakePointTypeMenu)
                 .ButtonContent()[SNew(STextBlock).Text(LOCTEXT("PointType", "Interpolation"))]]
         ]
@@ -567,14 +1001,57 @@ TSharedRef<SDockTab> FStrandSplineAssetEditor::SpawnDetailsTab(const FSpawnTabAr
                 .Value_Lambda([]() -> TOptional<double> { return 1.0; })
                 .OnValueCommitted_Lambda([this](double Factor, ETextCommit::Type) { ScaleSelection(Factor); })]
         ]
-        + SVerticalBox::Slot().FillHeight(1.0f).Padding(5.f, 8.f, 5.f, 3.f)
-        [SNew(SExpandableArea)
-            .InitiallyCollapsed(true)
-            .AreaTitle(LOCTEXT("AssetSettingsFoldout", "Asset Properties / Source / Reimport"))
-            .ToolTipText(LOCTEXT("AssetSettingsTooltip", "Advanced asset, source, and import settings. Open this section when changing import behavior."))
-            .BodyContent()
-            [SNew(SBox).MinDesiredHeight(310.f)[DetailsView.ToSharedRef()]]
-        ]
+        // Persistent context: useful even when no anchor is selected. Native
+        // spline length is evaluated, not a sum of straight point distances.
+        + SVerticalBox::Slot().AutoHeight().Padding(8.0f, 12.0f, 8.0f, 2.0f)
+        [SNew(SSeparator)]
+        + SVerticalBox::Slot().AutoHeight().Padding(10.0f, 6.0f, 8.0f, 3.0f)
+        [SNew(STextBlock).Text(LOCTEXT("SplineOverviewHeading", "SPLINE OVERVIEW"))
+            .ToolTipText(LOCTEXT("SplineOverviewHeadingTip", "Live native spline statistics, including evaluated arc length in centimeters."))
+            .ColorAndOpacity(FSlateColor::UseSubduedForeground())]
+        + SVerticalBox::Slot().AutoHeight().Padding(10.0f, 0.0f, 8.0f, 5.0f)
+        [SNew(STextBlock)
+            .Text_Lambda([this]()
+            {
+                const USplineDataAsset* Current = Asset.Get();
+                const int32 Points = Current ? Current->Points.Num() : 0;
+                const bool bClosed = Current && Current->bIsClosedLoop;
+                const int32 Segments = FMath::Max(0, Points - (bClosed ? 0 : 1));
+                const double Length = NativePreview.IsValid() ? NativePreview->GetSplineLength() : 0.0;
+                return FText::FromString(FString::Printf(TEXT("%d anchors  |  %d segments  |  %.1f cm  |  %s"),
+                    Points, Segments, Length, bClosed ? TEXT("Closed") : TEXT("Open")));
+            })
+            .ToolTipText(LOCTEXT("SplineOverviewLengthTip", "Arc length comes from Unreal's evaluated spline. It may differ from the distance between control points."))]
+        + SVerticalBox::Slot().AutoHeight().Padding(10.0f, 0.0f, 8.0f, 6.0f)
+        [SNew(STextBlock)
+            .Visibility_Lambda([this]() { return HasSelectedPoint() && !HasMultipleSelectedPoints() ? EVisibility::Visible : EVisibility::Collapsed; })
+            .Text_Lambda([this]()
+            {
+                if (!NativePreview.IsValid() || !HasSelectedPoint() ||
+                    SelectedPointIndex >= NativePreview->GetNumberOfSplinePoints()) { return FText::GetEmpty(); }
+                const double Distance = NativePreview->GetDistanceAlongSplineAtSplinePoint(SelectedPointIndex);
+                const double Length = NativePreview->GetSplineLength();
+                const double Percent = Length > KINDA_SMALL_NUMBER ? Distance / Length * 100.0 : 0.0;
+                return FText::FromString(FString::Printf(TEXT("Selected anchor: %.1f cm along path (%.1f%%)"), Distance, Percent));
+            })
+            .ToolTipText(LOCTEXT("SplineOverviewDistanceTip", "Evaluated distance from the spline start to the selected anchor. On a closed spline the first anchor is at 0%."))]
+        + SVerticalBox::Slot().FillHeight(1.0f)
+        [SNew(SSpacer)]
+    ];
+}
+
+TSharedRef<SDockTab> FStrandSplineAssetEditor::SpawnSourceTab(const FSpawnTabArgs& Args)
+{
+    check(DetailsView.IsValid());
+    return SNew(SDockTab).Label(LOCTEXT("SourceTabLabel", "Source & Import"))
+        .ToolTipText(LOCTEXT("SourceTabTip", "Asset placement defaults, original source, and format-specific reimport settings."))
+    [
+        SNew(SVerticalBox)
+        + SVerticalBox::Slot().AutoHeight().Padding(8.0f)
+        [SNew(STextBlock).Text(LOCTEXT("SourceTabHeading", "ASSET / SOURCE / IMPORT"))
+            .ColorAndOpacity(FSlateColor::UseSubduedForeground())]
+        + SVerticalBox::Slot().FillHeight(1.0f).Padding(4.0f)
+        [DetailsView.ToSharedRef()]
     ];
 }
 
@@ -631,7 +1108,7 @@ TOptional<double> FStrandSplineAssetEditor::GetPointCoordinate(int32 Axis) const
 {
     if (!HasSelectedPoint()) { return TOptional<double>(); }
     const FVector Center = StrandSplineEditOperations::SelectionCenter(Asset->Points, GetSelectedIndices());
-    return Center[Axis];
+    return bRelativePositionEntry ? 0.0 : Center[Axis];
 }
 
 void FStrandSplineAssetEditor::SetPointCoordinate(double Value, int32 Axis)
@@ -640,7 +1117,7 @@ void FStrandSplineAssetEditor::SetPointCoordinate(double Value, int32 Axis)
     if (!HasSelectedPoint() || !CanEditAxis(Axis) || !FMath::IsFinite(Value)) { return; }
     const TArray<int32> Indices = GetSelectedIndices();
     const double Old = StrandSplineEditOperations::SelectionCenter(Current->Points, Indices)[Axis];
-    const double DeltaValue = Value - Old;
+    const double DeltaValue = StrandSplineEditOperations::PositionEntryDelta(Old, Value, bRelativePositionEntry);
     if (FMath::IsNearlyZero(DeltaValue, 0.000001)) { return; }
     EndViewportPointDrag();
     const FScopedTransaction Transaction(LOCTEXT("MovePointTransaction", "Move Strand Spline Selection"));
@@ -654,6 +1131,86 @@ void FStrandSplineAssetEditor::SetPointCoordinate(double Value, int32 Axis)
         RebuildNativePreview();
         if (DetailsView.IsValid()) { DetailsView->ForceRefresh(); }
     }
+}
+
+TOptional<double> FStrandSplineAssetEditor::GetAnchorRotationCoordinate(int32 Axis) const
+{
+    if (!HasSelectedPoint() || HasMultipleSelectedPoints() || Axis < 0 || Axis > 2)
+    {
+        return TOptional<double>();
+    }
+    const FRotator& Rotation = Asset->Points[SelectedPointIndex].LocalRotation;
+    return Axis == 0 ? Rotation.Pitch : Axis == 1 ? Rotation.Yaw : Rotation.Roll;
+}
+
+void FStrandSplineAssetEditor::SetAnchorRotationCoordinate(double Value, int32 Axis)
+{
+    USplineDataAsset* Current = Asset.Get();
+    if (!Current || !HasSelectedPoint() || HasMultipleSelectedPoints() ||
+        Axis < 0 || Axis > 2 || !FMath::IsFinite(Value)) { return; }
+    FRotator Rotation = Current->Points[SelectedPointIndex].LocalRotation;
+    double& Component = Axis == 0 ? Rotation.Pitch : Axis == 1 ? Rotation.Yaw : Rotation.Roll;
+    if (FMath::IsNearlyEqual(Component, Value, 0.000001)) { return; }
+    Component = Value;
+    if (Rotation.ContainsNaN()) { return; }
+    EndViewportPointDrag();
+    const FScopedTransaction Transaction(LOCTEXT("EditAnchorOrientationUndo", "Edit Strand Anchor Orientation"));
+    Current->Modify();
+    if (StrandSplineEditOperations::SetSelectedOrientation(Current->Points,
+        TArray<int32>{SelectedPointIndex}, Rotation))
+    {
+        Current->PostEditChange();
+        Current->MarkPackageDirty();
+        RebuildNativePreview();
+        if (DetailsView.IsValid()) { DetailsView->ForceRefresh(); }
+    }
+}
+
+FReply FStrandSplineAssetEditor::ResetSelectedOrientations()
+{
+    USplineDataAsset* Current = Asset.Get();
+    if (!Current || !HasSelectedPoint()) { return FReply::Handled(); }
+    EndViewportPointDrag();
+    const FScopedTransaction Transaction(LOCTEXT("ResetAnchorOrientationsUndo", "Reset Strand Anchor Orientations"));
+    Current->Modify();
+    if (StrandSplineEditOperations::SetSelectedOrientation(Current->Points,
+        GetSelectedIndices(), FRotator::ZeroRotator))
+    {
+        Current->PostEditChange();
+        Current->MarkPackageDirty();
+        RebuildNativePreview();
+        if (DetailsView.IsValid()) { DetailsView->ForceRefresh(); }
+    }
+    return FReply::Handled();
+}
+
+FReply FStrandSplineAssetEditor::AlignSelectedOrientationsToCurve()
+{
+    USplineDataAsset* Current = Asset.Get();
+    if (!Current || !HasSelectedPoint() || !NativePreview.IsValid()) { return FReply::Handled(); }
+    EndViewportPointDrag();
+    const FScopedTransaction Transaction(LOCTEXT("AlignAnchorOrientationsUndo", "Align Strand Anchor Orientations to Curve"));
+    Current->Modify();
+    bool bChanged = false;
+    for (int32 Index : GetSelectedIndices())
+    {
+        if (!Current->Points.IsValidIndex(Index)) { continue; }
+        const FVector Forward = NativePreview->GetDirectionAtSplinePoint(Index, ESplineCoordinateSpace::Local);
+        if (Forward.IsNearlyZero()) { continue; }
+        const FVector ReferenceUp = FMath::Abs(FVector::DotProduct(Forward, FVector::UpVector)) > 0.98
+            ? FVector::YAxisVector : FVector::UpVector;
+        const FRotator Rotation = FRotationMatrix::MakeFromXZ(Forward, ReferenceUp).Rotator();
+        bChanged |= StrandSplineEditOperations::SetSelectedOrientation(Current->Points,
+            TArray<int32>{Index}, Rotation);
+    }
+    if (bChanged)
+    {
+        Current->PostEditChange();
+        Current->MarkPackageDirty();
+        RebuildNativePreview();
+        if (DetailsView.IsValid()) { DetailsView->ForceRefresh(); }
+    }
+    return FReply::Handled();
 }
 
 TOptional<double> FStrandSplineAssetEditor::GetTangentCoordinate(int32 Axis) const
@@ -729,17 +1286,25 @@ void FStrandSplineAssetEditor::ApplyViewportPointDrag(const FVector& LocalDelta)
     }
 }
 
-void FStrandSplineAssetEditor::ApplyViewportRotation(int32 Axis, double Degrees)
+void FStrandSplineAssetEditor::ApplyViewportRotation(const FQuat& RotationDelta)
 {
     USplineDataAsset* Current = Asset.Get();
+    if (!Current || SelectedPointIndices.IsEmpty() || RotationDelta.ContainsNaN()) { return; }
+    const FQuat Delta = RotationDelta.GetNormalized();
+    if (Delta.IsIdentity(0.000001)) { return; }
     const int32 PlaneAxis = EditPlane == EStrandEditPlane::XY ? 2 :
         EditPlane == EStrandEditPlane::XZ ? 1 : EditPlane == EStrandEditPlane::YZ ? 0 : -1;
-    if (!Current || SelectedPointIndices.IsEmpty() ||
-        (PlaneAxis >= 0 && Axis != PlaneAxis) || !FMath::IsFinite(Degrees) ||
-        FMath::IsNearlyZero(Degrees, 0.000001)) { return; }
+    if (PlaneAxis >= 0)
+    {
+        FVector Axis = FVector::ZeroVector;
+        double Angle = 0.0;
+        Delta.ToAxisAndAngle(Axis, Angle);
+        // A constrained plane permits only rotations about its normal.
+        if (FMath::Abs(Axis[PlaneAxis]) < 0.999) { return; }
+    }
     if (!ActivePointDragTransaction) { BeginViewportPointDrag(); }
     if (!ActivePointDragTransaction) { return; }
-    if (StrandSplineEditOperations::RotateSelected(Current->Points, GetSelectedIndices(), Axis, Degrees))
+    if (StrandSplineEditOperations::RotateSelectedQuat(Current->Points, GetSelectedIndices(), Delta))
     {
         bPointChangedDuringDrag = true;
         Current->PostEditChange();
@@ -811,6 +1376,9 @@ void FStrandSplineAssetEditor::SyncViewportSelection()
     {
         PreviewWidget->SetSelectedPoints(GetSelectedIndices(), SelectedPointIndex);
         PreviewWidget->SetSelectedHandle(HasMultipleSelectedPoints() ? 0 : SelectedHandle);
+        const USplineDataAsset* Current = Asset.Get();
+        PreviewWidget->SetAuthoredAnchorRotation(Current && Current->Points.IsValidIndex(SelectedPointIndex)
+            ? Current->Points[SelectedPointIndex].LocalRotation : FRotator::ZeroRotator);
     }
 }
 
@@ -929,11 +1497,11 @@ FReply FStrandSplineAssetEditor::InvertPointSelection()
 TSharedRef<SWidget> FStrandSplineAssetEditor::MakeSelectionMenu()
 {
     FMenuBuilder Menu(true, nullptr);
-    Menu.AddMenuEntry(LOCTEXT("SelectAllMenu", "Select All (Ctrl+A)"), FText::GetEmpty(), FSlateIcon(),
+    Menu.AddMenuEntry(LOCTEXT("SelectAllMenu", "Select All"), LOCTEXT("SelectAllMenuHelp", "Select every spline anchor (Ctrl+A)."), FSlateIcon(),
         FUIAction(FExecuteAction::CreateLambda([this]() { SelectAllPoints(); })));
-    Menu.AddMenuEntry(LOCTEXT("InvertSelectMenu", "Invert Selection"), FText::GetEmpty(), FSlateIcon(),
+    Menu.AddMenuEntry(LOCTEXT("InvertSelectMenu", "Invert Selection"), LOCTEXT("InvertSelectMenuHelp", "Select unselected anchors and deselect currently selected anchors."), FSlateIcon(),
         FUIAction(FExecuteAction::CreateLambda([this]() { InvertPointSelection(); })));
-    Menu.AddMenuEntry(LOCTEXT("ClearSelectMenu", "Clear Selection (Esc)"), FText::GetEmpty(), FSlateIcon(),
+    Menu.AddMenuEntry(LOCTEXT("ClearSelectMenu", "Clear Selection"), LOCTEXT("ClearSelectMenuHelp", "Deselect all anchors (Esc)."), FSlateIcon(),
         FUIAction(FExecuteAction::CreateLambda([this]() { ClearPointSelection(); })));
     return Menu.MakeWidget();
 }
@@ -968,7 +1536,12 @@ void FStrandSplineAssetEditor::RebuildNativePreview()
     if (Asset.IsValid() && NativePreview.IsValid())
     {
         Asset->ApplyToSplineComponent(NativePreview.Get());
-        if (PreviewWidget.IsValid()) { PreviewWidget->SetSpline(NativePreview.Get()); }
+        if (PreviewWidget.IsValid())
+        {
+            PreviewWidget->SetSpline(NativePreview.Get());
+            PreviewWidget->SetAuthoredAnchorRotation(Asset->Points.IsValidIndex(SelectedPointIndex)
+                ? Asset->Points[SelectedPointIndex].LocalRotation : FRotator::ZeroRotator);
+        }
     }
 }
 
@@ -1061,6 +1634,96 @@ FReply FStrandSplineAssetEditor::NewSplineAsset()
     return FReply::Handled();
 }
 
+TSharedRef<SWidget> FStrandSplineAssetEditor::MakePrimitiveMenu()
+{
+    FMenuBuilder Menu(true, nullptr);
+    Menu.AddMenuEntry(LOCTEXT("CirclePrimitive", "Circle"),
+        LOCTEXT("CirclePrimitiveTip", "Create a closed 200 cm cubic circle with four editable Bezier anchors."),
+        FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this]() { CreatePrimitiveAsset(0); })));
+    Menu.AddMenuEntry(LOCTEXT("RectanglePrimitive", "Rectangle"),
+        LOCTEXT("RectanglePrimitiveTip", "Create a closed 200 x 150 cm rectangle with four linear anchors."),
+        FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this]() { CreatePrimitiveAsset(1); })));
+    Menu.AddMenuEntry(LOCTEXT("HelixPrimitive", "Helix"),
+        LOCTEXT("HelixPrimitiveTip", "Create a two-turn, 400 cm tall editable cubic helix."),
+        FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this]() { CreatePrimitiveAsset(2); })));
+    return Menu.MakeWidget();
+}
+
+// Asset > Primitives creates another document. This authoring-strip menu edits
+// the currently open document instead; its action is transactional and retains
+// the asset identity, placement defaults and external actor links.
+TSharedRef<SWidget> FStrandSplineAssetEditor::MakeReplacePrimitiveMenu()
+{
+    FMenuBuilder Menu(true, nullptr);
+    Menu.BeginSection("StrandReplacePrimitive", LOCTEXT("ReplacePrimitiveSection", "Replace Current Spline"));
+    Menu.AddMenuEntry(LOCTEXT("ReplaceWithCircle", "Circle"),
+        LOCTEXT("ReplaceWithCircleTip", "Replace this spline with a four-anchor cubic circle. Undo restores the previous geometry."),
+        FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this]() { ReplaceSplineWithPrimitive(0); })));
+    Menu.AddMenuEntry(LOCTEXT("ReplaceWithRectangle", "Rectangle"),
+        LOCTEXT("ReplaceWithRectangleTip", "Replace this spline with a four-corner linear rectangle. Undo restores the previous geometry."),
+        FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this]() { ReplaceSplineWithPrimitive(1); })));
+    Menu.AddMenuEntry(LOCTEXT("ReplaceWithHelix", "Helix"),
+        LOCTEXT("ReplaceWithHelixTip", "Replace this spline with a 25-anchor, two-turn 3D helix. Undo restores the previous geometry."),
+        FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this]() { ReplaceSplineWithPrimitive(2); })));
+    Menu.EndSection();
+    return Menu.MakeWidget();
+}
+
+void FStrandSplineAssetEditor::ReplaceSplineWithPrimitive(int32 Kind)
+{
+    USplineDataAsset* Current = Asset.Get();
+    if (!Current) { return; }
+    // Invalid kinds leave the asset untouched, without beginning Undo history.
+    if (Kind < 0 || Kind > 2) { return; }
+
+    EndViewportPointDrag();
+    const FScopedTransaction Transaction(LOCTEXT("ReplaceStrandWithPrimitive", "Replace Strand Spline With Primitive"));
+    Current->Modify();
+#if WITH_EDITORONLY_DATA
+    // The new authored geometry is no longer the imported curve. Preserve the
+    // source-file metadata under Undo, but prevent a later Reimport from
+    // silently replacing the new shape with the old external source.
+    Current->SourceCurveId.Reset();
+    Current->SourceImportFormat.Reset();
+    // Keep the import-data subobject intact so undo can restore the prior
+    // source link without depending on that subobject being transactional.
+#endif
+    if (!StrandSplineEditOperations::ReplacePrimitiveGeometry(*Current, Kind)) { return; }
+    // Replacing topology invalidates point/handle indices, even if counts match.
+    SelectedPointIndices.Reset();
+    SelectedPointIndex = INDEX_NONE;
+    SelectedHandle = 0;
+    CommitSplineEdit(INDEX_NONE);
+}
+
+void FStrandSplineAssetEditor::CreatePrimitiveAsset(int32 Kind)
+{
+    const USplineDataAsset* Current = Asset.Get();
+    if (!Current) { return; }
+    TArray<FSplinePointData> Points;
+    bool bClosed = false;
+    if (!StrandSplineEditOperations::MakePrimitive(Kind, Points, bClosed)) { return; }
+    const FString ParentFolder = FPackageName::GetLongPackagePath(Current->GetOutermost()->GetName());
+    const TCHAR* BaseName = Kind == 0 ? TEXT("StrandCircle") : Kind == 1 ? TEXT("StrandRectangle") : TEXT("StrandHelix");
+    IAssetTools& Tools = FAssetToolsModule::GetModule().Get();
+    FString PackageName, AssetName;
+    Tools.CreateUniqueAssetName(FPaths::Combine(ParentFolder, BaseName), TEXT(""), PackageName, AssetName);
+    USplineDataAsset* Created = Cast<USplineDataAsset>(Tools.CreateAsset(AssetName, ParentFolder,
+        USplineDataAsset::StaticClass(), NewObject<USplineDataAssetFactory>()));
+    if (!Created) { return; }
+    Created->Modify();
+    Created->Points = MoveTemp(Points);
+    Created->bIsClosedLoop = bClosed;
+    Created->MarkPackageDirty();
+    if (GEditor)
+    {
+        if (UAssetEditorSubsystem* Editors = GEditor->GetEditorSubsystem<UAssetEditorSubsystem>())
+        {
+            Editors->OpenEditorForAsset(Created);
+        }
+    }
+}
+
 FReply FStrandSplineAssetEditor::ExportAlembic()
 {
     StrandSplineExport::ExportInteractive(Asset.Get(), true);
@@ -1084,11 +1747,15 @@ FReply FStrandSplineAssetEditor::AddPointAfterSelection()
     int32 InsertIndex = INDEX_NONE;
     if (bAppend)
     {
-        const FVector Direction = Index > 0
-            ? (Current->Points[Index].LocalPosition - Current->Points[Index - 1].LocalPosition) * 0.5
-            : FVector(100.0, 0.0, 0.0);
-        InsertIndex = StrandSplineEditOperations::AppendPenPoint(Current->Points,
-            Current->Points[Index].LocalPosition + Direction, false, false);
+        if (Index > 0 && StrandSplineEditOperations::ExtendOpenEndpoint(Current->Points, NativePreview.Get(), false))
+        {
+            InsertIndex = Current->Points.Num() - 1;
+        }
+        else if (Index == 0)
+        {
+            InsertIndex = StrandSplineEditOperations::AppendPenPoint(Current->Points,
+                Current->Points[Index].LocalPosition + FVector(100.0, 0.0, 0.0), false, false);
+        }
     }
     else
     {
@@ -1097,6 +1764,202 @@ FReply FStrandSplineAssetEditor::AddPointAfterSelection()
     }
     if (InsertIndex != INDEX_NONE) { CommitSplineEdit(InsertIndex); }
     return FReply::Handled();
+}
+
+void FStrandSplineAssetEditor::InsertPointOnViewportSegment(int32 Segment, double Alpha)
+{
+    USplineDataAsset* Current = Asset.Get();
+    if (!Current || !NativePreview.IsValid() || Current->Points.Num() >= 100000) { return; }
+    const int32 Spans = Current->Points.Num() - (Current->bIsClosedLoop ? 0 : 1);
+    if (Segment < 0 || Segment >= Spans || !FMath::IsFinite(Alpha)) { return; }
+    EndViewportPointDrag();
+    const FScopedTransaction Transaction(LOCTEXT("ViewportInsertSegmentUndo", "Insert Strand Spline Point On Curve"));
+    Current->Modify();
+    const int32 NewIndex = StrandSplineEditOperations::InsertOnSegment(Current->Points,
+        Current->bIsClosedLoop, NativePreview.Get(), Segment, FMath::Clamp(Alpha, 0.002, 0.998));
+    if (NewIndex != INDEX_NONE) { CommitSplineEdit(NewIndex); }
+}
+
+// Direct curve shaping: Ctrl+drag acts on the selected segment's two Bezier
+// derivatives, not on its anchor positions. The initial state is immutable for
+// the duration of a drag, so pointer movement never accumulates drift.
+void FStrandSplineAssetEditor::BeginViewportSegmentBend(int32 Segment, double Alpha)
+{
+    EndViewportPointDrag();
+    EndViewportSegmentBend();
+    const USplineDataAsset* Current = Asset.Get();
+    if (!Current || !NativePreview.IsValid()) { return; }
+    const int32 SpanCount = Current->Points.Num() - (Current->bIsClosedLoop ? 0 : 1);
+    if (Segment < 0 || Segment >= SpanCount || !FMath::IsFinite(Alpha) ||
+        Alpha < 0.1 || Alpha > 0.9) { return; }
+    BendSegmentIndex = Segment;
+    BendSegmentAlpha = Alpha;
+    BendBaselinePoints = Current->Points;
+    // Capture evaluated native tangents before any automatic point converts to
+    // manual derivatives. This is important for Alembic and native Curve points.
+    const int32 Next = (Segment + 1) % Current->Points.Num();
+    BendEvaluatedStart = NativePreview->GetSplinePointAt(Segment, ESplineCoordinateSpace::Local);
+    BendEvaluatedEnd = NativePreview->GetSplinePointAt(Next, ESplineCoordinateSpace::Local);
+    bSegmentBendChanged = false;
+}
+
+void FStrandSplineAssetEditor::UpdateViewportSegmentBend(const FVector& InDelta)
+{
+    USplineDataAsset* Current = Asset.Get();
+    if (!Current || BendSegmentIndex == INDEX_NONE || InDelta.ContainsNaN()) { return; }
+    FVector Delta = InDelta;
+    const int32 LockedAxis = EditPlane == EStrandEditPlane::XY ? 2 :
+        EditPlane == EStrandEditPlane::XZ ? 1 : EditPlane == EStrandEditPlane::YZ ? 0 : -1;
+    if (LockedAxis >= 0) { Delta[LockedAxis] = 0.0; }
+    if (Delta.IsNearlyZero())
+    {
+        if (bSegmentBendChanged)
+        {
+            Current->Points = BendBaselinePoints;
+            Current->PostEditChange();
+            RebuildNativePreview();
+        }
+        return;
+    }
+    TArray<FSplinePointData> Result = BendBaselinePoints;
+    if (!StrandSplineEditOperations::BendSegment(Result, Current->bIsClosedLoop,
+        BendSegmentIndex, BendSegmentAlpha, Delta, BendEvaluatedStart, BendEvaluatedEnd)) { return; }
+    if (!ActiveSegmentBendTransaction)
+    {
+        ActiveSegmentBendTransaction = MakeUnique<FScopedTransaction>(
+            LOCTEXT("BendSegmentUndo", "Bend Strand Spline Segment"));
+        Current->Modify();
+    }
+    Current->Points = MoveTemp(Result);
+    bSegmentBendChanged = true;
+    Current->PostEditChange();
+    RebuildNativePreview();
+}
+
+void FStrandSplineAssetEditor::EndViewportSegmentBend()
+{
+    if (ActiveSegmentBendTransaction)
+    {
+        if (bSegmentBendChanged && Asset.IsValid())
+        {
+            Asset->MarkPackageDirty();
+            if (DetailsView.IsValid()) { DetailsView->ForceRefresh(); }
+        }
+        ActiveSegmentBendTransaction.Reset();
+    }
+    BendSegmentIndex = INDEX_NONE;
+    BendSegmentAlpha = 0.5;
+    BendBaselinePoints.Reset();
+    bSegmentBendChanged = false;
+}
+
+// The native viewport retains RMB-drag flight navigation. Only a stationary
+// RMB click on an anchor or curve segment requests this contextual menu.
+TSharedRef<SWidget> FStrandSplineAssetEditor::MakeViewportContextMenu(int32 Point, int32 Segment, double Alpha)
+{
+    if (Point != INDEX_NONE && !SelectedPointIndices.Contains(Point))
+    {
+        SelectPoint(Point);
+    }
+    FMenuBuilder Menu(true, nullptr);
+    if (Point != INDEX_NONE)
+    {
+        Menu.BeginSection(TEXT("StrandAnchor"), LOCTEXT("ContextAnchor", "Spline Anchor"));
+        Menu.AddMenuEntry(LOCTEXT("ContextInsertAfter", "Insert Point After"),
+            LOCTEXT("ContextInsertAfterHelp", "Add an anchor after the selected point, preserving the current segment when possible."),
+            FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.Plus"),
+            FUIAction(FExecuteAction::CreateLambda([this]() { AddPointAfterSelection(); })));
+        Menu.AddMenuEntry(LOCTEXT("ContextDelete", "Delete Selected Anchors"),
+            LOCTEXT("ContextDeleteHelp", "Remove selected anchors in one undo transaction."),
+            FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.Delete"),
+            FUIAction(FExecuteAction::CreateLambda([this]() { RemoveSelectedPoint(); }),
+                FCanExecuteAction::CreateSP(this, &FStrandSplineAssetEditor::CanDeleteSelection)));
+        Menu.AddMenuSeparator();
+        Menu.AddSubMenu(LOCTEXT("ContextBezier", "Bézier Handle Mode"),
+            LOCTEXT("ContextBezierHelp", "Change how the selected anchor handles behave."),
+            FNewMenuDelegate::CreateLambda([this](FMenuBuilder& Sub)
+            {
+                struct FEntry { EStrandBezierHandleMode Mode; const TCHAR* Name; };
+                const FEntry Options[] = {
+                    {EStrandBezierHandleMode::Free, TEXT("Free")},
+                    {EStrandBezierHandleMode::Aligned, TEXT("Aligned")},
+                    {EStrandBezierHandleMode::Mirrored, TEXT("Mirrored")},
+                    {EStrandBezierHandleMode::Auto, TEXT("Auto")},
+                    {EStrandBezierHandleMode::Corner, TEXT("Corner")}
+                };
+                for (const FEntry& Option : Options)
+                {
+                    Sub.AddMenuEntry(FText::FromString(Option.Name), LOCTEXT("ContextHandleModeHelp", "Change selected anchor Bezier tangent constraint. This setting persists in the asset."), FSlateIcon(),
+                        FUIAction(FExecuteAction::CreateLambda([this, Mode=Option.Mode]() { SetSelectedHandleMode(Mode); })));
+                }
+            }));
+        Menu.AddSubMenu(LOCTEXT("ContextInterp", "Interpolation"),
+            LOCTEXT("ContextInterpHelp", "Native spline interpolation for selected points."),
+            FNewMenuDelegate::CreateLambda([this](FMenuBuilder& Sub)
+            {
+                Sub.AddMenuEntry(LOCTEXT("ContextSmooth", "Curve (Auto)"), LOCTEXT("ContextSmoothHelp", "Use native Unreal automatic curve tangents for selected anchors."), FSlateIcon(),
+                    FUIAction(FExecuteAction::CreateLambda([this]() { SetSelectedPointType(ESplinePointType::Curve); })));
+                Sub.AddMenuEntry(LOCTEXT("ContextCustom", "Curve (Custom Tangents)"), LOCTEXT("ContextCustomHelp", "Use individually editable Bezier tangents for selected anchors."), FSlateIcon(),
+                    FUIAction(FExecuteAction::CreateLambda([this]() { SetSelectedPointType(ESplinePointType::CurveCustomTangent); })));
+                Sub.AddMenuEntry(LOCTEXT("ContextLinear", "Linear"), LOCTEXT("ContextLinearHelp", "Create straight interpolation through selected anchors."), FSlateIcon(),
+                    FUIAction(FExecuteAction::CreateLambda([this]() { SetSelectedPointType(ESplinePointType::Linear); })));
+            }));
+        Menu.AddMenuSeparator();
+        Menu.AddMenuEntry(LOCTEXT("ContextAlignCurve", "Align Orientation to Curve"),
+            LOCTEXT("ContextAlignCurveHelp", "Align authored rotation to the spline's forward direction, without changing geometry."),
+            FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this]() { AlignSelectedOrientationsToCurve(); })));
+        Menu.AddMenuEntry(LOCTEXT("ContextResetRot", "Reset Authored Orientation"),
+            LOCTEXT("ContextResetRotHelp", "Clear authored pitch/yaw/roll without changing the spline."),
+            FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this]() { ResetSelectedOrientations(); })));
+        Menu.EndSection();
+    }
+    else if (Segment != INDEX_NONE)
+    {
+        Menu.BeginSection(TEXT("StrandSegment"), LOCTEXT("ContextSegment", "Spline Segment"));
+        Menu.AddMenuEntry(LOCTEXT("ContextInsertHere", "Insert Anchor Here"),
+            LOCTEXT("ContextInsertHereHelp", "Shape-preserving insertion at the chosen position on the segment."),
+            FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.Plus"),
+            FUIAction(FExecuteAction::CreateLambda([this, Segment, Alpha]()
+            { InsertPointOnViewportSegment(Segment, Alpha); })));
+        // Deterministic subdivisions for repeatable technical-art workflows.
+        // Fractions are native spline-input-key fractions, not arc-length percentages.
+        Menu.AddSubMenu(LOCTEXT("ContextInsertFraction", "Insert at Segment Fraction"),
+            LOCTEXT("ContextInsertFractionHelp", "Insert an anchor at an exact segment parameter (25%, 50%, or 75%). Preserves the original cubic shape; Undo supported."),
+            FNewMenuDelegate::CreateLambda([this, Segment](FMenuBuilder& Sub)
+            {
+                for (const int32 Percent : { 25, 50, 75 })
+                {
+                    const double Alpha = static_cast<double>(Percent) / 100.0;
+                    Sub.AddMenuEntry(FText::FromString(FString::Printf(TEXT("%d%%"), Percent)),
+                        LOCTEXT("ContextFractionTip", "Split this native curve segment at the chosen parameter while preserving its geometry. This is parameter fraction, not distance fraction."),
+                        FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this, Segment, Alpha]()
+                        { InsertPointOnViewportSegment(Segment, Alpha); })));
+                }
+            }));
+        Menu.AddMenuEntry(LOCTEXT("ContextSelectEndpoints", "Select Segment Endpoints"),
+            LOCTEXT("ContextEndpointsHelp", "Select both anchors defining this curve segment."),
+            FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this, Segment]()
+            {
+                if (const USplineDataAsset* Current = Asset.Get())
+                {
+                    if (Current->Points.Num() < 2) { return; }
+                    SelectPoint(Segment);
+                    SelectPoint((Segment + 1) % Current->Points.Num(), false, true);
+                }
+            })));
+        Menu.EndSection();
+    }
+    return Menu.MakeWidget();
+}
+
+void FStrandSplineAssetEditor::NudgeSelectedPoints(const FVector& Delta)
+{
+    if (!HasSelectedPoint() || Delta.IsNearlyZero()) { return; }
+    // A single key press = a single native Undo step. Reuses the same geometry
+    // editing pipeline and active 2D plane constraints as viewport dragging.
+    EndViewportPointDrag();
+    ApplyViewportPointDrag(Delta);
+    EndViewportPointDrag();
 }
 
 FReply FStrandSplineAssetEditor::RemoveSelectedPoint()
@@ -1168,7 +2031,7 @@ TSharedRef<SWidget> FStrandSplineAssetEditor::MakePointTypeMenu()
     FMenuBuilder Menu(true, nullptr);
     auto Add = [this, &Menu](ESplinePointType::Type Mode, const FText& Label)
     {
-        Menu.AddMenuEntry(Label, FText::GetEmpty(), FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this, Mode]()
+        Menu.AddMenuEntry(Label, LOCTEXT("PointTypeChoiceHelp", "Set selected anchors to this native Unreal spline interpolation type."), FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this, Mode]()
         {
             SetSelectedPointType(Mode);
         })));
@@ -1379,15 +2242,10 @@ FReply FStrandSplineAssetEditor::ExtendStart()
     EndViewportPointDrag();
     const FScopedTransaction Transaction(LOCTEXT("ExtendStartUndo", "Extend Strand Spline Start"));
     Current->Modify();
-    FSplinePointData First = Current->Points[0];
-    const FVector Direction = First.LocalPosition - Current->Points[1].LocalPosition;
-    First.LocalPosition += Direction * 0.5;
-    First.PointType = ESplinePointType::Curve;
-    First.HandleMode = EStrandBezierHandleMode::Auto;
-    First.ArriveTangent = FVector::ZeroVector;
-    First.LeaveTangent = FVector::ZeroVector;
-    Current->Points.Insert(First, 0);
-    CommitSplineEdit(0);
+    if (StrandSplineEditOperations::ExtendOpenEndpoint(Current->Points, NativePreview.Get(), true))
+    {
+        CommitSplineEdit(0);
+    }
     return FReply::Handled();
 }
 
@@ -1603,6 +2461,32 @@ FReply FStrandSplineAssetEditor::SubdivideSpline()
     return FReply::Handled();
 }
 
+FReply FStrandSplineAssetEditor::ResampleSpline(int32 TargetPoints)
+{
+    USplineDataAsset* Current = Asset.Get();
+    if (!Current || !NativePreview.IsValid() || Current->Points.Num() < 2 ||
+        TargetPoints < 2 || TargetPoints > 4096)
+    {
+        return FReply::Handled();
+    }
+    TArray<FSplinePointData> NewPoints;
+    if (!StrandSplineEditOperations::ResampleByArcLength(NativePreview.Get(),
+        Current->Points, Current->bIsClosedLoop, TargetPoints, NewPoints))
+    {
+        return FReply::Handled();
+    }
+    EndViewportPointDrag();
+    const FScopedTransaction Transaction(LOCTEXT("ResampleSplineUndo", "Resample Strand Spline"));
+    Current->Modify();
+    Current->Points = MoveTemp(NewPoints);
+    CommitSplineEdit(INDEX_NONE);
+    ResampleTargetCount = TargetPoints;
+    GConfig->SetInt(TEXT("StrandSplineEditor"), TEXT("LastResamplePointCount"),
+        ResampleTargetCount, GEditorPerProjectIni);
+    GConfig->Flush(false, GEditorPerProjectIni);
+    return FReply::Handled();
+}
+
 FReply FStrandSplineAssetEditor::LinearizeSpline()
 {
     USplineDataAsset* Current = Asset.Get();
@@ -1659,6 +2543,23 @@ TSharedRef<SWidget> FStrandSplineAssetEditor::MakeSplineToolsMenu()
     // active editing modes remain visible on the authoring strip; these are
     // less frequent operations grouped by what the designer is doing.
     FMenuBuilder Menu(true, nullptr);
+    Menu.AddSubMenu(LOCTEXT("ResampleMenu", "Resample by Arc Length"),
+        LOCTEXT("ResampleMenuTip", "Enter an exact target count of 2 to 4096 equally spaced spline anchors. The count is remembered per user, starting at 16. This approximates the source shape and is undoable."),
+        FNewMenuDelegate::CreateLambda([this](FMenuBuilder& Samples)
+        {
+            Samples.AddWidget(
+                SNew(SBox).WidthOverride(190.0f)
+                [SNew(SNumericEntryBox<int32>)
+                    .Value_Lambda([this]() { return TOptional<int32>(ResampleTargetCount); })
+                    .MinValue(2).MaxValue(4096)
+                    .AllowSpin(false)
+                    .ToolTipText(LOCTEXT("ResampleExactCountTip", "Exact target control point count, 2 to 4096. Last successfully applied count is remembered for this editor user."))
+                    .OnValueCommitted_Lambda([this](int32 Value, ETextCommit::Type) { ResampleTargetCount = FMath::Clamp(Value, 2, 4096); })],
+                LOCTEXT("ResamplePointsLabel", "Target points"), true);
+            Samples.AddMenuEntry(LOCTEXT("ResampleApply", "Apply Resampling"),
+                LOCTEXT("ResampleApplyTip", "Rebuild the current spline with the specified point count. Undo restores the original point geometry."),
+                FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this]() { ResampleSpline(ResampleTargetCount); })));
+        }));
     auto AddAction = [](FMenuBuilder& Target, const FText& Label, const FText& Tip,
         TFunction<void()> Action)
     {
@@ -1678,7 +2579,7 @@ TSharedRef<SWidget> FStrandSplineAssetEditor::MakeSplineToolsMenu()
                     {
                         const FText Label = I == 0 ? LOCTEXT("AlignX", "Align X")
                             : I == 1 ? LOCTEXT("AlignY", "Align Y") : LOCTEXT("AlignZ", "Align Z");
-                        Axis.AddMenuEntry(Label, FText::GetEmpty(), FSlateIcon(),
+                        Axis.AddMenuEntry(Label, LOCTEXT("AxisEditingTip", "Apply this operation to selected anchors along the named asset-space axis. Undoable."), FSlateIcon(),
                             FUIAction(FExecuteAction::CreateLambda([this, I]() { AlignSelection(I); })));
                     }
                 }));
@@ -1690,7 +2591,7 @@ TSharedRef<SWidget> FStrandSplineAssetEditor::MakeSplineToolsMenu()
                     {
                         const FText Label = I == 0 ? LOCTEXT("DistributeX", "Distribute X")
                             : I == 1 ? LOCTEXT("DistributeY", "Distribute Y") : LOCTEXT("DistributeZ", "Distribute Z");
-                        Axis.AddMenuEntry(Label, FText::GetEmpty(), FSlateIcon(),
+                        Axis.AddMenuEntry(Label, LOCTEXT("AxisEditingTip", "Apply this operation to selected anchors along the named asset-space axis. Undoable."), FSlateIcon(),
                             FUIAction(FExecuteAction::CreateLambda([this, I]() { DistributeSelection(I); })));
                     }
                 }));
@@ -1701,7 +2602,7 @@ TSharedRef<SWidget> FStrandSplineAssetEditor::MakeSplineToolsMenu()
                     for (const double Step : { 1.0, 10.0, 100.0 })
                     {
                         const FText Label = FText::FromString(FString::Printf(TEXT("%.0f cm"), Step));
-                        Steps.AddMenuEntry(Label, FText::GetEmpty(), FSlateIcon(),
+                        Steps.AddMenuEntry(Label, LOCTEXT("SnapStepsTip", "Round selected anchor positions to this centimeter step. Undoable."), FSlateIcon(),
                             FUIAction(FExecuteAction::CreateLambda([this, Step]() { SnapSelectedPoint(Step); })));
                     }
                 }));
@@ -1763,7 +2664,7 @@ TSharedRef<SWidget> FStrandSplineAssetEditor::MakeSplineToolsMenu()
                     {
                         const FText Label = Axis == 0 ? LOCTEXT("MirrorX", "Mirror X")
                             : Axis == 1 ? LOCTEXT("MirrorY", "Mirror Y") : LOCTEXT("MirrorZ", "Mirror Z");
-                        Axes.AddMenuEntry(Label, FText::GetEmpty(), FSlateIcon(),
+                        Axes.AddMenuEntry(Label, LOCTEXT("AxisShapeTip", "Apply this modeling operation to the entire spline in asset space. Undoable."), FSlateIcon(),
                             FUIAction(FExecuteAction::CreateLambda([this, Axis]() { MirrorSpline(Axis); })));
                     }
                 }));
@@ -1776,7 +2677,7 @@ TSharedRef<SWidget> FStrandSplineAssetEditor::MakeSplineToolsMenu()
                         const FText Label = Axis == 2 ? LOCTEXT("FlattenXY", "Top (XY), discard Z")
                             : Axis == 1 ? LOCTEXT("FlattenXZ", "Front (XZ), discard Y")
                             : LOCTEXT("FlattenYZ", "Side (YZ), discard X");
-                        Axes.AddMenuEntry(Label, FText::GetEmpty(), FSlateIcon(),
+                        Axes.AddMenuEntry(Label, LOCTEXT("AxisShapeTip", "Apply this modeling operation to the entire spline in asset space. Undoable."), FSlateIcon(),
                             FUIAction(FExecuteAction::CreateLambda([this, Axis]() { FlattenSpline(Axis); })));
                     }
                 }));
@@ -1796,6 +2697,13 @@ void FStrandSplineAssetEditor::SetWidgetMode(int32 Mode)
         if (PreviewWidget.IsValid()) { PreviewWidget->SetSelectedHandle(0); }
     }
     if (PreviewWidget.IsValid()) { PreviewWidget->SetWidgetMode(ActiveWidgetMode); }
+}
+
+void FStrandSplineAssetEditor::SetWidgetLocal(bool bLocal)
+{
+    EndViewportPointDrag();
+    bWidgetLocal = bLocal;
+    if (PreviewWidget.IsValid()) { PreviewWidget->SetWidgetLocal(bLocal); }
 }
 
 void FStrandSplineAssetEditor::SetMarqueeMode(bool bEnabled)
@@ -1831,7 +2739,7 @@ TSharedRef<SWidget> FStrandSplineAssetEditor::MakePenSnapMenu()
     FMenuBuilder Menu(true, nullptr);
     auto Add = [this, &Menu](double Step, const FText& Label)
     {
-        Menu.AddMenuEntry(Label, FText::GetEmpty(), FSlateIcon(),
+        Menu.AddMenuEntry(Label, LOCTEXT("PenSnapChoiceTip", "Snap Pen-created anchors and handles to the specified centimeter grid. Off preserves freehand placement."), FSlateIcon(),
             FUIAction(FExecuteAction::CreateLambda([this, Step]() { SetPenSnapStep(Step); })));
     };
     Add(0.0, LOCTEXT("PenSnapOff", "No Snapping"));
@@ -1850,6 +2758,11 @@ FText FStrandSplineAssetEditor::GetPenSnapLabel() const
 
 FText FStrandSplineAssetEditor::GetEditorHint() const
 {
+    if (PreviewWidget.IsValid() && !bMarqueeMode && !bPenMode)
+    {
+        const FText HoverHint = PreviewWidget->GetInteractionHint();
+        if (!HoverHint.IsEmpty()) { return HoverHint; }
+    }
     if (bMarqueeMode)
     {
         return LOCTEXT("MarqueeStatus", "Box Select  |  Drag rectangle to select anchors  |  Shift: add  |  Ctrl: toggle  |  Alt+LMB: orbit");
@@ -1870,18 +2783,20 @@ FText FStrandSplineAssetEditor::GetEditorHint() const
         if (ActiveWidgetMode == 1)
         {
             return HasMultipleSelectedPoints()
-                ? LOCTEXT("RotateStatus", "ROTATE  |  Native Unreal rotation widget  |  Group pivot: selection center  |  Space: Scale  |  RMB+WASD: fly")
-                : LOCTEXT("RotateSingleStatus", "ROTATE  |  Rotate selected anchor tangents/orientation  |  Space: Scale  |  RMB+WASD: fly");
+                ? LOCTEXT("RotateStatus", "ROTATE  |  Native Unreal rotation widget  |  Group pivot: selection center  |  Space: Scale  |  Shift+click curve: insert  |  RMB+WASD: fly")
+                : LOCTEXT("RotateSingleStatus", "ROTATE  |  Rotate selected anchor tangents/orientation  |  Space: Scale  |  Shift+click curve: insert  |  RMB+WASD: fly");
         }
         if (ActiveWidgetMode == 2)
         {
             return HasMultipleSelectedPoints()
-                ? LOCTEXT("ScaleStatus", "UNIFORM SCALE  |  Native Unreal scale widget  |  Group pivot: selection center  |  Space: Move  |  RMB+WASD: fly")
-                : LOCTEXT("ScaleSingleStatus", "UNIFORM SCALE  |  Scale selected anchor's tangents  |  Space: Move  |  RMB+WASD: fly");
+                ? LOCTEXT("ScaleStatus", "UNIFORM SCALE  |  Native Unreal scale widget  |  Group pivot: selection center  |  Space: Move  |  Shift+click curve: insert  |  RMB+WASD: fly")
+                : LOCTEXT("ScaleSingleStatus", "UNIFORM SCALE  |  Scale selected anchor's tangents  |  Space: Move  |  Shift+click curve: insert  |  RMB+WASD: fly");
         }
-        return LOCTEXT("MoveStatus", "MOVE  |  Native Unreal XYZ widget  |  Space: Rotate  |  RMB+WASD: fly  |  F: frame  |  Delete: remove");
+        return bWidgetLocal
+            ? LOCTEXT("MoveLocalStatus", "MOVE / LOCAL  |  X follows outgoing tangent  |  Space: Rotate  |  Shift-hover: insert preview  |  RMB-click: actions")
+            : LOCTEXT("MoveStatus", "MOVE / WORLD  |  Asset axes  |  Hover a widget axis to highlight it  |  Ctrl+Shift+I/J/K/L/U/O: 1 cm nudge  |  RMB-click: actions");
     }
-    return LOCTEXT("SelectModeStatus", "Select anchors to transform  |  Shift: range  Ctrl: toggle  |  Space: cycle Move/Rotate/Scale  |  P: Pen  B: Box Select");
+    return LOCTEXT("SelectModeStatus", "SELECT  |  Hover: contextual cursor  |  Shift-hover curve: insertion preview  |  RMB click: actions  |  Ctrl+Shift+I/J/K/L/U/O: nudge XYZ");
 }
 
 FReply FStrandSplineAssetEditor::ClearSpline()

@@ -9,6 +9,8 @@
 #include "SplineDataAsset.h"
 
 class IDetailsView;
+class UToolMenu;
+struct FToolMenuContext;
 class USplineDataAsset;
 class USplineComponent;
 class SDockTab;
@@ -40,6 +42,8 @@ public:
     virtual FLinearColor GetWorldCentricTabColorScale() const override { return FLinearColor(0.0f, 0.706f, 0.655f); }
     virtual void RegisterTabSpawners(const TSharedRef<FTabManager>& InTabManager) override;
     virtual void UnregisterTabSpawners(const TSharedRef<FTabManager>& InTabManager) override;
+    virtual UToolMenu* GenerateCommonActionsToolbar(FToolMenuContext& MenuContext) override;
+    virtual void PostRegenerateMenusAndToolbars() override;
 
 private:
     TWeakObjectPtr<USplineDataAsset> Asset;
@@ -50,11 +54,21 @@ private:
     TSet<int32> SelectedPointIndices;
     TUniquePtr<FScopedTransaction> ActivePointDragTransaction;
     bool bPointChangedDuringDrag = false;
+    TUniquePtr<FScopedTransaction> ActiveSegmentBendTransaction;
+    TArray<FSplinePointData> BendBaselinePoints;
+    FSplinePoint BendEvaluatedStart;
+    FSplinePoint BendEvaluatedEnd;
+    int32 BendSegmentIndex = INDEX_NONE;
+    double BendSegmentAlpha = 0.5;
+    bool bSegmentBendChanged = false;
     EStrandEditPlane EditPlane = EStrandEditPlane::Free3D;
     int32 SelectedHandle = 0; // 0 anchor, 1 incoming, 2 outgoing.
     bool bPenMode = false;
     bool bMarqueeMode = false;
     int32 ActiveWidgetMode = 0; // Move, Rotate, Scale: native Unreal viewport widgets.
+    bool bWidgetLocal = false; // Preview/asset axes vs primary point's local orientation.
+    bool bRelativePositionEntry = false; // Absolute target vs additive numeric offset.
+    int32 ResampleTargetCount = 16; // Per-user remembered target count. Shared spline asset stays clean.
     double PenSnapStep = 0.0;
     TUniquePtr<FScopedTransaction> ActivePenTransaction;
     TArray<FSplinePointData> PenPreviousPoints;
@@ -66,6 +80,12 @@ private:
 
     TSharedRef<SDockTab> SpawnPreviewTab(const FSpawnTabArgs& Args);
     TSharedRef<SDockTab> SpawnDetailsTab(const FSpawnTabArgs& Args);
+    TSharedRef<SDockTab> SpawnSourceTab(const FSpawnTabArgs& Args);
+    TSharedRef<SWidget> BuildAssetActionToolbar();
+    TSharedRef<SWidget> MakePrimitiveMenu();
+    TSharedRef<SWidget> MakeReplacePrimitiveMenu();
+    void ReplaceSplineWithPrimitive(int32 Kind);
+    void CreatePrimitiveAsset(int32 Kind);
     void RebuildNativePreview();
     void OnPropertyChanged(const FPropertyChangedEvent& Event);
     bool CanReimport() const;
@@ -74,6 +94,12 @@ private:
     FReply ExportAlembic();
     FReply ExportSvg();
     FReply AddPointAfterSelection();
+    void InsertPointOnViewportSegment(int32 Segment, double Alpha);
+    void BeginViewportSegmentBend(int32 Segment, double Alpha);
+    void UpdateViewportSegmentBend(const FVector& Delta);
+    void EndViewportSegmentBend();
+    TSharedRef<SWidget> MakeViewportContextMenu(int32 Point, int32 Segment, double Alpha);
+    void NudgeSelectedPoints(const FVector& Delta);
     FReply RemoveSelectedPoint();
     FReply AlignSelection(int32 Axis);
     FReply RotateSelection(int32 Axis, double Degrees);
@@ -96,8 +122,9 @@ private:
     void SetPenMode(bool bEnabled);
     void SetMarqueeMode(bool bEnabled);
     void SetWidgetMode(int32 Mode);
+    void SetWidgetLocal(bool bLocal);
     void SelectMarqueePoints(const TArray<int32>& Indices, bool bAdd, bool bToggle);
-    void ApplyViewportRotation(int32 Axis, double Degrees);
+    void ApplyViewportRotation(const FQuat& RotationDelta);
     void ApplyViewportScale(double Factor);
     void SetPenSnapStep(double Step);
     TSharedRef<SWidget> MakePenSnapMenu();
@@ -112,6 +139,7 @@ private:
     FReply SetSelectedAsFirst();
     FReply SnapSelectedPoint(double Step);
     FReply SubdivideSpline();
+    FReply ResampleSpline(int32 TargetPoints);
     FReply LinearizeSpline();
     FReply SmoothSpline();
     FReply MirrorSpline(int32 Axis);
@@ -140,6 +168,10 @@ private:
     FText GetSelectedPointLabel() const;
     TOptional<double> GetPointCoordinate(int32 Axis) const;
     void SetPointCoordinate(double Value, int32 Axis);
+    TOptional<double> GetAnchorRotationCoordinate(int32 Axis) const;
+    void SetAnchorRotationCoordinate(double Value, int32 Axis);
+    FReply ResetSelectedOrientations();
+    FReply AlignSelectedOrientationsToCurve();
     TOptional<double> GetTangentCoordinate(int32 Axis) const;
     void SetTangentCoordinate(double Value, int32 Axis);
     void SelectPoint(int32 Index, bool bRange = false, bool bToggle = false);

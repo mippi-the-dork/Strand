@@ -106,6 +106,194 @@ namespace StrandSplineEditOperations
             !OldLeave.Equals(Point.LeaveTangent, 0.000001);
     }
 
+    // Edit the interior of a Hermite span without moving either endpoint.
+    // For fixed endpoints, the only free terms are outgoing M0 and incoming M1.
+    // Their Hermite basis weights at t are h10 and h11. Use a least-norm
+    // derivative update so the displacement at t exactly matches Delta.
+    // Automatic/linear endpoints become custom while retaining all tangents
+    // on neighboring segments, preventing an unwanted shape jump elsewhere.
+    inline bool BendSegment(TArray<FSplinePointData>& Points, bool bClosed,
+        int32 Segment, double Alpha, const FVector& Delta,
+        const FSplinePoint& EvaluatedStart, const FSplinePoint& EvaluatedEnd)
+    {
+        const int32 Count = Points.Num();
+        if (Count < 2 || Segment < 0 || Segment >= Count - (bClosed ? 0 : 1) ||
+            !FMath::IsFinite(Alpha) || Alpha < 0.1 || Alpha > 0.9 ||
+            Delta.ContainsNaN() || Delta.IsNearlyZero()) { return false; }
+        const int32 Next = (Segment + 1) % Count;
+        FSplinePointData& A = Points[Segment];
+        FSplinePointData& B = Points[Next];
+        const FVector Chord = B.LocalPosition - A.LocalPosition;
+        if (EvaluatedStart.Type == ESplinePointType::Constant) { return false; }
+        // A linear segment has a Hermite representation using this chord for
+        // both tangent vectors; make that the baseline before bending it.
+        const bool bLinear = EvaluatedStart.Type == ESplinePointType::Linear;
+        A.ArriveTangent = EvaluatedStart.ArriveTangent;
+        A.LeaveTangent = bLinear ? Chord : EvaluatedStart.LeaveTangent;
+        B.ArriveTangent = bLinear ? Chord : EvaluatedEnd.ArriveTangent;
+        B.LeaveTangent = EvaluatedEnd.LeaveTangent;
+        const double T = Alpha;
+        const double H10 = T * (1.0 - T) * (1.0 - T);
+        const double H11 = -T * T * (1.0 - T);
+        const double NormSq = H10 * H10 + H11 * H11;
+        if (NormSq <= UE_DOUBLE_SMALL_NUMBER) { return false; }
+        A.LeaveTangent += Delta * (H10 / NormSq);
+        B.ArriveTangent += Delta * (H11 / NormSq);
+        A.PointType = B.PointType = ESplinePointType::CurveCustomTangent;
+        A.HandleMode = B.HandleMode = EStrandBezierHandleMode::Free;
+        return !A.LeaveTangent.ContainsNaN() && !B.ArriveTangent.ContainsNaN();
+    }
+
+    // Standard editable spline primitives, authored directly as native
+    // spline point data. Do not replace them with sampled polylines.
+    inline bool MakePrimitive(int32 Kind, TArray<FSplinePointData>& OutPoints, bool& bOutClosed)
+    {
+        if (Kind < 0 || Kind > 2) { return false; }
+        TArray<FSplinePointData> Result;
+        const int32 Count = Kind == 2 ? 25 : 4;
+        Result.Reserve(Count);
+        constexpr double Radius = 100.0;
+        for (int32 Index = 0; Index < Count; ++Index)
+        {
+            FSplinePointData Point;
+            if (Kind == 0)
+            {
+                const double Angle = UE_PI * 0.5 * Index;
+                const FVector Forward(-FMath::Sin(Angle), FMath::Cos(Angle), 0.0);
+                Point.LocalPosition = FVector(Radius * FMath::Cos(Angle), Radius * FMath::Sin(Angle), 0.0);
+                // Cubic Hermite derivative = 3 * Bezier control-arm length.
+                Point.ArriveTangent = Point.LeaveTangent = Forward *
+                    (4.0 * Radius * FMath::Tan(UE_PI / 8.0));
+                Point.PointType = ESplinePointType::CurveCustomTangent;
+            }
+            else if (Kind == 1)
+            {
+                const FVector Corners[4] = {
+                    FVector(-100.0, -75.0, 0.0), FVector(100.0, -75.0, 0.0),
+                    FVector(100.0, 75.0, 0.0), FVector(-100.0, 75.0, 0.0) };
+                Point.LocalPosition = Corners[Index];
+                Point.PointType = ESplinePointType::Linear;
+            }
+            else
+            {
+                const double T = static_cast<double>(Index) / (Count - 1);
+                const double Angle = 4.0 * UE_PI * T;
+                const double StepAngle = 4.0 * UE_PI / (Count - 1);
+                Point.LocalPosition = FVector(Radius * FMath::Cos(Angle),
+                    Radius * FMath::Sin(Angle), 400.0 * T);
+                Point.ArriveTangent = Point.LeaveTangent = FVector(
+                    -Radius * FMath::Sin(Angle) * StepAngle,
+                    Radius * FMath::Cos(Angle) * StepAngle, 400.0 / (Count - 1));
+                Point.PointType = ESplinePointType::CurveCustomTangent;
+            }
+            Point.HandleMode = EStrandBezierHandleMode::Free;
+            Result.Add(Point);
+        }
+        OutPoints = MoveTemp(Result);
+        bOutClosed = Kind != 2;
+        return true;
+    }
+
+    // Mutate an existing Strand asset in place, not create a second asset.
+    // Callers own FScopedTransaction, Modify, source-link handling and refresh.
+    inline bool ReplacePrimitiveGeometry(USplineDataAsset& Target, int32 Kind)
+    {
+        TArray<FSplinePointData> Points;
+        bool bClosed = false;
+        if (!MakePrimitive(Kind, Points, bClosed)) { return false; }
+        Target.Points = MoveTemp(Points);
+        Target.bIsClosedLoop = bClosed;
+        return true;
+    }
+
+    // Extend a native open spline in the *evaluated* endpoint direction. Auto
+    // points often store zero tangents; the evaluated native spline is the
+    // source of truth. Converting the old endpoint to custom tangents preserves
+    // its current evaluated handles when the new anchor is added.
+    inline bool ExtendOpenEndpoint(TArray<FSplinePointData>& Points,
+        const USplineComponent* Spline, bool bAtStart)
+    {
+        const int32 Count = Points.Num();
+        if (!IsValid(Spline) || Count < 2 || Count >= 100000 ||
+            Spline->GetNumberOfSplinePoints() != Count) { return false; }
+        const int32 Edge = bAtStart ? 0 : Count - 1;
+        const int32 Neighbor = bAtStart ? 1 : Count - 2;
+        const FSplinePoint Evaluated = Spline->GetSplinePointAt(Edge, ESplineCoordinateSpace::Local);
+        FSplinePointData& Endpoint = Points[Edge];
+        const double NeighborDistance = (Endpoint.LocalPosition - Points[Neighbor].LocalPosition).Size();
+        if (NeighborDistance <= KINDA_SMALL_NUMBER) { return false; }
+        const FVector AlongCurve = bAtStart ? -Evaluated.ArriveTangent : Evaluated.LeaveTangent;
+        const FVector Fallback = Endpoint.LocalPosition - Points[Neighbor].LocalPosition;
+        const FVector Direction = !AlongCurve.IsNearlyZero() ? AlongCurve.GetSafeNormal() : Fallback.GetSafeNormal();
+        if (Direction.IsNearlyZero()) { return false; }
+        const double Step = FMath::Max(NeighborDistance * 0.5, 1.0);
+        FSplinePointData Added = Endpoint;
+        Added.LocalPosition += Direction * Step;
+        Added.PointType = ESplinePointType::CurveCustomTangent;
+        Added.HandleMode = EStrandBezierHandleMode::Aligned;
+        // Native arrive/leave tangent vectors both point in *forward*
+        // spline travel direction, even at the start of the curve.
+        const FVector NewTangent = (bAtStart ? -Direction : Direction) * Step;
+        Added.ArriveTangent = NewTangent;
+        Added.LeaveTangent = NewTangent;
+        if (Endpoint.PointType.GetValue() == ESplinePointType::Curve ||
+            Endpoint.PointType.GetValue() == ESplinePointType::CurveClamped)
+        {
+            Endpoint.ArriveTangent = Evaluated.ArriveTangent;
+            Endpoint.LeaveTangent = Evaluated.LeaveTangent;
+            Endpoint.PointType = ESplinePointType::CurveCustomTangent;
+            Endpoint.HandleMode = EStrandBezierHandleMode::Free;
+        }
+        if (bAtStart) { Points.Insert(Added, 0); }
+        else { Points.Add(Added); }
+        return true;
+    }
+
+    // Arc-length resampling rebuilds control points at roughly equal spacing.
+    // Unlike exact Bezier subdivision, resampling is an approximation and the
+    // caller must make it an explicit, undoable operation.
+    inline bool ResampleByArcLength(const USplineComponent* Spline,
+        const TArray<FSplinePointData>& Original, bool bClosed, int32 TargetPoints,
+        TArray<FSplinePointData>& OutPoints)
+    {
+        if (!IsValid(Spline) || Original.Num() < 2 || TargetPoints < 2 || TargetPoints > 4096)
+        {
+            return false;
+        }
+        const double Length = Spline->GetSplineLength();
+        if (!FMath::IsFinite(Length) || Length <= KINDA_SMALL_NUMBER) { return false; }
+        bool bAllLinear = true;
+        for (const FSplinePointData& Point : Original)
+        {
+            if (Point.PointType.GetValue() != ESplinePointType::Linear) { bAllLinear = false; break; }
+        }
+        const double Spacing = Length / static_cast<double>(bClosed ? TargetPoints : TargetPoints - 1);
+        TArray<FSplinePointData> NewPoints;
+        NewPoints.Reserve(TargetPoints);
+        for (int32 Index = 0; Index < TargetPoints; ++Index)
+        {
+            const double Distance = FMath::Min(Length, static_cast<double>(Index) * Spacing);
+            FSplinePointData Point;
+            Point.LocalPosition = Spline->GetLocationAtDistanceAlongSpline(Distance, ESplineCoordinateSpace::Local);
+            Point.LocalRotation = Spline->GetRotationAtDistanceAlongSpline(Distance, ESplineCoordinateSpace::Local);
+            Point.LocalScale = Spline->GetScaleAtDistanceAlongSpline(Distance);
+            Point.PointType = bAllLinear ? ESplinePointType::Linear : ESplinePointType::CurveCustomTangent;
+            if (!bAllLinear)
+            {
+                const FVector Tangent = Spline->GetDirectionAtDistanceAlongSpline(
+                    Distance, ESplineCoordinateSpace::Local) * Spacing;
+                Point.ArriveTangent = Tangent;
+                Point.LeaveTangent = Tangent;
+                Point.HandleMode = EStrandBezierHandleMode::Aligned;
+            }
+            if (Point.LocalPosition.ContainsNaN() || Point.ArriveTangent.ContainsNaN() ||
+                Point.LeaveTangent.ContainsNaN()) { return false; }
+            NewPoints.Add(Point);
+        }
+        OutPoints = MoveTemp(NewPoints);
+        return true;
+    }
+
     inline FVector ReflectVector(FVector Value, int32 Axis)
     {
         if (Axis == 0) { Value.X = -Value.X; }
@@ -309,17 +497,52 @@ namespace StrandSplineEditOperations
         return bChanged;
     }
 
+    // Direct orientation authoring changes ONLY the rotation channel. This must
+    // never call USplineComponent::SetRotationAtSplinePoint, which can also
+    // change spline tangents. Tangent alignment remains a separate operation.
+    inline bool SetSelectedOrientation(TArray<FSplinePointData>& Points,
+        const TArray<int32>& Indices, const FRotator& NewOrientation)
+    {
+        if (NewOrientation.ContainsNaN()) { return false; }
+        const FQuat Target = NewOrientation.Quaternion().GetNormalized();
+        bool bChanged = false;
+        for (int32 Index : Indices)
+        {
+            if (!Points.IsValidIndex(Index)) { continue; }
+            FSplinePointData& Point = Points[Index];
+            if (Point.LocalRotation.Quaternion().Equals(Target, 0.000001)) { continue; }
+            Point.LocalRotation = Target.Rotator();
+            bChanged = true;
+        }
+        return bChanged;
+    }
+
     // Group transforms use the average selected anchor as pivot. Transform
     // tangents as vectors, never translate them. Unselected points are untouched.
-    inline bool RotateSelected(TArray<FSplinePointData>& Points, const TArray<int32>& Indices,
-        int32 Axis, double Degrees)
+    inline double PositionEntryDelta(double CurrentCoordinate, double EnteredValue, bool bRelative)
     {
-        if (Indices.IsEmpty() || Axis < 0 || Axis > 2 || !FMath::IsFinite(Degrees) ||
-            FMath::IsNearlyZero(Degrees, 0.000001)) { return false; }
+        return bRelative ? EnteredValue : EnteredValue - CurrentCoordinate;
+    }
+
+    // Unreal reports signed widget angles in its selected coordinate frame.
+    // A local delta is conjugated into spline asset axes before changing points.
+    inline FQuat WidgetRotationToAsset(const FQuat& WidgetDelta,
+        const FQuat& WidgetFrame, bool bLocal)
+    {
+        if (WidgetDelta.ContainsNaN() || WidgetFrame.ContainsNaN()) { return FQuat::Identity; }
+        const FQuat Delta = WidgetDelta.GetNormalized();
+        if (!bLocal) { return Delta; }
+        const FQuat Frame = WidgetFrame.GetNormalized();
+        return (Frame * Delta * Frame.Inverse()).GetNormalized();
+    }
+
+    inline bool RotateSelectedQuat(TArray<FSplinePointData>& Points, const TArray<int32>& Indices,
+        const FQuat& InRotation)
+    {
+        if (Indices.IsEmpty() || InRotation.ContainsNaN()) { return false; }
+        const FQuat Rotation = InRotation.GetNormalized();
+        if (Rotation.IsIdentity(0.000001)) { return false; }
         const FVector Pivot = SelectionCenter(Points, Indices);
-        const FVector Basis = Axis == 0 ? FVector::XAxisVector :
-            Axis == 1 ? FVector::YAxisVector : FVector::ZAxisVector;
-        const FQuat Rotation(Basis, FMath::DegreesToRadians(Degrees));
         bool bChanged = false;
         for (int32 Index : Indices)
         {
@@ -332,6 +555,16 @@ namespace StrandSplineEditOperations
             bChanged = true;
         }
         return bChanged;
+    }
+
+    inline bool RotateSelected(TArray<FSplinePointData>& Points, const TArray<int32>& Indices,
+        int32 Axis, double Degrees)
+    {
+        if (Axis < 0 || Axis > 2 || !FMath::IsFinite(Degrees)) { return false; }
+        const FVector Basis = Axis == 0 ? FVector::XAxisVector :
+            Axis == 1 ? FVector::YAxisVector : FVector::ZAxisVector;
+        return RotateSelectedQuat(Points, Indices,
+            FQuat(Basis, FMath::DegreesToRadians(Degrees)));
     }
 
     inline bool ScaleSelected(TArray<FSplinePointData>& Points, const TArray<int32>& Indices,

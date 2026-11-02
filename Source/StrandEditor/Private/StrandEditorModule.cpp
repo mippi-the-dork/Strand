@@ -604,6 +604,36 @@ private:
             { TEXT("Strand.Move"), TEXT("StrandToolMove.svg") },
             { TEXT("Strand.Rotate"), TEXT("StrandToolRotate.svg") },
             { TEXT("Strand.Scale"), TEXT("StrandToolScale.svg") },
+            { TEXT("Strand.SelectAll"), TEXT("StrandToolSelectAll.svg") },
+            { TEXT("Strand.Invert"), TEXT("StrandToolInvert.svg") },
+            { TEXT("Strand.ClearSelection"), TEXT("StrandToolClearSelection.svg") },
+            { TEXT("Strand.World"), TEXT("StrandToolWorld.svg") },
+            { TEXT("Strand.Local"), TEXT("StrandToolLocal.svg") },
+            { TEXT("Strand.Selection"), TEXT("StrandToolSelection.svg") },
+            { TEXT("Strand.View"), TEXT("StrandToolView.svg") },
+            { TEXT("Strand.Plane"), TEXT("StrandToolPlane.svg") },
+            { TEXT("Strand.Snap"), TEXT("StrandToolSnap.svg") },
+            { TEXT("Strand.FrameAll"), TEXT("StrandToolFrameAll.svg") },
+            { TEXT("Strand.FrameSelected"), TEXT("StrandToolFrameSelected.svg") },
+            { TEXT("Strand.Points"), TEXT("StrandToolPoints.svg") },
+            { TEXT("Strand.Grid"), TEXT("StrandToolGrid.svg") },
+            { TEXT("Strand.Tangents"), TEXT("StrandToolTangents.svg") },
+            { TEXT("Strand.Insert"), TEXT("StrandToolInsert.svg") },
+            { TEXT("Strand.Delete"), TEXT("StrandToolDelete.svg") },
+            { TEXT("Strand.Subdivide"), TEXT("StrandToolSubdivide.svg") },
+            { TEXT("Strand.Smooth"), TEXT("StrandToolSmooth.svg") },
+            { TEXT("Strand.Linear"), TEXT("StrandToolLinear.svg") },
+            { TEXT("Strand.Reverse"), TEXT("StrandToolReverse.svg") },
+            { TEXT("Strand.Loop"), TEXT("StrandToolLoop.svg") },
+            { TEXT("Strand.OpenPath"), TEXT("StrandToolOpenPath.svg") },
+            { TEXT("Strand.ClosedPath"), TEXT("StrandToolClosedPath.svg") },
+            { TEXT("Strand.Primitives"), TEXT("StrandToolPrimitives.svg") },
+            { TEXT("Strand.ReplaceShape"), TEXT("StrandToolReplaceShape.svg") },
+            { TEXT("Strand.Absolute"), TEXT("StrandToolAbsolute.svg") },
+            { TEXT("Strand.Relative"), TEXT("StrandToolRelative.svg") },
+            { TEXT("Strand.More"), TEXT("StrandToolMore.svg") },
+            { TEXT("Strand.Handles"), TEXT("StrandToolHandles.svg") },
+            { TEXT("Strand.Interpolation"), TEXT("StrandToolInterpolation.svg") },
         };
         for (const FToolBrush& Icon : ToolIcons)
         {
@@ -611,7 +641,7 @@ private:
             if (FPaths::FileExists(Path))
             {
                 AssetStyle->Set(Icon.Key, new FSlateVectorImageBrush(Path,
-                    FVector2D(16.0f, 16.0f), FLinearColor::White, ESlateBrushTileType::NoTile));
+                    FVector2D(28.0f, 28.0f), FLinearColor::White, ESlateBrushTileType::NoTile));
             }
             else
             {
@@ -765,8 +795,46 @@ private:
                 }));
         }
 
+        // Native spline conversion is useful outside the Strand asset editor.
+        // Reuse the existing safe transaction/asset capture implementation.
+        // An ambiguous actor with multiple spline components is rejected by
+        // ConvertSelectedActors; its individual components can be captured via
+        // Strand's actor Details link UI.
+        if (UToolMenu* ActorMenu = UToolMenus::Get()->ExtendMenu(TEXT("LevelEditor.ActorContextMenu")))
+        {
+            FToolMenuSection& NativeSplineActions = ActorMenu->FindOrAddSection(TEXT("StrandNativeSplineActions"));
+            NativeSplineActions.AddMenuEntry(TEXT("StrandConvertSelectedNativeSpline"),
+                LOCTEXT("ConvertNativeSplineLabel", "Strand: Save Native Spline as Asset..."),
+                LOCTEXT("ConvertNativeSplineTip", "Capture the selected level Actor's existing native Spline Component into a new editable Strand asset and link it without changing its points or Actor transform. For multiple spline components, capture one explicitly in Strand's actor Details panel."),
+                FSlateIcon(), FUIAction(FExecuteAction::CreateStatic(&SplineEditorCommands::ConvertSelectedActors),
+                    FCanExecuteAction::CreateLambda([]()
+                    {
+                        for (AActor* Actor : SplineEditorCommands::SelectedActors())
+                        {
+                            if (IsValid(Actor) && SplineEditorCommands::FindUnambiguousSpline(Actor)) { return true; }
+                        }
+                        return false;
+                    })));
+        }
+
         UToolMenu* ToolsMenu = UToolMenus::Get()->ExtendMenu(TEXT("LevelEditor.MainMenu.Tools"));
+        // Explicit section label makes Strand its own first-class Tools group.
+        // Previously FindOrAddSection without a label visually grouped these
+        // commands beneath the preceding plugin's heading.
         FToolMenuSection& ImportSection = ToolsMenu->FindOrAddSection(TEXT("StrandImport"));
+        ImportSection.Label = LOCTEXT("StrandToolsCategory", "Strand");
+        ImportSection.AddMenuEntry(TEXT("StrandConvertNativeSplineFromTools"),
+            LOCTEXT("ConvertSelectedNativeSplineTools", "Strand: Save Selected Actor Spline as Asset..."),
+            LOCTEXT("ConvertSelectedNativeSplineToolsTip", "Capture existing native Spline Components from selected level actors as new Strand Spline assets; preserves local spline geometry and Actor transforms."),
+            FSlateIcon(), FUIAction(FExecuteAction::CreateStatic(&SplineEditorCommands::ConvertSelectedActors),
+                FCanExecuteAction::CreateLambda([]()
+                {
+                    for (AActor* Actor : SplineEditorCommands::SelectedActors())
+                    {
+                        if (IsValid(Actor) && SplineEditorCommands::FindUnambiguousSpline(Actor)) { return true; }
+                    }
+                    return false;
+                })));
         ImportSection.AddMenuEntry(TEXT("StrandGenerateCurveTests"),
             LOCTEXT("GenerateTests", "Strand: Generate Helix and Braid Test Curves..."),
             LOCTEXT("GenerateTestsTip", "Write two Alembic ICurves test fixtures to Project/Saved/Strand/CurveImportTests."),

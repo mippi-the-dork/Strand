@@ -6,6 +6,7 @@
 
 class USplineComponent;
 class FPreviewScene;
+class FEditorModeTools;
 class FStrandSplineViewportClient;
 
 /** Screen-space pen target, evaluated in native spline-local centimeters. */
@@ -39,6 +40,13 @@ public:
     void SetSelectedPointIndex(int32 Index);
     void SetSelectedPoints(const TArray<int32>& Indices, int32 PrimaryIndex);
     void SetOnPointSelected(TFunction<void(int32, bool, bool)> InCallback);
+    void SetOnSegmentInsert(TFunction<void(int32, double)> InCallback);
+    /** Ctrl+drag on a segment bends its interior; callbacks own the undo transaction. */
+    void SetSegmentBendCallbacks(TFunction<void(int32, double)> Begin,
+        TFunction<void(const FVector&)> Update, TFunction<void()> End);
+    void SetOnContextMenu(TFunction<TSharedRef<SWidget>(int32, int32, double)> InCallback);
+    void SetOnNudge(TFunction<void(const FVector&)> InCallback);
+    FText GetInteractionHint() const;
     void SetOnSelectAll(TFunction<void()> InCallback);
     void SetOnClearSelection(TFunction<void()> InCallback);
     void SetOnTangentSelected(TFunction<void(int32, int32)> InCallback);
@@ -47,9 +55,17 @@ public:
     void SetPenMode(bool bEnabled);
     void SetMarqueeMode(bool bEnabled);
     void SetWidgetMode(int32 Mode);
+    void SetWidgetLocal(bool bLocal);
+    void SetAuthoredAnchorRotation(const FRotator& Rotation);
+    /** The actual saved rotation driving Local gizmo axes; also used by regression tests. */
+    FRotator GetAuthoredAnchorRotation() const;
+    /** Exposes actual native coordinate-frame X axis for editor automation. */
+    FVector GetCurrentWidgetAxisX() const;
+    /** Diagnostic: true when the selected anchor has an enabled native widget path. */
+    bool IsNativeWidgetReady();
     void SetOnMarqueeSelected(TFunction<void(const TArray<int32>&, bool, bool)> InCallback);
     void SetOnMarqueeExit(TFunction<void()> InCallback);
-    void SetPointRotationCallback(TFunction<void(int32, double)> InCallback);
+    void SetPointRotationCallback(TFunction<void(const FQuat&)> InCallback);
     void SetPointScaleCallback(TFunction<void(double)> InCallback);
     void SetOnWidgetModeChanged(TFunction<void(int32)> InCallback);
     void SetOnToolShortcut(TFunction<void(int32)> InCallback);
@@ -68,6 +84,8 @@ protected:
 
 private:
     TSharedPtr<FPreviewScene> PreviewScene;
+    // Must outlive StrandViewportClient, which holds a non-owning mode-manager pointer.
+    TSharedPtr<FEditorModeTools> ModeTools;
     TSharedPtr<FStrandSplineViewportClient> StrandViewportClient;
     TWeakObjectPtr<USplineComponent> Spline;
     bool bHasFramedInitialSpline = false;

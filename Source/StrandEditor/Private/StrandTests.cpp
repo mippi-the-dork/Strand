@@ -11,6 +11,11 @@
 #include "Components/SplineMeshComponent.h"
 #include "Components/BillboardComponent.h"
 #include "StrandPlacement.h"
+#include "StrandSplineViewport.h"
+#include "Math/RotationMatrix.h"
+#include "StrandSplineEditOperations.h"
+#include "StrandSplineInputUtils.h"
+#include <limits>
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSplineAssetRoundTripTest,
     "Strand.Data.RoundTripPointData", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
@@ -112,6 +117,120 @@ bool FSplineAssetRoundTripTest::RunTest(const FString& Parameters)
         }
     }
     TestTrue(TEXT("Clearing assignment preserves points"), bGeometryPreserved);
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStrandAuthoredAnchorOrientationTest,
+    "Strand.Editor.Authoring.AuthoredAnchorOrientation",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FStrandAuthoredAnchorOrientationTest::RunTest(const FString& Parameters)
+{
+    USplineDataAsset* Asset = NewObject<USplineDataAsset>(GetTransientPackage());
+    FSplinePointData Point;
+    Point.LocalPosition = FVector(11, 42, -7);
+    Point.ArriveTangent = FVector(40, 0, 0);
+    Point.LeaveTangent = FVector(0, 120, 30);
+    Point.LocalRotation = FRotator(10, 55, 20);
+    Point.PointType = ESplinePointType::CurveCustomTangent;
+    Asset->Points.Add(Point);
+    const FSplinePointData Before = Point;
+    const TArray<int32> Selection{0};
+    TestTrue(TEXT("Orientation edit succeeds"), StrandSplineEditOperations::SetSelectedOrientation(
+        Asset->Points, Selection, FRotator(20, 100, 5)));
+    TestTrue(TEXT("Authored rotation updates"), Asset->Points[0].LocalRotation.Equals(FRotator(20, 100, 5), 0.001));
+    TestTrue(TEXT("Anchor position preserved"), Asset->Points[0].LocalPosition.Equals(Before.LocalPosition));
+    TestTrue(TEXT("Independent arrive tangent preserved"), Asset->Points[0].ArriveTangent.Equals(Before.ArriveTangent));
+    TestTrue(TEXT("Independent leave tangent preserved"), Asset->Points[0].LeaveTangent.Equals(Before.LeaveTangent));
+    TestEqual(TEXT("Point type remains custom"), Asset->Points[0].PointType.GetValue(), Before.PointType.GetValue());
+    TestFalse(TEXT("Identical orientation does not dirty"), StrandSplineEditOperations::SetSelectedOrientation(
+        Asset->Points, Selection, FRotator(20, 100, 5)));
+    TestTrue(TEXT("Reset rotation"), StrandSplineEditOperations::SetSelectedOrientation(
+        Asset->Points, Selection, FRotator::ZeroRotator));
+
+    TSharedRef<SStrandSplineViewport> Viewport = SNew(SStrandSplineViewport);
+    USplineComponent* Spline = NewObject<USplineComponent>(GetTransientPackage());
+    Spline->ClearSplinePoints(false);
+    Spline->AddPoint(Before.ToSplinePoint(0), false);
+    FSplinePointData Second = Before;
+    Second.LocalPosition = Before.LocalPosition + FVector(0, 200, 20);
+    Spline->AddPoint(Second.ToSplinePoint(1), true);
+    Viewport->SetSpline(Spline);
+    Viewport->SetSelectedPointIndex(0);
+    Viewport->SetAuthoredAnchorRotation(FRotator(0, 0, 0));
+    TestTrue(TEXT("Explicit zero authored frame does not inherit native point rotation"),
+        Viewport->GetAuthoredAnchorRotation().IsNearlyZero());
+    Viewport->SetAuthoredAnchorRotation(FRotator(20, 100, 5));
+    TestTrue(TEXT("Viewport receives Strand's authored orientation as up/roll reference"),
+        Viewport->GetAuthoredAnchorRotation().Equals(FRotator(20, 100, 5), 0.001));
+    Viewport->SetWidgetLocal(false);
+    TestTrue(TEXT("World widget basis is asset X axis"),
+        Viewport->GetCurrentWidgetAxisX().Equals(FVector::XAxisVector, 0.0001));
+    Viewport->SetWidgetLocal(true);
+    const FVector Outgoing = Before.LeaveTangent.GetSafeNormal();
+    TestTrue(TEXT("Local X follows outgoing tangent even with authored nonzero yaw"),
+        Viewport->GetCurrentWidgetAxisX().Equals(Outgoing, 0.0001));
+    Viewport->SetAuthoredAnchorRotation(FRotator::ZeroRotator);
+    TestTrue(TEXT("Unrotated imported anchor also uses outgoing tangent"),
+        Viewport->GetCurrentWidgetAxisX().Equals(Outgoing, 0.0001));
+    Viewport->SetWidgetLocal(false);
+    TestTrue(TEXT("World X remains fixed even on curved anchor"),
+        Viewport->GetCurrentWidgetAxisX().Equals(FVector::XAxisVector, 0.0001));
+    Viewport->SetWidgetLocal(true);
+    // A linear endpoint with no evaluated handle still needs a defined axis.
+    USplineComponent* LinearSpline = NewObject<USplineComponent>(GetTransientPackage());
+    LinearSpline->ClearSplinePoints(false);
+    LinearSpline->AddPoint(FSplinePoint(0, FVector::ZeroVector, FVector::ZeroVector,
+        FVector::ZeroVector, FRotator::ZeroRotator, FVector::OneVector, ESplinePointType::Linear), false);
+    LinearSpline->AddPoint(FSplinePoint(1, FVector(0, 150, 0), FVector::ZeroVector,
+        FVector::ZeroVector, FRotator::ZeroRotator, FVector::OneVector, ESplinePointType::Linear), true);
+    Viewport->SetSpline(LinearSpline);
+    Viewport->SetSelectedPointIndex(0);
+    TestTrue(TEXT("Linear point without tangent uses next-segment direction"),
+        Viewport->GetCurrentWidgetAxisX().Equals(FVector::YAxisVector, 0.0001));
+    return true;
+}
+
+// This specifically exercises the standalone preview's native-widget wiring.
+// The prior v0.6.11 code returned a widget mode but supplied no editor-mode
+// manager, so all geometry tests passed while the widget remained invisible.
+// A separate live render and mouse-drag check is still required in UE.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStrandNativeViewportWidgetLifecycleTest,
+    "Strand.Editor.Authoring.NativeWidgetLifecycle",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FStrandNativeViewportWidgetLifecycleTest::RunTest(const FString& Parameters)
+{
+    TSharedRef<SStrandSplineViewport> Viewport = SNew(SStrandSplineViewport);
+    TestFalse(TEXT("No selection has no transform widget"), Viewport->IsNativeWidgetReady());
+
+    USplineComponent* Spline = NewObject<USplineComponent>(GetTransientPackage());
+    Spline->ClearSplinePoints(false);
+    Spline->AddSplinePoint(FVector::ZeroVector, ESplineCoordinateSpace::Local, false);
+    Spline->AddSplinePoint(FVector(100.0, 0.0, 0.0), ESplineCoordinateSpace::Local, true);
+    Viewport->SetSpline(Spline);
+    TestFalse(TEXT("A spline without selection has no widget"), Viewport->IsNativeWidgetReady());
+
+    Viewport->SetSelectedPointIndex(0);
+    TestTrue(TEXT("Selected anchor enables Strand's owned native widget"), Viewport->IsNativeWidgetReady());
+    Viewport->SetWidgetMode(1);
+    TestTrue(TEXT("Rotation mode retains the native widget"), Viewport->IsNativeWidgetReady());
+    Viewport->SetWidgetMode(2);
+    TestTrue(TEXT("Scale mode retains the native widget"), Viewport->IsNativeWidgetReady());
+    Viewport->SetShowControlPoints(false);
+    TestFalse(TEXT("Hiding selectable anchors hides widget"), Viewport->IsNativeWidgetReady());
+    Viewport->SetShowControlPoints(true);
+    TestTrue(TEXT("Restoring anchors restores widget"), Viewport->IsNativeWidgetReady());
+    Viewport->SetMarqueeMode(true);
+    TestFalse(TEXT("Box Select suppresses the transform widget"), Viewport->IsNativeWidgetReady());
+    Viewport->SetMarqueeMode(false);
+    TestTrue(TEXT("Exiting Box Select restores native widget"), Viewport->IsNativeWidgetReady());
+    Viewport->SetPenMode(true);
+    TestFalse(TEXT("Pen suppresses the transform widget"), Viewport->IsNativeWidgetReady());
+    Viewport->SetPenMode(false);
+    TestTrue(TEXT("Exiting Pen restores native widget"), Viewport->IsNativeWidgetReady());
+    Viewport->SetSelectedPointIndex(INDEX_NONE);
+    TestFalse(TEXT("Clearing selection hides transform widget"), Viewport->IsNativeWidgetReady());
     return true;
 }
 
@@ -948,7 +1067,6 @@ bool FStrandSplineAuthoringExportTest::RunTest(const FString& Parameters)
 #endif
 
 #if WITH_DEV_AUTOMATION_TESTS
-#include "StrandSplineEditOperations.h"
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStrandSplineEditingOperationsTest,
     "Strand.Editor.Authoring.SplineEditingOperations",
@@ -1188,6 +1306,247 @@ bool FStrandBezierHandleModesTest::RunTest(const FString& Parameters)
     return true;
 }
 
+
+// Direct Select-mode insertion uses the same shape-preserving core as Pen,
+// but targets a specific segment/parameter from the viewport hit proxy.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStrandDirectSegmentInsertionTest,
+    "Strand.Editor.Authoring.DirectSegmentInsertion",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FStrandDirectSegmentInsertionTest::RunTest(const FString& Parameters)
+{
+    USplineDataAsset* Asset = NewObject<USplineDataAsset>(GetTransientPackage());
+    USplineComponent* Native = NewObject<USplineComponent>(GetTransientPackage());
+    FSplinePointData A, B;
+    A.LocalPosition = FVector(0, 0, 0);
+    B.LocalPosition = FVector(100, 0, 0);
+    A.PointType = B.PointType = ESplinePointType::Linear;
+    Asset->Points = { A, B };
+    Asset->ApplyToSplineComponent(Native);
+    const int32 NewIndex = StrandSplineEditOperations::InsertOnSegment(
+        Asset->Points, false, Native, 0, 0.35);
+    TestEqual(TEXT("Direct segment insertion selects the inserted anchor"), NewIndex, 1);
+    TestEqual(TEXT("Direct insertion creates exactly one point"), Asset->Points.Num(), 3);
+    TestTrue(TEXT("Inserted anchor follows picked parameter"),
+        Asset->Points.IsValidIndex(1) &&
+        Asset->Points[1].LocalPosition.Equals(FVector(35, 0, 0), 0.0001));
+    TestTrue(TEXT("Open spline endpoints remain unchanged"),
+        Asset->Points[0].LocalPosition.Equals(A.LocalPosition) &&
+        Asset->Points.Last().LocalPosition.Equals(B.LocalPosition));
+    Asset->ApplyToSplineComponent(Native);
+    TestTrue(TEXT("Inserted native curve remains a straight segment"),
+        Native->GetLocationAtSplineInputKey(0.5f, ESplineCoordinateSpace::Local).Equals(FVector(17.5, 0, 0), 0.001) &&
+        Native->GetLocationAtSplineInputKey(1.5f, ESplineCoordinateSpace::Local).Equals(FVector(67.5, 0, 0), 0.001));
+    const int32 Count = Asset->Points.Num();
+    TestEqual(TEXT("Reject invalid segment"), StrandSplineEditOperations::InsertOnSegment(
+        Asset->Points, false, Native, Count - 1, 0.5), INDEX_NONE);
+    TestEqual(TEXT("Invalid direct insertion is non-destructive"), Asset->Points.Num(), Count);
+    return true;
+}
+
+// v0.6.23 precision insertion actions reuse native cubic geometry splitting.
+// Test several fractions independently so the 25/50/75 menu cannot silently
+// regress into equally spaced straight-line placement or destructive resampling.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStrandPrecisionSegmentFractionsTest,
+    "Strand.Editor.Authoring.PrecisionSegmentFractions",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FStrandPrecisionSegmentFractionsTest::RunTest(const FString& Parameters)
+{
+    USplineDataAsset* Asset = NewObject<USplineDataAsset>(GetTransientPackage());
+    USplineComponent* Native = NewObject<USplineComponent>(GetTransientPackage());
+    FSplinePointData A, B;
+    A.LocalPosition = FVector(0.0, 40.0, 0.0);
+    B.LocalPosition = FVector(180.0, 110.0, 65.0);
+    A.PointType = B.PointType = ESplinePointType::CurveCustomTangent;
+    A.LeaveTangent = FVector(250.0, -110.0, 170.0);
+    B.ArriveTangent = FVector(40.0, 230.0, -75.0);
+    for (const double Fraction : { 0.25, 0.5, 0.75 })
+    {
+        Asset->Points = { A, B };
+        Asset->bIsClosedLoop = false;
+        Asset->ApplyToSplineComponent(Native);
+        TArray<FVector> Before;
+        for (int32 Index = 0; Index <= 100; ++Index)
+        {
+            Before.Add(Native->GetLocationAtSplineInputKey(Index / 100.0, ESplineCoordinateSpace::Local));
+        }
+        const int32 Inserted = StrandSplineEditOperations::InsertOnSegment(Asset->Points,
+            false, Native, 0, Fraction);
+        TestEqual(TEXT("Precision fraction inserts the middle anchor"), Inserted, 1);
+        TestEqual(TEXT("Precision fraction makes exactly three anchors"), Asset->Points.Num(), 3);
+        if (!Asset->Points.IsValidIndex(1)) { return false; }
+        const FVector ExpectedPosition = Before[FMath::RoundToInt(Fraction * 100.0)];
+        TestTrue(TEXT("Inserted point matches evaluated 3D cubic"),
+            Asset->Points[1].LocalPosition.Equals(ExpectedPosition, 0.01));
+        Asset->ApplyToSplineComponent(Native);
+        double MaximumError = 0.0;
+        for (int32 Index = 0; Index <= 100; ++Index)
+        {
+            const double T = Index / 100.0;
+            const double NewT = T <= Fraction ? T / Fraction : 1.0 + (T - Fraction) / (1.0 - Fraction);
+            MaximumError = FMath::Max(MaximumError, FVector::Distance(Before[Index],
+                Native->GetLocationAtSplineInputKey(NewT, ESplineCoordinateSpace::Local)));
+        }
+        TestTrue(TEXT("Precision insertion preserves entire cubic within 0.01 cm"), MaximumError < 0.01);
+    }
+    return true;
+}
+
+// Direct Ctrl-drag reshaping uses a least-norm Hermite derivative update.
+// Point positions stay fixed, the cursor-picked interior point follows the
+// intended 3D delta, and the unaffected neighboring segment does not jump.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStrandDirectSegmentBendTest,
+    "Strand.Editor.Authoring.DirectSegmentBend",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FStrandDirectSegmentBendTest::RunTest(const FString& Parameters)
+{
+    USplineDataAsset* Asset = NewObject<USplineDataAsset>(GetTransientPackage());
+    USplineComponent* Native = NewObject<USplineComponent>(GetTransientPackage());
+    FSplinePointData A, B, C;
+    A.LocalPosition = FVector(-150.0, 10.0, 20.0);
+    B.LocalPosition = FVector(100.0, 55.0, -35.0);
+    C.LocalPosition = FVector(250.0, 190.0, 100.0);
+    A.PointType = B.PointType = C.PointType = ESplinePointType::Curve;
+    Asset->Points = { A, B, C };
+    Asset->ApplyToSplineComponent(Native);
+    const FSplinePoint P0 = Native->GetSplinePointAt(0, ESplineCoordinateSpace::Local);
+    const FSplinePoint P1 = Native->GetSplinePointAt(1, ESplineCoordinateSpace::Local);
+    const FVector OriginalMiddle = Native->GetLocationAtSplineInputKey(0.4f, ESplineCoordinateSpace::Local);
+    const FVector OriginalNextSpan = Native->GetLocationAtSplineInputKey(1.35f, ESplineCoordinateSpace::Local);
+    const FVector Delta(0.0, 80.0, -25.0);
+    TestTrue(TEXT("Direct bend accepts an interior 3D curve segment"),
+        StrandSplineEditOperations::BendSegment(Asset->Points, false, 0, 0.4, Delta, P0, P1));
+    TestEqual(TEXT("Direct bend retains original point count"), Asset->Points.Num(), 3);
+    TestTrue(TEXT("Direct bend keeps first anchor position"), Asset->Points[0].LocalPosition.Equals(A.LocalPosition));
+    TestTrue(TEXT("Direct bend keeps second anchor position"), Asset->Points[1].LocalPosition.Equals(B.LocalPosition));
+    TestTrue(TEXT("Direct bend keeps unrelated anchor position"), Asset->Points[2].LocalPosition.Equals(C.LocalPosition));
+    TestTrue(TEXT("Direct bend switches to independent custom handles"),
+        Asset->Points[0].PointType == ESplinePointType::CurveCustomTangent &&
+        Asset->Points[1].PointType == ESplinePointType::CurveCustomTangent &&
+        Asset->Points[0].HandleMode == EStrandBezierHandleMode::Free);
+    Asset->ApplyToSplineComponent(Native);
+    TestTrue(TEXT("Dragged location follows precise 3D cursor delta"),
+        Native->GetLocationAtSplineInputKey(0.4f, ESplineCoordinateSpace::Local).Equals(OriginalMiddle + Delta, 0.01));
+    TestTrue(TEXT("Neighbor segment keeps its original geometry"),
+        Native->GetLocationAtSplineInputKey(1.35f, ESplineCoordinateSpace::Local).Equals(OriginalNextSpan, 0.01));
+
+    TArray<FSplinePointData> Invalid = { A, B };
+    const FSplinePointData Before = Invalid[0];
+    TestFalse(TEXT("Reject near-endpoint drag to avoid extreme tangent amplification"),
+        StrandSplineEditOperations::BendSegment(Invalid, false, 0, 0.01, Delta, P0, P1));
+    TestTrue(TEXT("Rejected edit preserves original tangent"),
+        Invalid[0].LeaveTangent.Equals(Before.LeaveTangent));
+    TestFalse(TEXT("Reject invalid segment index"),
+        StrandSplineEditOperations::BendSegment(Invalid, false, 1, 0.5, Delta, P0, P1));
+    TestFalse(TEXT("Reject non-finite delta"),
+        StrandSplineEditOperations::BendSegment(Invalid, false, 0, 0.5,
+            FVector(std::numeric_limits<double>::quiet_NaN(), 0, 0), P0, P1));
+
+    // Linear segments must transition to cubic smoothly, without a jump in
+    // the baseline straight line before the actual curvature edit is applied.
+    A.PointType = B.PointType = ESplinePointType::Linear;
+    Asset->Points = { A, B };
+    Asset->ApplyToSplineComponent(Native);
+    const FSplinePoint L0 = Native->GetSplinePointAt(0, ESplineCoordinateSpace::Local);
+    const FSplinePoint L1 = Native->GetSplinePointAt(1, ESplineCoordinateSpace::Local);
+    const FVector LinearOriginal = Native->GetLocationAtSplineInputKey(0.5f, ESplineCoordinateSpace::Local);
+    TestTrue(TEXT("Linear segment can be bent into an editable cubic"),
+        StrandSplineEditOperations::BendSegment(Asset->Points, false, 0, 0.5, Delta, L0, L1));
+    Asset->ApplyToSplineComponent(Native);
+    TestTrue(TEXT("Linear-to-curve bending follows the requested offset"),
+        Native->GetLocationAtSplineInputKey(0.5f, ESplineCoordinateSpace::Local).Equals(LinearOriginal + Delta, 0.01));
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStrandWorkspaceInputIsolationTest,
+    "Strand.Editor.Authoring.WorkspaceInputIsolation",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FStrandWorkspaceInputIsolationTest::RunTest(const FString& Parameters)
+{
+    using namespace StrandSplineInputUtils;
+    TestTrue(TEXT("Shift+Control+J nudges negative X"),
+        NudgeDirection(EKeys::J, true, true, false).Equals(FVector(-1, 0, 0)));
+    TestTrue(TEXT("Shift+Control+L nudges positive X"),
+        NudgeDirection(EKeys::L, true, true, false).Equals(FVector(1, 0, 0)));
+    TestTrue(TEXT("Shift+Control+I nudges positive Y"),
+        NudgeDirection(EKeys::I, true, true, false).Equals(FVector(0, 1, 0)));
+    TestTrue(TEXT("Shift+Control+K nudges negative Y"),
+        NudgeDirection(EKeys::K, true, true, false).Equals(FVector(0, -1, 0)));
+    TestTrue(TEXT("Shift+Control+U nudges positive Z"),
+        NudgeDirection(EKeys::U, true, true, false).Equals(FVector(0, 0, 1)));
+    TestTrue(TEXT("Shift+Control+O nudges negative Z"),
+        NudgeDirection(EKeys::O, true, true, false).Equals(FVector(0, 0, -1)));
+    TestTrue(TEXT("Native arrow navigation is not consumed as a nudge"),
+        NudgeDirection(EKeys::Left, true, true, false).IsNearlyZero() &&
+        NudgeDirection(EKeys::Right, true, true, false).IsNearlyZero() &&
+        NudgeDirection(EKeys::Up, true, true, false).IsNearlyZero() &&
+        NudgeDirection(EKeys::Down, true, true, false).IsNearlyZero());
+    TestTrue(TEXT("Native PageUp/PageDown navigation is not consumed as a nudge"),
+        NudgeDirection(EKeys::PageUp, true, true, false).IsNearlyZero() &&
+        NudgeDirection(EKeys::PageDown, true, true, false).IsNearlyZero());
+    TestTrue(TEXT("Unmodified keys never nudge"),
+        NudgeDirection(EKeys::J, false, false, false).IsNearlyZero() &&
+        NudgeDirection(EKeys::J, false, true, false).IsNearlyZero());
+    TestTrue(TEXT("Alt camera modifier suppresses nudge"),
+        NudgeDirection(EKeys::J, true, true, true).IsNearlyZero());
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStrandContextualPrecisionEditingTest,
+    "Strand.Editor.Authoring.ContextualPrecisionEditing",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FStrandContextualPrecisionEditingTest::RunTest(const FString& Parameters)
+{
+    // The context menu, Shift-click insertion preview, and Pen use the same
+    // shape-preserving segment splitter. Exercise a real spatial cubic rather
+    // than just a linear test fixture, and verify precision movements.
+    USplineDataAsset* Asset = NewObject<USplineDataAsset>(GetTransientPackage());
+    USplineComponent* Native = NewObject<USplineComponent>(GetTransientPackage());
+    FSplinePointData A, B;
+    A.LocalPosition = FVector(10.0, -30.0, 20.0);
+    B.LocalPosition = FVector(140.0, 50.0, 80.0);
+    A.LeaveTangent = FVector(150.0, 90.0, -40.0);
+    B.ArriveTangent = FVector(25.0, -100.0, 70.0);
+    A.PointType = B.PointType = ESplinePointType::CurveCustomTangent;
+    Asset->Points = {A, B};
+    Asset->ApplyToSplineComponent(Native);
+    constexpr double Split = 0.4;
+    const double Samples[] = {0.05, 0.21, 0.36, 0.52, 0.76, 0.93};
+    TArray<FVector> OriginalCurve;
+    for (double T : Samples)
+    {
+        OriginalCurve.Add(Native->GetLocationAtSplineInputKey(static_cast<float>(T), ESplineCoordinateSpace::Local));
+    }
+    const int32 InsertIndex = StrandSplineEditOperations::InsertOnSegment(
+        Asset->Points, false, Native, 0, Split);
+    TestEqual(TEXT("Contextual insertion returns the new anchor index"), InsertIndex, 1);
+    TestEqual(TEXT("Contextual cubic insert creates one anchor"), Asset->Points.Num(), 3);
+    Asset->ApplyToSplineComponent(Native);
+    for (int32 I = 0; I < UE_ARRAY_COUNT(Samples); ++I)
+    {
+        const double T = Samples[I];
+        const double Mapped = T < Split ? T / Split : 1.0 + (T - Split) / (1.0 - Split);
+        TestTrue(*FString::Printf(TEXT("Cubic geometry preserved at sample %d"), I),
+            Native->GetLocationAtSplineInputKey(static_cast<float>(Mapped), ESplineCoordinateSpace::Local).Equals(OriginalCurve[I], 0.05));
+    }
+    const FVector FixedStart = Asset->Points[0].LocalPosition;
+    const FVector FixedEnd = Asset->Points[2].LocalPosition;
+    const FVector PreviousHandle = Asset->Points[1].LeaveTangent;
+    TestTrue(TEXT("Precision nudge applies to the selected anchor"),
+        StrandSplineEditOperations::TranslateSelected(Asset->Points, TArray<int32>{1}, FVector(1.0, -10.0, 0.0)));
+    TestTrue(TEXT("Nudge changes position by exact centimeters"),
+        Asset->Points[1].LocalPosition.Equals(Native->GetLocationAtSplinePoint(1, ESplineCoordinateSpace::Local) + FVector(1, -10, 0), 0.0001));
+    TestTrue(TEXT("Nudge leaves other anchors and tangent vectors intact"),
+        Asset->Points[0].LocalPosition.Equals(FixedStart) &&
+        Asset->Points[2].LocalPosition.Equals(FixedEnd) &&
+        Asset->Points[1].LeaveTangent.Equals(PreviousHandle));
+    return true;
+}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStrandGroupEditingTest,
     "Strand.Editor.Authoring.GroupEditingOperations",
     EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
@@ -1291,6 +1650,37 @@ bool FStrandGroupEditingTest::RunTest(const FString& Parameters)
             OnePoint[2].ArriveTangent.Equals(FVector(0, 20, 0), 0.00001) &&
             OnePoint[1].LocalPosition.Equals(OtherBefore, 0.00001));
     }
+    // Arbitrary 3D rotations are required for Unreal's local-coordinate widget.
+    {
+        TArray<FSplinePointData> LocalPoints = Points;
+        const TArray<int32> One = { 2 };
+        const FVector AnchorBefore = LocalPoints[2].LocalPosition;
+        LocalPoints[2].ArriveTangent = FVector(0.0, 10.0, 0.0);
+        const FVector Axis = FVector(1.0, 1.0, 1.0).GetSafeNormal();
+        const FQuat Delta(Axis, UE_PI / 3.0);
+        TestTrue(TEXT("Arbitrary local-axis quaternion rotation accepted"),
+            StrandSplineEditOperations::RotateSelectedQuat(LocalPoints, One, Delta));
+        TestTrue(TEXT("Local-axis rotation preserves anchor position"),
+            LocalPoints[2].LocalPosition.Equals(AnchorBefore, 0.00001));
+        TestTrue(TEXT("Local-axis rotation transforms tangent direction using quaternion"),
+            LocalPoints[2].ArriveTangent.Equals(Delta.RotateVector(FVector(0.0, 10.0, 0.0)), 0.00001));
+        TestFalse(TEXT("Identity rotation rejected"),
+            StrandSplineEditOperations::RotateSelectedQuat(LocalPoints, One, FQuat::Identity));
+    }
+    TestTrue(TEXT("Absolute numeric position resolves to target-minus-current"),
+        FMath::IsNearlyEqual(StrandSplineEditOperations::PositionEntryDelta(-50.0, 125.0, false), 175.0));
+    TestTrue(TEXT("Relative numeric position preserves signed offset"),
+        FMath::IsNearlyEqual(StrandSplineEditOperations::PositionEntryDelta(-50.0, -25.0, true), -25.0));
+    {
+        const FQuat LocalFrame(FVector::ZAxisVector, UE_PI / 2.0);
+        const FQuat InputDelta(FVector::XAxisVector, UE_PI / 4.0);
+        const FQuat LocalDelta = StrandSplineEditOperations::WidgetRotationToAsset(InputDelta, LocalFrame, true);
+        const FQuat WorldDelta = StrandSplineEditOperations::WidgetRotationToAsset(InputDelta, LocalFrame, false);
+        TestTrue(TEXT("Local widget rotation follows point orientation"),
+            LocalDelta.RotateVector(FVector::ZAxisVector).Equals(FVector(FMath::Sqrt(0.5), 0.0, FMath::Sqrt(0.5)), 0.00001));
+        TestTrue(TEXT("World widget rotation ignores point orientation"),
+            WorldDelta.RotateVector(FVector::YAxisVector).Equals(InputDelta.RotateVector(FVector::YAxisVector), 0.00001));
+    }
     TestFalse(TEXT("Zero scale rejected"),
         StrandSplineEditOperations::ScaleSelected(Points, Selection, 0.0));
     TestFalse(TEXT("Invalid rotation axis rejected"),
@@ -1304,4 +1694,239 @@ bool FStrandGroupEditingTest::RunTest(const FString& Parameters)
         Points[0].LocalPosition.Equals(Unchanged[0].LocalPosition));
     return true;
 }
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStrandSplinePrimitiveAuthoringTest,
+    "Strand.Editor.Authoring.SplinePrimitiveAuthoring",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FStrandSplinePrimitiveAuthoringTest::RunTest(const FString& Parameters)
+{
+    for (int32 Kind = 0; Kind < 3; ++Kind)
+    {
+        TArray<FSplinePointData> Points;
+        bool bClosed = false;
+        TestTrue(TEXT("Primitive creation succeeds"),
+            StrandSplineEditOperations::MakePrimitive(Kind, Points, bClosed));
+        TestEqual(TEXT("Expected anchor count"), Points.Num(), Kind == 2 ? 25 : 4);
+        TestEqual(TEXT("Expected closure"), bClosed, Kind != 2);
+        USplineDataAsset* Asset = NewObject<USplineDataAsset>(GetTransientPackage());
+        Asset->Points = Points;
+        Asset->bIsClosedLoop = bClosed;
+        USplineComponent* Native = NewObject<USplineComponent>(GetTransientPackage());
+        Asset->ApplyToSplineComponent(Native);
+        TestEqual(TEXT("Native spline anchor count"), Native->GetNumberOfSplinePoints(), Points.Num());
+        TestEqual(TEXT("Native spline closure"), Native->IsClosedLoop(), bClosed);
+        TestTrue(TEXT("Primitive round-trip matches native component"), Asset->MatchesSplineComponent(Native, 0.001f));
+        if (Kind == 0)
+        {
+            TestTrue(TEXT("Circle starts at +X"), Points[0].LocalPosition.Equals(FVector(100, 0, 0), 0.001));
+            TestTrue(TEXT("Circle tangent points to +Y"), Points[0].LeaveTangent.Y > 160.0);
+            TestTrue(TEXT("Circle circumference near expected"),
+                FMath::Abs(Native->GetSplineLength() - 2.0 * UE_PI * 100.0) < 1.0);
+        }
+        if (Kind == 1)
+        {
+            TestTrue(TEXT("Rectangle uses linear interpolation"),
+                Points[0].PointType == ESplinePointType::Linear);
+            TestTrue(TEXT("Rectangle has expected perimeter"),
+                FMath::Abs(Native->GetSplineLength() - 700.0) < 0.01);
+        }
+        if (Kind == 2)
+        {
+            TestTrue(TEXT("Helix rises along Z"), Points.Last().LocalPosition.Z > Points[0].LocalPosition.Z);
+            TestTrue(TEXT("Helix preserves finite tangents"), !Points[5].LeaveTangent.ContainsNaN());
+        }
+    }
+    TArray<FSplinePointData> Points;
+    bool bClosed = false;
+    TestFalse(TEXT("Invalid primitive type rejected"),
+        StrandSplineEditOperations::MakePrimitive(-1, Points, bClosed));
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStrandInPlacePrimitiveReplacementTest,
+    "Strand.Editor.Authoring.InPlacePrimitiveReplacement",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FStrandInPlacePrimitiveReplacementTest::RunTest(const FString& Parameters)
+{
+    USplineDataAsset* Current = NewObject<USplineDataAsset>(GetTransientPackage());
+    TestTrue(TEXT("Initial asset is valid"), Current != nullptr);
+    if (!Current) { return false; }
+    Current->DefaultAnchorPointIndex = 2;
+    FSplinePointData Before;
+    Before.LocalPosition = FVector(41, 17, -8);
+    Current->Points.Add(Before);
+    Current->bIsClosedLoop = false;
+    USplineDataAsset* Identity = Current;
+
+    for (int32 Kind : {0, 1, 2})
+    {
+        TestTrue(TEXT("In-place geometry replacement succeeds"),
+            StrandSplineEditOperations::ReplacePrimitiveGeometry(*Current, Kind));
+        TestTrue(TEXT("Same spline asset remains open"), Current == Identity);
+        TestEqual(TEXT("Expected point count"), Current->Points.Num(), Kind == 2 ? 25 : 4);
+        TestEqual(TEXT("Expected loop state"), Current->bIsClosedLoop, Kind != 2);
+        TestEqual(TEXT("Placement settings are preserved"), Current->DefaultAnchorPointIndex, 2);
+        USplineComponent* Native = NewObject<USplineComponent>(GetTransientPackage());
+        Current->ApplyToSplineComponent(Native);
+        TestTrue(TEXT("Replaced geometry retains native spline compatibility"),
+            Current->MatchesSplineComponent(Native, 0.001f));
+    }
+    const TArray<FSplinePointData> Saved = Current->Points;
+    const bool bSavedLoop = Current->bIsClosedLoop;
+    TestFalse(TEXT("Unknown primitive cannot overwrite existing geometry"),
+        StrandSplineEditOperations::ReplacePrimitiveGeometry(*Current, -1));
+    TestEqual(TEXT("Invalid action preserves point count"), Current->Points.Num(), Saved.Num());
+    TestEqual(TEXT("Invalid action preserves closed state"), Current->bIsClosedLoop, bSavedLoop);
+    TestTrue(TEXT("Invalid action preserves first anchor"),
+        Current->Points[0].LocalPosition.Equals(Saved[0].LocalPosition));
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStrandArcLengthResamplingTest,
+    "Strand.Editor.Authoring.ArcLengthResampling",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FStrandArcLengthResamplingTest::RunTest(const FString& Parameters)
+{
+    TArray<FSplinePointData> SourcePoints;
+    bool bClosed = false;
+    TestTrue(TEXT("Circle primitive generated"), StrandSplineEditOperations::MakePrimitive(0, SourcePoints, bClosed));
+    USplineComponent* Native = NewObject<USplineComponent>(GetTransientPackage());
+    Native->ClearSplinePoints(false);
+    for (int32 Index = 0; Index < SourcePoints.Num(); ++Index)
+    {
+        Native->AddPoint(SourcePoints[Index].ToSplinePoint(Index), false);
+    }
+    Native->SetClosedLoop(bClosed, true);
+    TArray<FSplinePointData> NewPoints;
+    TestTrue(TEXT("Closed curve resampled"), StrandSplineEditOperations::ResampleByArcLength(
+        Native, SourcePoints, true, 16, NewPoints));
+    TestEqual(TEXT("Exact resampled anchor count"), NewPoints.Num(), 16);
+    if (NewPoints.Num() != 16) { return false; }
+    // Technical-art workflows must support arbitrary exact counts, not just
+    // the old 8/16/32/64 presets.
+    TestTrue(TEXT("Arbitrary 37-point request succeeds"), StrandSplineEditOperations::ResampleByArcLength(
+        Native, SourcePoints, true, 37, NewPoints));
+    TestEqual(TEXT("Exact arbitrary anchor count"), NewPoints.Num(), 37);
+    TestFalse(TEXT("Above hard cap rejected"), StrandSplineEditOperations::ResampleByArcLength(
+        Native, SourcePoints, true, 4097, NewPoints));
+    TestEqual(TEXT("Rejected count does not replace output"), NewPoints.Num(), 37);
+    TestTrue(TEXT("First position preserved"), NewPoints[0].LocalPosition.Equals(SourcePoints[0].LocalPosition, 0.001));
+    for (const FSplinePointData& Point : NewPoints)
+    {
+        TestFalse(TEXT("No NaN in resampled positions"), Point.LocalPosition.ContainsNaN());
+        TestFalse(TEXT("No NaN in resampled tangents"), Point.LeaveTangent.ContainsNaN());
+    }
+    TArray<FSplinePointData> Unchanged = NewPoints;
+    TestFalse(TEXT("Invalid zero samples rejected"), StrandSplineEditOperations::ResampleByArcLength(
+        Native, SourcePoints, true, 0, NewPoints));
+    TestEqual(TEXT("Invalid request does not modify existing output"), NewPoints.Num(), Unchanged.Num());
+    Native->SetClosedLoop(false, true);
+    TestTrue(TEXT("Open curve resampled"), StrandSplineEditOperations::ResampleByArcLength(
+        Native, SourcePoints, false, 8, NewPoints));
+    TestEqual(TEXT("Open curve count"), NewPoints.Num(), 8);
+    TestTrue(TEXT("Open curve final point matches endpoint"),
+        NewPoints.Last().LocalPosition.Equals(SourcePoints.Last().LocalPosition, 0.01));
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStrandNativeSplineConversionContractTest,
+    "Strand.Editor.Authoring.NativeSplineCaptureContract",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FStrandNativeSplineConversionContractTest::RunTest(const FString& Parameters)
+{
+    USplineComponent* Native = NewObject<USplineComponent>(GetTransientPackage());
+    Native->ClearSplinePoints(false);
+    Native->AddPoint(FSplinePoint(0, FVector(25, -15, 40), FVector(10, -20, 5),
+        FVector(25, 30, 10), FRotator(5, 30, 10), FVector(1, 2, 1),
+        ESplinePointType::CurveCustomTangent), false);
+    Native->AddPoint(FSplinePoint(1, FVector(-120, 80, 65), FVector(-12, 10, 5),
+        FVector(20, 0, -4), FRotator(0, -40, 5), FVector(1, 1, 2),
+        ESplinePointType::CurveCustomTangent), false);
+    Native->AddPoint(FSplinePoint(2, FVector(-170, 90, 140), FVector(-11, -5, 9),
+        FVector(8, 6, 0), FRotator(10, 0, -5), FVector(2, 1, 1),
+        ESplinePointType::CurveCustomTangent), false);
+    Native->SetClosedLoop(true, false);
+    Native->SetRelativeTransform(FTransform(FRotator(0, 20, 0), FVector(100, 500, 30)));
+    Native->UpdateSpline();
+    const FTransform NativeTransform = Native->GetRelativeTransform();
+    USplineDataAsset* Captured = NewObject<USplineDataAsset>(GetTransientPackage());
+    Captured->SerializeFromSplineComponent(Native);
+    TestEqual(TEXT("Capture preserves point count"), Captured->Points.Num(), 3);
+    TestTrue(TEXT("Capture preserves closed flag"), Captured->bIsClosedLoop);
+    TestTrue(TEXT("Capture preserves exact native point geometry"), Captured->MatchesSplineComponent(Native, 0.0001f));
+    TestTrue(TEXT("Capture leaves component transform intact"), Native->GetRelativeTransform().Equals(NativeTransform));
+    UStrandSplineUserData::AssignAsset(Native, Captured);
+    TestEqual(TEXT("Captured native spline linked to new asset"),
+        UStrandSplineUserData::GetAssignedAsset(Native), Captured);
+    TestTrue(TEXT("Linking captured asset does not alter native geometry"), Captured->MatchesSplineComponent(Native, 0.0001f));
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStrandTangentEndpointExtensionTest,
+    "Strand.Editor.Authoring.TangentEndpointExtension",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FStrandTangentEndpointExtensionTest::RunTest(const FString& Parameters)
+{
+    TArray<FSplinePointData> Source;
+    FSplinePointData A, B, C;
+    A.LocalPosition = FVector(0, 0, 0);
+    B.LocalPosition = FVector(100, 80, 20);
+    C.LocalPosition = FVector(210, 200, 75);
+    A.PointType = B.PointType = C.PointType = ESplinePointType::CurveCustomTangent;
+    A.ArriveTangent = A.LeaveTangent = FVector(60, 120, 15);
+    B.ArriveTangent = B.LeaveTangent = FVector(110, 95, 50);
+    C.ArriveTangent = C.LeaveTangent = FVector(120, -30, 45);
+    Source = {A, B, C};
+    USplineComponent* Native = NewObject<USplineComponent>(GetTransientPackage());
+    Native->ClearSplinePoints(false);
+    for (int32 Index = 0; Index < Source.Num(); ++Index)
+    {
+        Native->AddPoint(Source[Index].ToSplinePoint(Index), false);
+    }
+    Native->UpdateSpline();
+    const FVector StartDirection = -Native->GetSplinePointAt(0, ESplineCoordinateSpace::Local).ArriveTangent.GetSafeNormal();
+    const FVector EndDirection = Native->GetSplinePointAt(2, ESplineCoordinateSpace::Local).LeaveTangent.GetSafeNormal();
+    TArray<FSplinePointData> ExtendedStart = Source;
+    TestTrue(TEXT("Extend start succeeds"), StrandSplineEditOperations::ExtendOpenEndpoint(ExtendedStart, Native, true));
+    TestEqual(TEXT("Start adds exactly one point"), ExtendedStart.Num(), 4);
+    TestTrue(TEXT("Start extension follows negative incoming tangent"),
+        (ExtendedStart[0].LocalPosition - Source[0].LocalPosition).GetSafeNormal().Equals(StartDirection, 0.0001));
+    TestTrue(TEXT("Original start location preserved"), ExtendedStart[1].LocalPosition.Equals(Source[0].LocalPosition));
+    TArray<FSplinePointData> ExtendedEnd = Source;
+    TestTrue(TEXT("Extend end succeeds"), StrandSplineEditOperations::ExtendOpenEndpoint(ExtendedEnd, Native, false));
+    TestEqual(TEXT("End adds exactly one point"), ExtendedEnd.Num(), 4);
+    TestTrue(TEXT("End extension follows outgoing tangent"),
+        (ExtendedEnd.Last().LocalPosition - Source.Last().LocalPosition).GetSafeNormal().Equals(EndDirection, 0.0001));
+    TestTrue(TEXT("Original end position preserved"), ExtendedEnd[2].LocalPosition.Equals(Source[2].LocalPosition));
+    TestFalse(TEXT("Null preview rejected"), StrandSplineEditOperations::ExtendOpenEndpoint(ExtendedEnd, nullptr, false));
+    // Imported/auto points can serialize zero tangents; evaluate the native
+    // curve rather than using those raw zero vectors to place new endpoints.
+    TArray<FSplinePointData> AutoPoints = Source;
+    for (FSplinePointData& Point : AutoPoints)
+    {
+        Point.PointType = ESplinePointType::Curve;
+        Point.ArriveTangent = Point.LeaveTangent = FVector::ZeroVector;
+    }
+    USplineComponent* AutoNative = NewObject<USplineComponent>(GetTransientPackage());
+    AutoNative->ClearSplinePoints(false);
+    for (int32 Index = 0; Index < AutoPoints.Num(); ++Index)
+    {
+        AutoNative->AddPoint(AutoPoints[Index].ToSplinePoint(Index), false);
+    }
+    AutoNative->UpdateSpline();
+    const FVector EvaluatedAutoDirection = -AutoNative->GetSplinePointAt(0,
+        ESplineCoordinateSpace::Local).ArriveTangent.GetSafeNormal();
+    TestTrue(TEXT("Auto start extends"), StrandSplineEditOperations::ExtendOpenEndpoint(
+        AutoPoints, AutoNative, true));
+    TestTrue(TEXT("Auto spline extends along evaluated tangent"),
+        (AutoPoints[0].LocalPosition - Source[0].LocalPosition).GetSafeNormal().Equals(EvaluatedAutoDirection, 0.0001));
+    TestEqual(TEXT("Original Auto endpoint converted for tangent preservation"),
+        AutoPoints[1].PointType.GetValue(), ESplinePointType::CurveCustomTangent);
+    return true;
+}
+
 #endif
