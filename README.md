@@ -9,7 +9,7 @@ Strand has two complementary editing workflows:
 - **Strand Spline Editor:** Double-click a Strand Spline asset to edit its saved curve in a dedicated 2D/3D preview. These changes modify the asset, not existing level actors.
 - **Native Level Editor spline editing:** Drag a Strand asset into the level or associate it with an existing native spline component. Continue using Unreal's native actor, spline, and viewport tools. Explicitly **Apply Asset** or **Update Asset** to synchronize the two copies.
 
-**Package:** v0.6.24 source, targeting Unreal Engine 5.8.3 on Windows 64-bit. The editor uses Unreal's host-provided asset toolbar, direct authoring buttons, separate Spline Details and Source & Import tabs, and contextual hover actions. See [TEST_PLAN_0.6.24.md](TEST_PLAN_0.6.24.md) for build and live-editor verification.
+**Package:** v0.6.25 source, targeting Unreal Engine 5.8.3 on Windows 64-bit. The editor uses Unreal's host-provided asset toolbar, direct authoring buttons, separate Spline Details and Source & Import tabs, and contextual hover actions. See [TEST_PLAN_0.6.25.md](TEST_PLAN_0.6.25.md) for build and live-editor verification.
 
 ### Direct curve shaping
 
@@ -17,7 +17,7 @@ In **Select** mode, hold **Ctrl** and drag the middle of a spline segment to ben
 
 **Shift-click** continues to insert an anchor at the cursor, while **right-drag** and **RMB+WASD** remain viewport navigation. Ctrl-clicking an anchor or native gizmo retains its previous behavior.
 
-The **left modeling rail** uses square 24-pixel vector artwork within the native 36-pixel-tall button content area. The successfully fixed top toolbar and its independent icon layer are unchanged.
+The **left modeling rail** and top toolbar render their artwork through matching independent, centered 28×28 icon layers instead of constraining the art within native Slate button padding. Dropdown icons occupy an independent left-aligned icon surface clear of the chevron; the existing 48×36 action buttons and 60×36 dropdown dimensions remain unchanged.
 ## Install
 
 1. Close Unreal Editor and replace the **entire** `<Project>/Plugins/Strand/` folder with the `Strand/` folder from this ZIP. Do not merge the ZIP into an old source tree. UnrealBuildTool will compile leftover `.cpp` files from older versions.

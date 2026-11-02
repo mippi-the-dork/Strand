@@ -69,12 +69,57 @@ namespace
         return FAppStyle::GetBrush(Icon);
     }
 
+    // Top-row icons are correct because they sit in an independent, centered
+    // overlay above a blank native control. The left modeling rail must use the
+    // SAME layout. Putting art inside an SButton/SCheckBox compresses it through
+    // content padding (as verified by comparing rendered buttons at 1:1 scale).
+    constexpr float RailIconPixels = 28.0f;
+
+    TSharedRef<SWidget> RailIconControl(const TSharedRef<SWidget>& ActionSurface, const FName Icon)
+    {
+        return SNew(SOverlay)
+            + SOverlay::Slot()
+            [ActionSurface]
+            + SOverlay::Slot().HAlign(HAlign_Center).VAlign(VAlign_Center)
+            [SNew(SBox)
+                .WidthOverride(RailIconPixels).HeightOverride(RailIconPixels)
+                .HAlign(HAlign_Center).VAlign(VAlign_Center)
+                .Visibility(EVisibility::HitTestInvisible)
+                [SNew(SImage)
+                    .Image(AuthoringBrush(Icon))
+                    .DesiredSizeOverride(FVector2D(RailIconPixels, RailIconPixels))
+                    .ColorAndOpacity_Lambda([ActionSurface]()
+                    {
+                        return ActionSurface->IsEnabled() ? FLinearColor::White : FLinearColor(1.0f, 1.0f, 1.0f, 0.45f);
+                    })]];
+    }
+
+    // A combo button has a native chevron on its right. Position the art at
+    // the visual center of the *remaining* left-hand action region, without
+    // running it through SComboButton's compressed content padding.
+    TSharedRef<SWidget> RailDropdownControl(const TSharedRef<SWidget>& ActionSurface, const FName Icon)
+    {
+        return SNew(SOverlay)
+            + SOverlay::Slot()
+            [ActionSurface]
+            + SOverlay::Slot().HAlign(HAlign_Left).VAlign(VAlign_Center).Padding(9.0f, 0.0f, 0.0f, 0.0f)
+            [SNew(SBox)
+                .WidthOverride(RailIconPixels).HeightOverride(RailIconPixels)
+                .HAlign(HAlign_Center).VAlign(VAlign_Center)
+                .Visibility(EVisibility::HitTestInvisible)
+                [SNew(SImage)
+                    .Image(AuthoringBrush(Icon))
+                    .DesiredSizeOverride(FVector2D(RailIconPixels, RailIconPixels))
+                    .ColorAndOpacity_Lambda([ActionSurface]()
+                    {
+                        return ActionSurface->IsEnabled() ? FLinearColor::White : FLinearColor(1.0f, 1.0f, 1.0f, 0.45f);
+                    })]];
+    }
+
+    // The separate View/Plane/Snap dropdowns in the top toolbar already render
+    // correctly. Keep their existing internal content path unchanged.
     TSharedRef<SWidget> CompactIcon(const FName Icon)
     {
-        // The vertical rail uses 36px-high native Slate buttons. Their built-in
-        // padding leaves less than 30px for content. Keep the art square and
-        // smaller than the *actual content rectangle*; otherwise Slate stretches
-        // it vertically while the already-fixed top toolbar looks correct.
         return SNew(SBox).WidthOverride(24.0f).HeightOverride(24.0f)
             .HAlign(HAlign_Center).VAlign(VAlign_Center)
             [SNew(SImage).Image(AuthoringBrush(Icon))
@@ -598,107 +643,112 @@ TSharedRef<SDockTab> FStrandSplineAssetEditor::SpawnPreviewTab(const FSpawnTabAr
             + SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center).Padding(3.0f)
             [SNew(SBox).WidthOverride(48.0f).HeightOverride(36.0f)
                 .HAlign(HAlign_Fill).VAlign(VAlign_Fill)
-                [SNew(SCheckBox).Style(FAppStyle::Get(), "ToggleButtonCheckbox")
+                [RailIconControl(SNew(SCheckBox).Style(FAppStyle::Get(), "ToggleButtonCheckbox")
                 .IsChecked_Lambda([this]() { return bPenMode ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
                 .OnCheckStateChanged_Lambda([this](ECheckBoxState State) { SetPenMode(State == ECheckBoxState::Checked); })
                 .ToolTipText(LOCTEXT("DrawPenTip", "Pen tool (P). Click to create anchors; drag to create Bezier handles. Esc to finish."))
-                [CompactIcon(TEXT("Strand.Pen"))]]]
+                [SNullWidget::NullWidget], FName(TEXT("Strand.Pen")))]]
             + SVerticalBox::Slot().AutoHeight().Padding(1.0f, 5.0f)
             [SNew(SSeparator)]
             + SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center).Padding(3.0f)
             [SNew(SBox).WidthOverride(48.0f).HeightOverride(36.0f)
                 .HAlign(HAlign_Fill).VAlign(VAlign_Fill)
-                [SNew(SButton).ContentPadding(FMargin(2.0f))
+                [RailIconControl(SNew(SButton).ContentPadding(FMargin(2.0f))
                 .ToolTipText(LOCTEXT("StrandInsertTip", "Insert a point after the selected anchor."))
                 .IsEnabled(this, &FStrandSplineAssetEditor::HasSelectedPoint)
                 .OnClicked(this, &FStrandSplineAssetEditor::AddPointAfterSelection)
-                [CompactIcon(TEXT("Strand.Insert"))]]]
+                [SNullWidget::NullWidget], FName(TEXT("Strand.Insert")))]]
             + SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center).Padding(3.0f)
             [SNew(SBox).WidthOverride(48.0f).HeightOverride(36.0f)
                 .HAlign(HAlign_Fill).VAlign(VAlign_Fill)
-                [SNew(SButton).ContentPadding(FMargin(2.0f))
+                [RailIconControl(SNew(SButton).ContentPadding(FMargin(2.0f))
                 .ToolTipText(LOCTEXT("StrandDeleteTip", "Delete selected spline anchors (Delete)."))
                 .IsEnabled(this, &FStrandSplineAssetEditor::CanDeleteSelection)
                 .OnClicked(this, &FStrandSplineAssetEditor::RemoveSelectedPoint)
-                [CompactIcon(TEXT("Strand.Delete"))]]]
+                [SNullWidget::NullWidget], FName(TEXT("Strand.Delete")))]]
             + SVerticalBox::Slot().AutoHeight().Padding(1.0f, 5.0f)
             [SNew(SSeparator)]
             + SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center).Padding(3.0f)
             [SNew(SBox).WidthOverride(48.0f).HeightOverride(36.0f)
                 .HAlign(HAlign_Fill).VAlign(VAlign_Fill)
-                [SNew(SButton).ContentPadding(FMargin(2.0f))
+                [RailIconControl(SNew(SButton).ContentPadding(FMargin(2.0f))
                 .ToolTipText(LOCTEXT("StrandSubdivideTip", "Subdivide all spline segments, preserving curve shape."))
                 .OnClicked(this, &FStrandSplineAssetEditor::SubdivideSpline)
-                [CompactIcon(TEXT("Strand.Subdivide"))]]]
+                [SNullWidget::NullWidget], FName(TEXT("Strand.Subdivide")))]]
             + SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center).Padding(3.0f)
             [SNew(SBox).WidthOverride(48.0f).HeightOverride(36.0f)
                 .HAlign(HAlign_Fill).VAlign(VAlign_Fill)
-                [SNew(SButton).ContentPadding(FMargin(2.0f))
+                [RailIconControl(SNew(SButton).ContentPadding(FMargin(2.0f))
                 .ToolTipText(LOCTEXT("StrandSmoothTip", "Auto-smooth the spline tangents."))
                 .OnClicked(this, &FStrandSplineAssetEditor::SmoothSpline)
-                [CompactIcon(TEXT("Strand.Smooth"))]]]
+                [SNullWidget::NullWidget], FName(TEXT("Strand.Smooth")))]]
             + SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center).Padding(3.0f)
             [SNew(SBox).WidthOverride(48.0f).HeightOverride(36.0f)
                 .HAlign(HAlign_Fill).VAlign(VAlign_Fill)
-                [SNew(SButton).ContentPadding(FMargin(2.0f))
+                [RailIconControl(SNew(SButton).ContentPadding(FMargin(2.0f))
                 .ToolTipText(LOCTEXT("StrandLinearTip", "Linearize all segments."))
                 .OnClicked(this, &FStrandSplineAssetEditor::LinearizeSpline)
-                [CompactIcon(TEXT("Strand.Linear"))]]]
+                [SNullWidget::NullWidget], FName(TEXT("Strand.Linear")))]]
             + SVerticalBox::Slot().AutoHeight().Padding(1.0f, 5.0f)
             [SNew(SSeparator)]
             + SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center).Padding(3.0f)
             [SNew(SBox).WidthOverride(48.0f).HeightOverride(36.0f)
                 .HAlign(HAlign_Fill).VAlign(VAlign_Fill)
-                [SNew(SButton).ContentPadding(FMargin(2.0f))
+                [RailIconControl(SNew(SButton).ContentPadding(FMargin(2.0f))
                 .ToolTipText(LOCTEXT("StrandReverseTip", "Reverse spline point order and tangents."))
                 .OnClicked(this, &FStrandSplineAssetEditor::ReverseSpline)
-                [CompactIcon(TEXT("Strand.Reverse"))]]]
+                [SNullWidget::NullWidget], FName(TEXT("Strand.Reverse")))]]
             + SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center).Padding(3.0f)
             [SNew(SBox).WidthOverride(48.0f).HeightOverride(36.0f)
                 .HAlign(HAlign_Fill).VAlign(VAlign_Fill)
-                [SNew(SButton).ContentPadding(FMargin(2.0f))
-                .ToolTipText_Lambda([this]() { return Asset.IsValid() && Asset->bIsClosedLoop
-                    ? LOCTEXT("StrandOpenLoopTip", "Open spline: break the connection between the final and first anchor. Undoable.")
-                    : LOCTEXT("StrandCloseLoopTip", "Close spline: connect the final anchor to the first. Undoable."); })
-                .OnClicked(this, &FStrandSplineAssetEditor::ToggleClosedLoop)
-                [SNew(SBox).WidthOverride(24.0f).HeightOverride(24.0f)
-                    .HAlign(HAlign_Center).VAlign(VAlign_Center)
-                    [SNew(SImage).DesiredSizeOverride(FVector2D(24.0f, 24.0f))
-                        .Image_Lambda([this]() { return AuthoringBrush(Asset.IsValid() && Asset->bIsClosedLoop
-                            ? FName(TEXT("Strand.OpenPath")) : FName(TEXT("Strand.ClosedPath"))); })]]]]
+                [SNew(SOverlay)
+                    + SOverlay::Slot()
+                    [SNew(SButton).ContentPadding(FMargin(2.0f))
+                        .ToolTipText_Lambda([this]() { return Asset.IsValid() && Asset->bIsClosedLoop
+                            ? LOCTEXT("StrandOpenLoopTip", "Open spline: break the connection between the final and first anchor. Undoable.")
+                            : LOCTEXT("StrandCloseLoopTip", "Close spline: connect the final anchor to the first. Undoable."); })
+                        .OnClicked(this, &FStrandSplineAssetEditor::ToggleClosedLoop)
+                        [SNullWidget::NullWidget]]
+                    + SOverlay::Slot().HAlign(HAlign_Center).VAlign(VAlign_Center)
+                    [SNew(SBox).WidthOverride(RailIconPixels).HeightOverride(RailIconPixels)
+                        .HAlign(HAlign_Center).VAlign(VAlign_Center)
+                        .Visibility(EVisibility::HitTestInvisible)
+                        [SNew(SImage).DesiredSizeOverride(FVector2D(RailIconPixels, RailIconPixels))
+                            .Image_Lambda([this]() { return AuthoringBrush(Asset.IsValid() && Asset->bIsClosedLoop
+                                ? FName(TEXT("Strand.OpenPath")) : FName(TEXT("Strand.ClosedPath"))); })]]]]
             + SVerticalBox::Slot().AutoHeight().Padding(1.0f, 5.0f)
             [SNew(SSeparator)]
             + SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center).Padding(3.0f)
             [SNew(SBox).WidthOverride(60.0f).HeightOverride(36.0f)
                 .HAlign(HAlign_Fill).VAlign(VAlign_Fill)
-                [SNew(SComboButton).ContentPadding(FMargin(0.0f))
+                [RailDropdownControl(SNew(SComboButton).ContentPadding(FMargin(0.0f))
                 .IsEnabled(this, &FStrandSplineAssetEditor::HasSelectedPoint)
                 .ToolTipText(LOCTEXT("HandleQuickToolTip", "Bezier handles: Free, Aligned, Mirrored, Auto, or Corner. Choose a persistent handle constraint for selected anchors."))
                 .OnGetMenuContent(this, &FStrandSplineAssetEditor::MakeHandleModeMenu)
-                .ButtonContent()[CompactIcon(TEXT("Strand.Handles"))]]]
+                .ButtonContent()[SNullWidget::NullWidget], FName(TEXT("Strand.Handles")))]]
             + SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center).Padding(3.0f)
             [SNew(SBox).WidthOverride(60.0f).HeightOverride(36.0f)
                 .HAlign(HAlign_Fill).VAlign(VAlign_Fill)
-                [SNew(SComboButton).ContentPadding(FMargin(0.0f))
+                [RailDropdownControl(SNew(SComboButton).ContentPadding(FMargin(0.0f))
                 .IsEnabled(this, &FStrandSplineAssetEditor::HasSelectedPoint)
                 .ToolTipText(LOCTEXT("InterpolationQuickToolTip", "Change selected anchor interpolation: Linear, Curve, Curve Clamped, Constant or Custom."))
                 .OnGetMenuContent(this, &FStrandSplineAssetEditor::MakePointTypeMenu)
-                .ButtonContent()[CompactIcon(TEXT("Strand.Interpolation"))]]]
+                .ButtonContent()[SNullWidget::NullWidget], FName(TEXT("Strand.Interpolation")))]]
             + SVerticalBox::Slot().AutoHeight().Padding(1.0f, 5.0f)
             [SNew(SSeparator)]
             + SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center).Padding(3.0f)
             [SNew(SBox).WidthOverride(60.0f).HeightOverride(36.0f)
                 .HAlign(HAlign_Fill).VAlign(VAlign_Fill)
-                [SNew(SComboButton).ContentPadding(FMargin(0.0f))
+                [RailDropdownControl(SNew(SComboButton).ContentPadding(FMargin(0.0f))
                 .ToolTipText(LOCTEXT("ReplacePrimitiveStripTip", "Replace THIS asset's spline with a Circle, Rectangle, or Helix. Supports Undo/Redo; removes any external-source reimport link."))
                 .OnGetMenuContent(this, &FStrandSplineAssetEditor::MakeReplacePrimitiveMenu)
-                .ButtonContent()[CompactIcon(TEXT("Strand.ReplaceShape"))]]]
+                .ButtonContent()[SNullWidget::NullWidget], FName(TEXT("Strand.ReplaceShape")))]]
             + SVerticalBox::Slot().AutoHeight().Padding(4.0f, 8.0f)
             [SNew(SBox).WidthOverride(60.0f).HeightOverride(36.0f)
                 .HAlign(HAlign_Fill).VAlign(VAlign_Fill)
-                [SNew(SComboButton).ContentPadding(FMargin(0.0f)).ToolTipText(LOCTEXT("MoreAuthoringTip", "More spline modeling operations, tangent and point tools."))
+                [RailDropdownControl(SNew(SComboButton).ContentPadding(FMargin(0.0f)).ToolTipText(LOCTEXT("MoreAuthoringTip", "More spline modeling operations, tangent and point tools."))
                 .OnGetMenuContent(this, &FStrandSplineAssetEditor::MakeSplineToolsMenu)
-                .ButtonContent()[CompactIcon(TEXT("Strand.More"))]]]]
+                .ButtonContent()[SNullWidget::NullWidget], FName(TEXT("Strand.More")))]]]
             + SHorizontalBox::Slot().FillWidth(1.0f)
             [SAssignNew(PreviewWidget, SStrandSplineViewport)]
         ]
