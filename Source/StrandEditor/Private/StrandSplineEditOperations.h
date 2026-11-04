@@ -144,6 +144,42 @@ namespace StrandSplineEditOperations
         return !A.LeaveTangent.ContainsNaN() && !B.ArriveTangent.ContainsNaN();
     }
 
+    // A non-destructive split of an OPEN curve at an existing internal anchor.
+    // Baking the native evaluated automatic tangents before separating points
+    // prevents native Auto from changing either half near the split boundary.
+    // The split anchor appears in both outputs. Outputs remain untouched on
+    // invalid requests, so the editor can preflight before creating assets.
+    inline bool SplitOpenSplineAtAnchor(const TArray<FSplinePointData>& Original,
+        bool bClosed, const USplineComponent* Native, int32 SplitIndex,
+        TArray<FSplinePointData>& OutStart, TArray<FSplinePointData>& OutEnd)
+    {
+        if (bClosed || !IsValid(Native) || Original.Num() < 3 ||
+            SplitIndex <= 0 || SplitIndex >= Original.Num() - 1 ||
+            Native->GetNumberOfSplinePoints() != Original.Num()) { return false; }
+        TArray<FSplinePointData> Baked = Original;
+        for (int32 Index = 0; Index < Baked.Num(); ++Index)
+        {
+            FSplinePointData& Point = Baked[Index];
+            if (Point.PointType == ESplinePointType::Curve ||
+                Point.PointType == ESplinePointType::CurveClamped)
+            {
+                const FSplinePoint Evaluated = Native->GetSplinePointAt(Index, ESplineCoordinateSpace::Local);
+                if (Evaluated.ArriveTangent.ContainsNaN() || Evaluated.LeaveTangent.ContainsNaN())
+                { return false; }
+                Point.ArriveTangent = Evaluated.ArriveTangent;
+                Point.LeaveTangent = Evaluated.LeaveTangent;
+                Point.PointType = ESplinePointType::CurveCustomTangent;
+                Point.HandleMode = EStrandBezierHandleMode::Free;
+            }
+        }
+        TArray<FSplinePointData> Start, End;
+        Start.Append(Baked.GetData(), SplitIndex + 1);
+        End.Append(Baked.GetData() + SplitIndex, Baked.Num() - SplitIndex);
+        OutStart = MoveTemp(Start);
+        OutEnd = MoveTemp(End);
+        return true;
+    }
+
     // Standard editable spline primitives, authored directly as native
     // spline point data. Do not replace them with sampled polylines.
     inline bool MakePrimitive(int32 Kind, TArray<FSplinePointData>& OutPoints, bool& bOutClosed)
@@ -364,6 +400,138 @@ namespace StrandSplineEditOperations
                 }
             }
         }
+    }
+
+    // Selection-only analysis: find discontinuities in the evaluated native
+    // curve direction. Uses native auto tangents where available and chord
+    // directions for linear and collapsed handles. Does not mutate the asset.
+    inline TArray<int32> FindSharpCorners(const USplineComponent* Native, double ThresholdDegrees)
+    {
+        TArray<int32> Result;
+        if (!IsValid(Native) || !FMath::IsFinite(ThresholdDegrees) ||
+            ThresholdDegrees < 1.0 || ThresholdDegrees > 179.0) { return Result; }
+        const int32 Count = Native->GetNumberOfSplinePoints();
+        const bool bClosed = Native->IsClosedLoop();
+        if (Count < (bClosed ? 3 : 3)) { return Result; }
+        for (int32 Index = bClosed ? 0 : 1; Index < (bClosed ? Count : Count - 1); ++Index)
+        {
+            const int32 Prev = (Index - 1 + Count) % Count;
+            const int32 Next = (Index + 1) % Count;
+            const FSplinePoint Point = Native->GetSplinePointAt(Index, ESplineCoordinateSpace::Local);
+            const FVector Position = Point.Position;
+            FVector Incoming = Point.ArriveTangent;
+            FVector Outgoing = Point.LeaveTangent;
+            if (Incoming.IsNearlyZero() || Point.Type == ESplinePointType::Linear || Point.Type == ESplinePointType::Constant)
+            {
+                Incoming = Position - Native->GetLocationAtSplinePoint(Prev, ESplineCoordinateSpace::Local);
+            }
+            if (Outgoing.IsNearlyZero() || Point.Type == ESplinePointType::Linear || Point.Type == ESplinePointType::Constant)
+            {
+                Outgoing = Native->GetLocationAtSplinePoint(Next, ESplineCoordinateSpace::Local) - Position;
+            }
+            if (Incoming.IsNearlyZero() || Outgoing.IsNearlyZero()) { continue; }
+            const double Alignment = FMath::Clamp(FVector::DotProduct(
+                Incoming.GetSafeNormal(), Outgoing.GetSafeNormal()), -1.0, 1.0);
+            const double TurnDegrees = FMath::RadiansToDegrees(FMath::Acos(Alignment));
+            if (TurnDegrees >= ThresholdDegrees - 1.0e-5) { Result.Add(Index); }
+        }
+        return Result;
+    }
+
+    // Join exactly two open Strand assets in the same asset-local coordinate
+    // space. The nearest pair of endpoints determines orientation. Converted
+    // native Auto/Clamped tangents preserve the original curves when adding
+    // or removing the common endpoint. Noncoincident ends get a LINEAR bridge,
+    // rather than a surprise Bezier overshoot.
+    // Outputs remain untouched for invalid input.
+    inline bool JoinOpenSplineAssets(const TArray<FSplinePointData>& First,
+        bool bFirstClosed, const USplineComponent* FirstNative,
+        const TArray<FSplinePointData>& Second, bool bSecondClosed,
+        const USplineComponent* SecondNative, TArray<FSplinePointData>& OutJoined,
+        double& OutGapCm, bool& bOutWelded)
+    {
+        if (bFirstClosed || bSecondClosed || !IsValid(FirstNative) || !IsValid(SecondNative) ||
+            First.Num() < 2 || Second.Num() < 2 ||
+            First.Num() + Second.Num() > 100000 ||
+            FirstNative->GetNumberOfSplinePoints() != First.Num() ||
+            SecondNative->GetNumberOfSplinePoints() != Second.Num()) { return false; }
+
+        auto BakeEvaluatedTangents = [](TArray<FSplinePointData>& Points, const USplineComponent* Native)
+        {
+            for (int32 Index = 0; Index < Points.Num(); ++Index)
+            {
+                FSplinePointData& Point = Points[Index];
+                if (Point.LocalPosition.ContainsNaN() || Point.ArriveTangent.ContainsNaN() ||
+                    Point.LeaveTangent.ContainsNaN()) { return false; }
+                if (Point.PointType == ESplinePointType::Curve ||
+                    Point.PointType == ESplinePointType::CurveClamped)
+                {
+                    const FSplinePoint Evaluated = Native->GetSplinePointAt(Index, ESplineCoordinateSpace::Local);
+                    if (Evaluated.ArriveTangent.ContainsNaN() || Evaluated.LeaveTangent.ContainsNaN())
+                    { return false; }
+                    Point.ArriveTangent = Evaluated.ArriveTangent;
+                    Point.LeaveTangent = Evaluated.LeaveTangent;
+                    Point.PointType = ESplinePointType::CurveCustomTangent;
+                    Point.HandleMode = EStrandBezierHandleMode::Free;
+                }
+            }
+            return true;
+        };
+
+        TArray<FSplinePointData> A = First;
+        TArray<FSplinePointData> B = Second;
+        if (!BakeEvaluatedTangents(A, FirstNative) ||
+            !BakeEvaluatedTangents(B, SecondNative)) { return false; }
+
+        // Four possible endpoint pairings, keeping the first asset before
+        // the second asset in the result. A is reversed when its START joins;
+        // B is reversed when its END joins.
+        double BestGap = TNumericLimits<double>::Max();
+        bool bReverseA = false;
+        bool bReverseB = false;
+        for (int32 AEnd = 0; AEnd < 2; ++AEnd)
+        {
+            for (int32 BEnd = 0; BEnd < 2; ++BEnd)
+            {
+                const FVector PA = A[AEnd == 0 ? 0 : A.Num() - 1].LocalPosition;
+                const FVector PB = B[BEnd == 0 ? 0 : B.Num() - 1].LocalPosition;
+                const double Gap = FVector::Distance(PA, PB);
+                if (!FMath::IsFinite(Gap)) { return false; }
+                if (Gap < BestGap)
+                {
+                    BestGap = Gap;
+                    bReverseA = AEnd == 0;
+                    bReverseB = BEnd == 1;
+                }
+            }
+        }
+        if (bReverseA) { Reverse(A, false); }
+        if (bReverseB) { Reverse(B, false); }
+        constexpr double ExactWeldToleranceCm = 0.001;
+        const bool bWeld = BestGap <= ExactWeldToleranceCm;
+        if (bWeld)
+        {
+            // Keep the first curve's incoming derivative, then use the second
+            // curve's outgoing derivative and segment interpolation. Only the
+            // duplicate boundary anchor is removed.
+            FSplinePointData& Seam = A.Last();
+            Seam.LeaveTangent = B[0].LeaveTangent;
+            Seam.PointType = B[0].PointType;
+            Seam.HandleMode = EStrandBezierHandleMode::Free;
+            A.Append(B.GetData() + 1, B.Num() - 1);
+        }
+        else
+        {
+            // Linear bridge from A.Last to B[0], leaving all original
+            // segment shapes unchanged on either side of the bridge.
+            A.Last().PointType = ESplinePointType::Linear;
+            A.Last().HandleMode = EStrandBezierHandleMode::Free;
+            A.Append(B);
+        }
+        OutJoined = MoveTemp(A);
+        OutGapCm = BestGap;
+        bOutWelded = bWeld;
+        return true;
     }
 
     // Split one native evaluated segment at arbitrary normalized t. Preserve

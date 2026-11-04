@@ -15,6 +15,8 @@
 #include "Math/RotationMatrix.h"
 #include "StrandSplineEditOperations.h"
 #include "StrandSplineInputUtils.h"
+#include "StrandSplineSelectionUtils.h"
+#include "StrandSplineFraming.h"
 #include <limits>
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSplineAssetRoundTripTest,
@@ -1457,6 +1459,310 @@ bool FStrandDirectSegmentBendTest::RunTest(const FString& Parameters)
     Asset->ApplyToSplineComponent(Native);
     TestTrue(TEXT("Linear-to-curve bending follows the requested offset"),
         Native->GetLocationAtSplineInputKey(0.5f, ESplineCoordinateSpace::Local).Equals(LinearOriginal + Delta, 0.01));
+    return true;
+}
+
+
+// Camera fit is tested in isolation: no editor window is required to prove
+// every evaluated curve sample projects within the requested safe viewport.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStrandSplineComfortFrameTest,
+    "Strand.Editor.Viewport.ComfortFrameSpline",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FStrandSplineComfortFrameTest::RunTest(const FString& Parameters)
+{
+    TArray<FVector> Points;
+    for (int32 I = 0; I <= 128; ++I)
+    {
+        const double T = static_cast<double>(I) / 128.0;
+        Points.Add(FVector(1000.0 * (T - 0.5), 280.0 * FMath::Sin(T * 9.0),
+            360.0 * FMath::Cos(T * 5.0) + 250.0 * T));
+    }
+    const FRotator View(-20.0, 45.0, 0.0);
+    for (const double Aspect : {0.65, 1.0, 1.78, 2.5})
+    {
+        StrandSplineFraming::FPerspectiveFit Fit;
+        if (!TestTrue(TEXT("Camera fit exists for valid perspective samples"),
+            StrandSplineFraming::FitPerspective(Points, View, 90.0, Aspect, 0.74, Fit)))
+        {
+            return false;
+        }
+        const FQuat Camera = View.Quaternion();
+        const double HTan = FMath::Tan(FMath::DegreesToRadians(45.0));
+        const double VTan = HTan / Aspect;
+        double MinX = DBL_MAX, MaxX = -DBL_MAX;
+        double MinY = DBL_MAX, MaxY = -DBL_MAX;
+        for (const FVector& P : Points)
+        {
+            const FVector Relative = P - Fit.Location;
+            const double Depth = FVector::DotProduct(Relative, Camera.GetForwardVector());
+            if (!TestTrue(TEXT("All framed samples in front of camera"), Depth > 10.0)) { return false; }
+            const double X = FVector::DotProduct(Relative, Camera.GetRightVector()) / (Depth * HTan);
+            const double Y = FVector::DotProduct(Relative, Camera.GetUpVector()) / (Depth * VTan);
+            MinX = FMath::Min(MinX, X); MaxX = FMath::Max(MaxX, X);
+            MinY = FMath::Min(MinY, Y); MaxY = FMath::Max(MaxY, Y);
+            if (!TestTrue(TEXT("Every point is comfortably within the perspective viewport"),
+                FMath::Abs(X) <= 0.741 && FMath::Abs(Y) <= 0.741)) { return false; }
+        }
+        TestTrue(TEXT("Projected horizontal extents are optically centered"),
+            FMath::Abs(MinX + MaxX) < 0.025);
+        TestTrue(TEXT("Projected vertical extents are optically centered"),
+            FMath::Abs(MinY + MaxY) < 0.025);
+    }
+    StrandSplineFraming::FPerspectiveFit Invalid;
+    TestFalse(TEXT("Invalid aspect rejected"),
+        StrandSplineFraming::FitPerspective(Points, View, 90.0, 0.0, 0.74, Invalid));
+    TestFalse(TEXT("Empty points rejected"),
+        StrandSplineFraming::FitPerspective(TArray<FVector>(), View, 90.0, 1.2, 0.74, Invalid));
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStrandSelectSharpCornersTest,
+    "Strand.Editor.Authoring.SelectSharpCorners",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FStrandSelectSharpCornersTest::RunTest(const FString& Parameters)
+{
+    USplineDataAsset* Asset = NewObject<USplineDataAsset>(GetTransientPackage());
+    USplineComponent* Native = NewObject<USplineComponent>(GetTransientPackage());
+    FSplinePointData A, B, C;
+    A.LocalPosition = FVector(0.0, 0.0, 0.0);
+    B.LocalPosition = FVector(100.0, 0.0, 0.0);
+    C.LocalPosition = FVector(100.0, 100.0, 0.0);
+    A.PointType = B.PointType = C.PointType = ESplinePointType::Linear;
+    Asset->Points = {A, B, C};
+    Asset->ApplyToSplineComponent(Native);
+    const TArray<int32> Corners = StrandSplineEditOperations::FindSharpCorners(Native, 45.0);
+    TestEqual(TEXT("Linear right angle has one interior corner"), Corners.Num(), 1);
+    if (Corners.Num() == 1) { TestEqual(TEXT("90-degree corner is middle point"), Corners[0], 1); }
+    TestTrue(TEXT("120-degree threshold excludes a right angle"),
+        StrandSplineEditOperations::FindSharpCorners(Native, 120.0).IsEmpty());
+    Asset->bIsClosedLoop = true;
+    Asset->ApplyToSplineComponent(Native);
+    TestEqual(TEXT("Closed right triangle includes seam corners"),
+        StrandSplineEditOperations::FindSharpCorners(Native, 45.0).Num(), 3);
+    Asset->bIsClosedLoop = false;
+    B.PointType = ESplinePointType::CurveCustomTangent;
+    B.ArriveTangent = FVector(100.0, 0.0, 0.0);
+    B.LeaveTangent = FVector(-100.0, 0.0, 0.0);
+    Asset->Points[1] = B;
+    Asset->ApplyToSplineComponent(Native);
+    TestEqual(TEXT("Custom-tangent reversal creates a cusp"),
+        StrandSplineEditOperations::FindSharpCorners(Native, 170.0).Num(), 1);
+    TestTrue(TEXT("Invalid threshold does not select points"),
+        StrandSplineEditOperations::FindSharpCorners(Native, 0.0).IsEmpty());
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStrandLassoSelectionGeometryTest,
+    "Strand.Editor.Authoring.LassoSelectionGeometry",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FStrandLassoSelectionGeometryTest::RunTest(const FString& Parameters)
+{
+    using namespace StrandSplineSelectionUtils;
+    TArray<FIntPoint> Polygon = { FIntPoint(10, 10), FIntPoint(90, 10),
+        FIntPoint(90, 70), FIntPoint(50, 45), FIntPoint(10, 70) };
+    TestTrue(TEXT("Closed freehand stroke recognized"), IsSelectionStroke(Polygon));
+    TestTrue(TEXT("Point inside outline selected"), IsInsideLasso(FVector2D(50, 20), Polygon));
+    TestTrue(TEXT("Edge hit included"), IsInsideLasso(FVector2D(10, 30), Polygon));
+    TestFalse(TEXT("Concave indentation excluded"), IsInsideLasso(FVector2D(50, 65), Polygon));
+    TestFalse(TEXT("Outside anchor excluded"), IsInsideLasso(FVector2D(120, 40), Polygon));
+    TArray<FIntPoint> Reverse = Polygon;
+    for (int32 I = 0, J = Reverse.Num() - 1; I < J; ++I, --J) { Reverse.Swap(I, J); }
+    TestTrue(TEXT("Opposite drawing direction works"), IsInsideLasso(FVector2D(50, 20), Reverse));
+    TestFalse(TEXT("Opposite drawing direction excludes indentation"), IsInsideLasso(FVector2D(50, 65), Reverse));
+    const TArray<FIntPoint> TinyStroke = { FIntPoint(1, 1), FIntPoint(2, 2), FIntPoint(3, 2) };
+    const TArray<FIntPoint> ShortStroke = { FIntPoint(1, 1), FIntPoint(2, 2) };
+    TestFalse(TEXT("Tiny stroke treated as click"), IsSelectionStroke(TinyStroke));
+    TestFalse(TEXT("Unclosed short stroke is not a polygon"), IsInsideLasso(FVector2D(50, 20), ShortStroke));
+    TSet<int32> InitialSelection;
+    InitialSelection.Add(2);
+    const TSet<int32> Grown = GrowAnchorSelection(InitialSelection, 5, false);
+    TestTrue(TEXT("Selection grows to previous neighbor"), Grown.Contains(1));
+    TestTrue(TEXT("Selection grows to next neighbor"), Grown.Contains(3));
+    TestEqual(TEXT("Grow selects three anchors"), Grown.Num(), 3);
+    const TSet<int32> Shrunk = ShrinkAnchorSelection(Grown, 5, false);
+    TestTrue(TEXT("Shrink returns center anchor"), Shrunk.Contains(2));
+    TestEqual(TEXT("Shrink removes both boundaries"), Shrunk.Num(), 1);
+    TSet<int32> Seam;
+    Seam.Add(0);
+    const TSet<int32> Wrapped = GrowAnchorSelection(Seam, 5, true);
+    TestTrue(TEXT("Closed-loop grow wraps across seam"), Wrapped.Contains(4));
+    TestFalse(TEXT("Open-loop grow never wraps"), GrowAnchorSelection(Seam, 5, false).Contains(4));
+        TArray<FIntPoint> Path = {FIntPoint(0,0)};
+    TestFalse(TEXT("Subpixel motion does not spam lasso samples"), ShouldAppendStrokePoint(Path, FIntPoint(1,1)));
+    TestTrue(TEXT("Significant motion appends a lasso sample"), ShouldAppendStrokePoint(Path, FIntPoint(5,5)));
+    return true;
+}
+
+// Complement to split: join from two selected open assets, preserving both
+// original 3D curves and auto-evaluated tangent geometry at the shared seam.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStrandJoinTwoAssetsTest,
+    "Strand.Editor.Authoring.JoinTwoOpenSplineAssets",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FStrandJoinTwoAssetsTest::RunTest(const FString& Parameters)
+{
+    USplineDataAsset* Source = NewObject<USplineDataAsset>(GetTransientPackage());
+    USplineComponent* Native = NewObject<USplineComponent>(GetTransientPackage());
+    for (int32 Index = 0; Index < 5; ++Index)
+    {
+        FSplinePointData Point;
+        Point.LocalPosition = FVector(Index * 140.0,
+            FMath::Sin(Index * 0.6) * 115.0, FMath::Cos(Index * 0.47) * 72.0);
+        Point.PointType = ESplinePointType::Curve;
+        Source->Points.Add(Point);
+    }
+    Source->ApplyToSplineComponent(Native);
+    TArray<FSplinePointData> Left, Right;
+    if (!TestTrue(TEXT("Can split the source"),
+        StrandSplineEditOperations::SplitOpenSplineAtAnchor(Source->Points, false,
+            Native, 2, Left, Right))) { return false; }
+    USplineDataAsset* LeftAsset = NewObject<USplineDataAsset>(GetTransientPackage());
+    USplineDataAsset* RightAsset = NewObject<USplineDataAsset>(GetTransientPackage());
+    LeftAsset->Points = Left;
+    RightAsset->Points = Right;
+    USplineComponent* LeftNative = NewObject<USplineComponent>(GetTransientPackage());
+    USplineComponent* RightNative = NewObject<USplineComponent>(GetTransientPackage());
+    LeftAsset->ApplyToSplineComponent(LeftNative);
+    RightAsset->ApplyToSplineComponent(RightNative);
+
+    TArray<FSplinePointData> Joined;
+    double Gap = -1.0;
+    bool bWelded = false;
+    TestTrue(TEXT("Join split halves"), StrandSplineEditOperations::JoinOpenSplineAssets(
+        Left, false, LeftNative, Right, false, RightNative, Joined, Gap, bWelded));
+    TestTrue(TEXT("Shared endpoint welded"), bWelded);
+    TestTrue(TEXT("Weld has zero gap"), FMath::IsNearlyZero(Gap, 0.001));
+    TestEqual(TEXT("Weld restores exact original anchor count"), Joined.Num(), 5);
+    TestEqual(TEXT("Source remains untouched"), Source->Points.Num(), 5);
+    TestEqual(TEXT("Original auto interpolation unchanged"),
+        Source->Points[2].PointType.GetValue(), ESplinePointType::Curve);
+    USplineDataAsset* Result = NewObject<USplineDataAsset>(GetTransientPackage());
+    Result->Points = Joined;
+    USplineComponent* JoinedNative = NewObject<USplineComponent>(GetTransientPackage());
+    Result->ApplyToSplineComponent(JoinedNative);
+    for (int32 Edge = 0; Edge < 4; ++Edge)
+    {
+        for (int32 Step = 0; Step <= 12; ++Step)
+        {
+            const double Key = Edge + Step / 12.0;
+            TestTrue(TEXT("Joined curve preserves original sampled 3D geometry"),
+                JoinedNative->GetLocationAtSplineInputKey(Key, ESplineCoordinateSpace::Local).Equals(
+                    Native->GetLocationAtSplineInputKey(Key, ESplineCoordinateSpace::Local), 0.01));
+        }
+    }
+
+    // Noncoincident ends: preserve both geometries with an explicit linear bridge.
+    FSplinePointData A0, A1, B0, B1;
+    A0.LocalPosition = FVector(0, 0, 0);
+    A1.LocalPosition = FVector(100, 0, 0);
+    B0.LocalPosition = FVector(220, 20, 10);
+    B1.LocalPosition = FVector(340, 20, 10);
+    A0.PointType = A1.PointType = B0.PointType = B1.PointType = ESplinePointType::Linear;
+    USplineDataAsset* First = NewObject<USplineDataAsset>(GetTransientPackage());
+    USplineDataAsset* Second = NewObject<USplineDataAsset>(GetTransientPackage());
+    First->Points = {A0, A1};
+    Second->Points = {B0, B1};
+    First->ApplyToSplineComponent(LeftNative);
+    Second->ApplyToSplineComponent(RightNative);
+    TArray<FSplinePointData> Bridge;
+    TestTrue(TEXT("Separated assets can join with explicit bridge"),
+        StrandSplineEditOperations::JoinOpenSplineAssets(First->Points, false, LeftNative,
+            Second->Points, false, RightNative, Bridge, Gap, bWelded));
+    TestFalse(TEXT("Separate ends are not welded"), bWelded);
+    TestEqual(TEXT("Separate join keeps all anchors"), Bridge.Num(), 4);
+    TestEqual(TEXT("Bridge is linear"), Bridge[1].PointType.GetValue(), ESplinePointType::Linear);
+
+    // The closest pair may require reversing the second asset.
+    Second->Points[0].LocalPosition = FVector(340, 0, 0);
+    Second->Points[1].LocalPosition = FVector(100, 0, 0);
+    Second->ApplyToSplineComponent(RightNative);
+    TArray<FSplinePointData> ReverseJoin;
+    TestTrue(TEXT("Join automatically orients nearest endpoints"),
+        StrandSplineEditOperations::JoinOpenSplineAssets(First->Points, false, LeftNative,
+            Second->Points, false, RightNative, ReverseJoin, Gap, bWelded));
+    TestTrue(TEXT("Nearest ends are welded after reversing second curve"), bWelded);
+    TestEqual(TEXT("Reverse join has three anchors"), ReverseJoin.Num(), 3);
+    TestTrue(TEXT("Reversed asset retains its far endpoint"),
+        ReverseJoin.Last().LocalPosition.Equals(FVector(340, 0, 0)));
+
+    const int32 UnmodifiedCount = ReverseJoin.Num();
+    First->bIsClosedLoop = true;
+    TestFalse(TEXT("Closed spline is rejected"),
+        StrandSplineEditOperations::JoinOpenSplineAssets(First->Points, true, LeftNative,
+            Second->Points, false, RightNative, ReverseJoin, Gap, bWelded));
+    TestEqual(TEXT("Invalid request does not alter caller output"), ReverseJoin.Num(), UnmodifiedCount);
+    return true;
+}
+
+// Non-destructive source split: both outputs share one internal boundary anchor
+// and preserve the native evaluated cubic, including automatic interpolation.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStrandSplitAtAnchorTest,
+    "Strand.Editor.Authoring.SplitOpenSplineAtAnchor",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FStrandSplitAtAnchorTest::RunTest(const FString& Parameters)
+{
+    USplineDataAsset* Source = NewObject<USplineDataAsset>(GetTransientPackage());
+    USplineComponent* Native = NewObject<USplineComponent>(GetTransientPackage());
+    for (int32 Index = 0; Index < 5; ++Index)
+    {
+        FSplinePointData Point;
+        Point.LocalPosition = FVector(Index * 100.0, FMath::Sin(Index * 0.7) * 90.0,
+            FMath::Cos(Index * 0.8) * 50.0);
+        Point.PointType = ESplinePointType::Curve;
+        Source->Points.Add(Point);
+    }
+    Source->ApplyToSplineComponent(Native);
+    TArray<FVector> Before;
+    for (int32 Edge = 0; Edge < 4; ++Edge)
+    {
+        for (int32 Step = 0; Step <= 10; ++Step)
+        {
+            Before.Add(Native->GetLocationAtSplineInputKey(Edge + Step / 10.0f,
+                ESplineCoordinateSpace::Local));
+        }
+    }
+    TArray<FSplinePointData> Start, End;
+    TestTrue(TEXT("Split valid internal anchor"), StrandSplineEditOperations::SplitOpenSplineAtAnchor(
+        Source->Points, false, Native, 2, Start, End));
+    TestEqual(TEXT("First half has three anchors"), Start.Num(), 3);
+    TestEqual(TEXT("Second half has three anchors"), End.Num(), 3);
+    TestTrue(TEXT("Both halves share the exact boundary anchor"),
+        Start.Last().LocalPosition.Equals(End[0].LocalPosition));
+    TestEqual(TEXT("Original source stays unchanged"), Source->Points.Num(), 5);
+    TestEqual(TEXT("Original automatic interpolation stays unchanged"),
+        Source->Points[2].PointType.GetValue(), ESplinePointType::Curve);
+    USplineDataAsset* SegmentAsset = NewObject<USplineDataAsset>(GetTransientPackage());
+    USplineComponent* Half = NewObject<USplineComponent>(GetTransientPackage());
+    for (int32 Side = 0; Side < 2; ++Side)
+    {
+        SegmentAsset->Points = Side == 0 ? Start : End;
+        SegmentAsset->bIsClosedLoop = false;
+        SegmentAsset->ApplyToSplineComponent(Half);
+        for (int32 Edge = 0; Edge < 2; ++Edge)
+        {
+            for (int32 Step = 0; Step <= 10; ++Step)
+            {
+                const FVector Actual = Half->GetLocationAtSplineInputKey(Edge + Step / 10.0f,
+                    ESplineCoordinateSpace::Local);
+                const FVector Expected = Before[(Edge + (Side == 0 ? 0 : 2)) * 11 + Step];
+                TestTrue(TEXT("Split half matches original evaluated curve"),
+                    Actual.Equals(Expected, 0.01));
+            }
+        }
+    }
+    TArray<FSplinePointData> InvalidStart, InvalidEnd;
+    TestFalse(TEXT("Cannot split a closed loop"),
+        StrandSplineEditOperations::SplitOpenSplineAtAnchor(Source->Points, true, Native,
+            2, InvalidStart, InvalidEnd));
+    TestFalse(TEXT("Cannot split at endpoint"),
+        StrandSplineEditOperations::SplitOpenSplineAtAnchor(Source->Points, false, Native,
+            0, InvalidStart, InvalidEnd));
+    TestTrue(TEXT("Invalid split leaves output untouched"),
+        InvalidStart.IsEmpty() && InvalidEnd.IsEmpty());
     return true;
 }
 

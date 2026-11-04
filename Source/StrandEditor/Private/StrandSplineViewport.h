@@ -54,6 +54,7 @@ public:
     void SetSelectedHandle(int32 Handle);
     void SetPenMode(bool bEnabled);
     void SetMarqueeMode(bool bEnabled);
+    void SetLassoMode(bool bEnabled);
     void SetWidgetMode(int32 Mode);
     void SetWidgetLocal(bool bLocal);
     void SetAuthoredAnchorRotation(const FRotator& Rotation);

@@ -12,6 +12,8 @@
 #include "Math/RotationMatrix.h"
 #include "StrandSplineEditOperations.h"
 #include "StrandSplineInputUtils.h"
+#include "StrandSplineSelectionUtils.h"
+#include "StrandSplineFraming.h"
 #include "Framework/Application/SlateApplication.h"
 
 namespace
@@ -44,24 +46,34 @@ namespace
         return FMath::CubicInterp(A.Position, A.LeaveTangent, B.Position, B.ArriveTangent, Alpha);
     }
 
+    void GatherFrameSamples(const USplineComponent* Spline, TArray<FVector>& OutSamples)
+    {
+        OutSamples.Reset();
+        if (!IsValid(Spline) || Spline->GetNumberOfSplinePoints() == 0) { return; }
+        const int32 Count = Spline->GetNumberOfSplinePoints();
+        const int32 Steps = FMath::Clamp(Count * 16, 96, MaxPreviewSegments);
+        OutSamples.Reserve(Count + Steps + 1);
+        for (int32 Index = 0; Index < Count; ++Index)
+        {
+            OutSamples.Add(Spline->GetLocationAtSplinePoint(Index, ESplineCoordinateSpace::World));
+        }
+        if (Count > 1)
+        {
+            const double Length = Spline->GetSplineLength();
+            for (int32 Index = 0; Index <= Steps; ++Index)
+            {
+                OutSamples.Add(Spline->GetLocationAtDistanceAlongSpline(
+                    Length * static_cast<double>(Index) / Steps, ESplineCoordinateSpace::World));
+            }
+        }
+    }
+
     FBox GetSplineBounds(const USplineComponent* Spline)
     {
         FBox Bounds(ForceInit);
-        if (!IsValid(Spline) || Spline->GetNumberOfSplinePoints() == 0) { return Bounds; }
-        const int32 PointCount = Spline->GetNumberOfSplinePoints();
-        for (int32 Index = 0; Index < PointCount; ++Index)
-        {
-            Bounds += Spline->GetLocationAtSplinePoint(Index, ESplineCoordinateSpace::Local);
-        }
-        if (PointCount > 1)
-        {
-            const int32 Samples = FMath::Clamp(PointCount * 8, 64, MaxPreviewSegments);
-            const double Length = Spline->GetSplineLength();
-            for (int32 Index = 0; Index <= Samples; ++Index)
-            {
-                Bounds += Spline->GetLocationAtDistanceAlongSpline(Length * Index / Samples, ESplineCoordinateSpace::Local);
-            }
-        }
+        TArray<FVector> Samples;
+        GatherFrameSamples(Spline, Samples);
+        for (const FVector& P : Samples) { Bounds += P; }
         return Bounds;
     }
 }
@@ -154,7 +166,15 @@ public:
     {
         bMarqueeMode = bEnable;
         bMarqueeDragging = false;
+        LassoPath.Reset();
+        bLassoMode = false;
         RefreshNativeWidget();
+        Invalidate();
+    }
+    void SetLassoMode(bool bEnable)
+    {
+        SetMarqueeMode(bEnable);
+        bLassoMode = bEnable;
         Invalidate();
     }
     void SetAuthoredAnchorRotation(const FRotator& InRotation)
@@ -244,6 +264,7 @@ public:
     void SetOnNudge(TFunction<void(const FVector&)> InCallback) { OnNudge = MoveTemp(InCallback); }
     FText GetInteractionHint() const
     {
+        if (bLassoMode) { return FText::FromString(TEXT("LASSO SELECT  |  Draw freely around anchors  |  Shift: add  |  Ctrl: toggle  |  Esc: exit")); }
         if (bPenMode || bMarqueeMode) { return FText::GetEmpty(); }
         if (GetCurrentWidgetAxis() != EAxisList::None)
         {
@@ -615,12 +636,72 @@ public:
 
     void FrameSpline()
     {
-        FBox Bounds = GetSplineBounds(Spline.Get());
-        if (!Bounds.IsValid) { Bounds = FBox(FVector(-50.0), FVector(50.0)); }
-        const FVector Center = Bounds.GetCenter();
-        const FVector Extent = Bounds.GetExtent();
-        const FVector SafeExtent(FMath::Max(Extent.X, 10.0), FMath::Max(Extent.Y, 10.0), FMath::Max(Extent.Z, 10.0));
-        FocusViewportOnBox(FBox(Center - SafeExtent, Center + SafeExtent), true);
+        const FIntPoint Size = Viewport ? Viewport->GetSizeXY() : FIntPoint(0, 0);
+        if (Size.X <= 1 || Size.Y <= 1)
+        {
+            // An asset can be assigned before its Slate viewport has a size.
+            // Defer initial framing instead of using an incorrect aspect ratio.
+            bFrameSplineWhenReady = true;
+            return;
+        }
+        bFrameSplineWhenReady = false;
+        TArray<FVector> Samples;
+        GatherFrameSamples(Spline.Get(), Samples);
+        if (Samples.IsEmpty()) { return; }
+
+        FBox Bounds(ForceInit);
+        for (const FVector& Point : Samples) { Bounds += Point; }
+        if (!Bounds.IsValid) { return; }
+        if (GetViewportType() == LVT_Perspective)
+        {
+            StrandSplineFraming::FPerspectiveFit Fit;
+            const double Aspect = static_cast<double>(Size.X) / Size.Y;
+            // 74% of the safe viewport half-angle leaves 26% margin around
+            // the projected silhouette, rather than just barely fitting it.
+            if (StrandSplineFraming::FitPerspective(Samples, GetViewRotation(),
+                static_cast<double>(ViewFOV), Aspect, 0.74, Fit))
+            {
+                SetViewLocation(Fit.Location);
+                SetLookAtLocation(Fit.Target, false);
+            }
+            else
+            {
+                FocusViewportOnBox(Bounds, true);
+            }
+        }
+        else
+        {
+            // Keep UE's native orthographic conventions, then adjust zoom to
+            // allow comfortable margins in the actual rectangular viewport.
+            FocusViewportOnBox(Bounds, true);
+            const ELevelViewportType Type = GetViewportType();
+            FVector2D Minimum(DBL_MAX, DBL_MAX), Maximum(-DBL_MAX, -DBL_MAX);
+            for (const FVector& P : Samples)
+            {
+                const FVector2D Plane = (Type == LVT_OrthoXY || Type == LVT_OrthoNegativeXY)
+                    ? FVector2D(P.X, P.Y)
+                    : (Type == LVT_OrthoXZ || Type == LVT_OrthoNegativeXZ)
+                        ? FVector2D(P.X, P.Z) : FVector2D(P.Y, P.Z);
+                Minimum.X = FMath::Min(Minimum.X, Plane.X);
+                Minimum.Y = FMath::Min(Minimum.Y, Plane.Y);
+                Maximum.X = FMath::Max(Maximum.X, Plane.X);
+                Maximum.Y = FMath::Max(Maximum.Y, Plane.Y);
+            }
+            const double UnitsPerPixel = GetOrthoUnitsPerPixel(Viewport);
+            if (UnitsPerPixel > 0.0 && FMath::IsFinite(UnitsPerPixel))
+            {
+                const double DesiredUnitsPerPixel = FMath::Max(
+                    FMath::Max((Maximum.X - Minimum.X) / (Size.X * 0.74),
+                        (Maximum.Y - Minimum.Y) / (Size.Y * 0.74)), 0.01);
+                const double Factor = DesiredUnitsPerPixel / UnitsPerPixel;
+                if (FMath::IsFinite(Factor) && Factor > 0.0)
+                {
+                    SetOrthoZoom(static_cast<float>(FMath::Clamp(
+                        static_cast<double>(GetOrthoZoom()) * Factor, 1.0, 1.0e9)));
+                }
+            }
+            CenterViewportAtPoint(Bounds.GetCenter(), true);
+        }
         Invalidate();
     }
 
@@ -739,6 +820,12 @@ public:
         {
             const FModifierKeysState Mods = FSlateApplication::Get().GetModifierKeys();
             if (!EventArgs.Viewport->KeyState(EKeys::RightMouseButton) &&
+                Mods.IsShiftDown() && !Mods.IsAltDown() && !Mods.IsControlDown() &&
+                EventArgs.Key == EKeys::B && OnToolShortcut)
+            {
+                OnToolShortcut(3); return true;
+            }
+            if (!EventArgs.Viewport->KeyState(EKeys::RightMouseButton) &&
                 !Mods.IsControlDown() && !Mods.IsAltDown() && !Mods.IsShiftDown())
             {
                 if (EventArgs.Key == EKeys::P && OnToolShortcut) { OnToolShortcut(1); return true; }
@@ -824,6 +911,8 @@ public:
                 bMarqueeDragging = true;
                 MarqueeStart = FIntPoint(EventArgs.Viewport->GetMouseX(), EventArgs.Viewport->GetMouseY());
                 MarqueeEnd = MarqueeStart;
+                LassoPath.Reset();
+                if (bLassoMode) { LassoPath.Add(MarqueeStart); }
                 const FModifierKeysState Mods = FSlateApplication::Get().GetModifierKeys();
                 bMarqueeAdd = Mods.IsShiftDown();
                 bMarqueeToggle = Mods.IsControlDown();
@@ -837,6 +926,7 @@ public:
             }
             if (EventArgs.Event == IE_Released && bMarqueeDragging)
             {
+                if (bLassoMode) { UpdateMarqueeCursor(EventArgs.Viewport->GetMouseX(), EventArgs.Viewport->GetMouseY()); }
                 bMarqueeDragging = false;
                 if (OnMarqueeSelected)
                 {
@@ -847,7 +937,10 @@ public:
                     const int32 MaxY = FMath::Max(MarqueeStart.Y, MarqueeEnd.Y);
                     // A click without a drag behaves like Select, including
                     // additive/toggle modifiers. It must not clear all anchors.
-                    if (MaxX - MinX < 4 && MaxY - MinY < 4)
+                    const bool bClick = bLassoMode
+                        ? !StrandSplineSelectionUtils::IsSelectionStroke(LassoPath)
+                        : MaxX - MinX < 4 && MaxY - MinY < 4;
+                    if (bClick)
                     {
                         int32 ClickedIndex = INDEX_NONE;
                         if (HHitProxy* ClickProxy = EventArgs.Viewport->GetHitProxy(MarqueeStart.X, MarqueeStart.Y))
@@ -858,6 +951,7 @@ public:
                             }
                         }
                         if (OnPointSelected) { OnPointSelected(ClickedIndex, bMarqueeAdd, bMarqueeToggle); }
+                        LassoPath.Reset();
                         Invalidate();
                         return true;
                     }
@@ -867,7 +961,8 @@ public:
                         {
                             FVector2D Screen;
                             if (ProjectAnchor(Native->GetLocationAtSplinePoint(Index, ESplineCoordinateSpace::Local), Screen) &&
-                                Screen.X >= MinX && Screen.X <= MaxX && Screen.Y >= MinY && Screen.Y <= MaxY)
+                                (bLassoMode ? StrandSplineSelectionUtils::IsInsideLasso(Screen, LassoPath)
+                                            : (Screen.X >= MinX && Screen.X <= MaxX && Screen.Y >= MinY && Screen.Y <= MaxY)))
                             {
                                 Indices.Add(Index);
                             }
@@ -875,6 +970,7 @@ public:
                     }
                     OnMarqueeSelected(Indices, bMarqueeAdd, bMarqueeToggle);
                 }
+                LassoPath.Reset();
                 Invalidate();
                 return true;
             }
@@ -962,7 +1058,7 @@ public:
         PenMouseX = X; PenMouseY = Y;
         if (bRightClickCandidate && (FIntPoint(X, Y) - RightClickStart).SizeSquared() > 36)
         { bRightClickMoved = true; }
-        if (bMarqueeDragging) { MarqueeEnd = FIntPoint(X, Y); Invalidate(); }
+        if (bMarqueeDragging) { UpdateMarqueeCursor(X, Y); }
         UpdatePenMouse();
         if (bSegmentBending) { UpdateSegmentBendCursor(X, Y); return; }
         if ((!bPenMode || !bPenDragging) && !bMarqueeDragging)
@@ -977,7 +1073,7 @@ public:
         PenMouseX = X; PenMouseY = Y;
         if (bRightClickCandidate && (FIntPoint(X, Y) - RightClickStart).SizeSquared() > 36)
         { bRightClickMoved = true; }
-        if (bMarqueeDragging) { MarqueeEnd = FIntPoint(X, Y); Invalidate(); }
+        if (bMarqueeDragging) { UpdateMarqueeCursor(X, Y); }
         UpdatePenMouse();
         if (bSegmentBending) { UpdateSegmentBendCursor(X, Y); return; }
         if ((!bPenMode || !bPenDragging) && !bMarqueeDragging)
@@ -1054,6 +1150,11 @@ public:
     virtual void Draw(const FSceneView* View, FPrimitiveDrawInterface* PDI) override
     {
         FEditorViewportClient::Draw(View, PDI);
+        if (bFrameSplineWhenReady && Viewport &&
+            Viewport->GetSizeXY().X > 1 && Viewport->GetSizeXY().Y > 1)
+        {
+            FrameSpline();
+        }
         if (!PDI || !View) { return; }
         CachedInvViewProjection = View->ViewMatrices.GetClipToWorld();
         CachedWorldToClip = CachedInvViewProjection.InverseFast();
@@ -1067,6 +1168,30 @@ public:
         // perspective and all orthographic viewport projections.
         if (bMarqueeDragging && bHasCachedView)
         {
+            if (bLassoMode)
+            {
+                auto DrawStrokeLine = [this, PDI](FIntPoint First, FIntPoint Last)
+                {
+                    FVector FirstOrigin, FirstDirection, LastOrigin, LastDirection;
+                    FSceneView::DeprojectScreenToWorld(FVector2D(First.X, First.Y),
+                        CachedViewRect, CachedInvViewProjection, FirstOrigin, FirstDirection);
+                    FSceneView::DeprojectScreenToWorld(FVector2D(Last.X, Last.Y),
+                        CachedViewRect, CachedInvViewProjection, LastOrigin, LastDirection);
+                    PDI->DrawLine(FirstOrigin + FirstDirection.GetSafeNormal() * 100.0,
+                        LastOrigin + LastDirection.GetSafeNormal() * 100.0,
+                        StrandSelectedColor, SDPG_Foreground, 0.85f);
+                };
+                for (int32 I = 1; I < LassoPath.Num(); ++I)
+                {
+                    DrawStrokeLine(LassoPath[I - 1], LassoPath[I]);
+                }
+                if (LassoPath.Num() >= 2)
+                {
+                    DrawStrokeLine(LassoPath.Last(), LassoPath[0]);
+                }
+            }
+            else
+            {
             const int32 MinX = FMath::Min(MarqueeStart.X, MarqueeEnd.X);
             const int32 MaxX = FMath::Max(MarqueeStart.X, MarqueeEnd.X);
             const int32 MinY = FMath::Min(MarqueeStart.Y, MarqueeEnd.Y);
@@ -1083,7 +1208,8 @@ public:
             for (int32 I = 0; I < 4; ++I)
             {
                 PDI->DrawLine(WorldCorners[I], WorldCorners[(I + 1) % 4],
-                    StrandSelectedColor, SDPG_Foreground, 1.5f);
+                    StrandSelectedColor, SDPG_Foreground, 0.85f);
+            }
             }
         }
 
@@ -1402,6 +1528,28 @@ private:
         Invalidate();
     }
 
+    void UpdateMarqueeCursor(int32 X, int32 Y)
+    {
+        MarqueeEnd = FIntPoint(X, Y);
+        if (bLassoMode && StrandSplineSelectionUtils::ShouldAppendStrokePoint(LassoPath, MarqueeEnd))
+        {
+            // Keep long freehand strokes responsive without losing the closed
+            // outline: decimate older samples when the 1024-point budget fills.
+            if (LassoPath.Num() >= 1024)
+            {
+                TArray<FIntPoint> Reduced;
+                Reduced.Reserve(513);
+                for (int32 Index = 0; Index < LassoPath.Num(); Index += 2)
+                {
+                    Reduced.Add(LassoPath[Index]);
+                }
+                LassoPath = MoveTemp(Reduced);
+            }
+            LassoPath.Add(MarqueeEnd);
+        }
+        Invalidate();
+    }
+
     void UpdatePenMouse()
     {
         if (!bPenMode) { return; }
@@ -1458,6 +1606,8 @@ private:
     bool bShowTangents = true;
     bool bPenMode = false;
     bool bMarqueeMode = false;
+    bool bLassoMode = false;
+    TArray<FIntPoint> LassoPath;
     bool bMarqueeDragging = false;
     bool bMarqueeAdd = false;
     bool bMarqueeToggle = false;
@@ -1473,6 +1623,7 @@ private:
     bool bDelegatedPenCameraClick = false;
     bool bHasCachedView = false;
     bool bHasPenHover = false;
+    bool bFrameSplineWhenReady = false;
     int32 LockedAxis = -1;
     int32 PenMouseX = 0;
     int32 PenMouseY = 0;
@@ -1587,6 +1738,10 @@ void SStrandSplineViewport::SetTangentDragCallback(TFunction<void(int32, const F
 void SStrandSplineViewport::SetMarqueeMode(bool bEnabled)
 {
     if (StrandViewportClient.IsValid()) { StrandViewportClient->SetMarqueeMode(bEnabled); }
+}
+void SStrandSplineViewport::SetLassoMode(bool bEnabled)
+{
+    if (StrandViewportClient.IsValid()) { StrandViewportClient->SetLassoMode(bEnabled); }
 }
 void SStrandSplineViewport::SetAuthoredAnchorRotation(const FRotator& Rotation)
 {

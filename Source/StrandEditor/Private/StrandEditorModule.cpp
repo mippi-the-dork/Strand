@@ -11,6 +11,9 @@
 #include "SplineDataAsset.h"
 #include "StrandActorFactory.h"
 #include "StrandSplineAssetEditor.h"
+#include "SplineDataAssetFactory.h"
+#include "StrandSplineEditOperations.h"
+#include "Misc/PackageName.h"
 #include "StrandSplineExport.h"
 #include "StrandPlacement.h"
 #include "StrandDropLogic.h"
@@ -60,6 +63,68 @@ namespace StrandEditorStyle
     {
         const ISlateStyle* RegisteredStyle = FSlateStyleRegistry::FindSlateStyle(StyleSetName);
         return RegisteredStyle ? RegisteredStyle->GetBrush(BrushName) : nullptr;
+    }
+}
+
+// Non-destructive Content Browser asset join. The operation only creates a
+// new asset, so neither source nor existing actor references are modified.
+namespace StrandAssetJoining
+{
+    static void JoinSelectedAssets(const TArray<USplineDataAsset*>& InAssets)
+    {
+        if (InAssets.Num() != 2 || !IsValid(InAssets[0]) || !IsValid(InAssets[1]) ||
+            InAssets[0] == InAssets[1]) { return; }
+        TArray<USplineDataAsset*> Assets = InAssets;
+        Assets.Sort([](const USplineDataAsset& A, const USplineDataAsset& B)
+        {
+            return A.GetPathName() < B.GetPathName();
+        });
+        USplineComponent* FirstNative = NewObject<USplineComponent>(GetTransientPackage());
+        USplineComponent* SecondNative = NewObject<USplineComponent>(GetTransientPackage());
+        Assets[0]->ApplyToSplineComponent(FirstNative);
+        Assets[1]->ApplyToSplineComponent(SecondNative);
+        TArray<FSplinePointData> Joined;
+        double Gap = 0.0;
+        bool bWelded = false;
+        if (!StrandSplineEditOperations::JoinOpenSplineAssets(Assets[0]->Points,
+            Assets[0]->bIsClosedLoop, FirstNative, Assets[1]->Points,
+            Assets[1]->bIsClosedLoop, SecondNative, Joined, Gap, bWelded))
+        {
+            FMessageDialog::Open(EAppMsgType::Ok,
+                LOCTEXT("JoinReject", "Select exactly two open Strand spline assets, each with at least two valid anchors."));
+            return;
+        }
+        if (!bWelded)
+        {
+            const FText Prompt = FText::Format(LOCTEXT("JoinGapPrompt",
+                "These splines have endpoints {0} cm apart in asset-local coordinates. "
+                "Join them with a new straight segment? The originals will remain unchanged."),
+                FText::AsNumber(Gap));
+            if (FMessageDialog::Open(EAppMsgType::YesNo, Prompt) != EAppReturnType::Yes) { return; }
+        }
+        const FString ParentFolder = FPackageName::GetLongPackagePath(Assets[0]->GetOutermost()->GetName());
+        IAssetTools& AssetTools = FAssetToolsModule::GetModule().Get();
+        FString PackageName, AssetName;
+        AssetTools.CreateUniqueAssetName(FPaths::Combine(ParentFolder,
+            Assets[0]->GetName() + TEXT("_") + Assets[1]->GetName() + TEXT("_Joined")),
+            TEXT(""), PackageName, AssetName);
+        USplineDataAsset* NewAsset = Cast<USplineDataAsset>(AssetTools.CreateAsset(
+            AssetName, ParentFolder, USplineDataAsset::StaticClass(), NewObject<USplineDataAssetFactory>()));
+        if (!NewAsset) { return; }
+        NewAsset->Modify();
+        NewAsset->Points = MoveTemp(Joined);
+        NewAsset->bIsClosedLoop = false;
+        NewAsset->DefaultCoordinateMode = Assets[0]->DefaultCoordinateMode;
+        NewAsset->DefaultAnchorMode = Assets[0]->DefaultAnchorMode;
+        NewAsset->DefaultAnchorPointIndex = FMath::Clamp(Assets[0]->DefaultAnchorPointIndex,
+            0, NewAsset->Points.Num() - 1);
+        // Deliberately do not inherit import association from either source.
+        NewAsset->MarkPackageDirty();
+        if (GEditor)
+        {
+            TArray<UObject*> AssetsToShow = { NewAsset };
+            GEditor->SyncBrowserToObjects(AssetsToShow);
+        }
     }
 }
 
@@ -598,8 +663,10 @@ private:
         struct FToolBrush { const TCHAR* Key; const TCHAR* Filename; };
         const FToolBrush ToolIcons[] = {
             { TEXT("Strand.Actors"), TEXT("StrandToolActors.svg") },
+            { TEXT("Strand.DropdownChevron"), TEXT("StrandToolDropdownChevron.svg") },
             { TEXT("Strand.Select"), TEXT("StrandToolSelect.svg") },
             { TEXT("Strand.BoxSelect"), TEXT("StrandToolBoxSelect.svg") },
+            { TEXT("Strand.Lasso"), TEXT("StrandToolLasso.svg") },
             { TEXT("Strand.Pen"), TEXT("StrandToolPen.svg") },
             { TEXT("Strand.Move"), TEXT("StrandToolMove.svg") },
             { TEXT("Strand.Rotate"), TEXT("StrandToolRotate.svg") },
@@ -617,6 +684,7 @@ private:
             { TEXT("Strand.FrameSelected"), TEXT("StrandToolFrameSelected.svg") },
             { TEXT("Strand.Points"), TEXT("StrandToolPoints.svg") },
             { TEXT("Strand.Grid"), TEXT("StrandToolGrid.svg") },
+            { TEXT("Strand.ViewportSettings"), TEXT("StrandToolViewportSettings.svg") },
             { TEXT("Strand.Tangents"), TEXT("StrandToolTangents.svg") },
             { TEXT("Strand.Insert"), TEXT("StrandToolInsert.svg") },
             { TEXT("Strand.Delete"), TEXT("StrandToolDelete.svg") },
@@ -710,6 +778,19 @@ private:
                         {
                             return !SplineEditorCommands::SelectedActors().IsEmpty();
                         })));
+                    if (SourceAssets.Num() == 2)
+                    {
+                        DynamicSection.AddMenuEntry(TEXT("Strand_JoinTwoAssets"),
+                            LOCTEXT("JoinTwo", "Join Two Strand Spline Assets..."),
+                            LOCTEXT("JoinTwoTip", "Create a NEW spline asset from two selected open Strand assets. "
+                                "Automatically connects their nearest endpoints, welding coincident ends or "
+                                "confirming a linear gap bridge. Originals and linked actors are untouched."),
+                            FSlateIcon(StrandEditorStyle::StyleSetName, TEXT("ClassIcon.SplineDataAsset")),
+                            FUIAction(FExecuteAction::CreateLambda([ResolveAssets]()
+                            {
+                                StrandAssetJoining::JoinSelectedAssets(ResolveAssets());
+                            })));
+                    }
                     if (SourceAssets.Num() != 1) { return; }
                     // Do not load the selected asset to build a context menu.
                     // Loading occurs only when the designer clicks an action.

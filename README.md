@@ -9,7 +9,13 @@ Strand has two complementary editing workflows:
 - **Strand Spline Editor:** Double-click a Strand Spline asset to edit its saved curve in a dedicated 2D/3D preview. These changes modify the asset, not existing level actors.
 - **Native Level Editor spline editing:** Drag a Strand asset into the level or associate it with an existing native spline component. Continue using Unreal's native actor, spline, and viewport tools. Explicitly **Apply Asset** or **Update Asset** to synchronize the two copies.
 
-**Package:** v0.6.25 source, targeting Unreal Engine 5.8.3 on Windows 64-bit. The editor uses Unreal's host-provided asset toolbar, direct authoring buttons, separate Spline Details and Source & Import tabs, and contextual hover actions. See [TEST_PLAN_0.6.25.md](TEST_PLAN_0.6.25.md) for build and live-editor verification.
+**Package:** v0.6.29 source, targeting Unreal Engine 5.8.3 on Windows 64-bit. The editor uses Unreal's host-provided asset toolbar, direct authoring buttons, separate Spline Details and Source & Import tabs, and contextual hover actions. See [TEST_PLAN_0.6.29.md](TEST_PLAN_0.6.29.md) for build and live-editor verification.
+
+### Camera-aware Frame Entire Spline (v0.6.29)
+
+**Frame Entire Spline (F)** now uses the *evaluated spline's projected silhouette* and the actual viewport aspect ratio rather than relying only on `FEditorViewportClient::FocusViewportOnBox`. In perspective, Strand preserves the current viewing direction, uses the current horizontal camera FOV, and solves for optical centering and a camera distance that leaves comfortable margins around all sampled curve positions. The spline fills at most approximately 74% of each viewport dimension; especially narrow or wide windows still fit. Initial framing defers until the Slate viewport has nonzero dimensions. Orthographic views continue to use Unreal's native framing behavior, with additional viewport-size-aware zoom and centering. This operation only changes the **preview camera**; it does not move control points, modify the asset, or reimport geometry.
+
+**Select Sharp Corners** lives under **More > Selected Points** with angle thresholds 15°, 30°, 45°, 60°, and 90°. It replaces the current selection with anchors whose incoming and outgoing *evaluated* directions form at least that angle. Open-path endpoints are skipped; closed loops check the closing seam. Auto-tangents and explicit handles are respected, while linear/collapsed handles use adjacent chord directions. This is a non-destructive analysis/selection operation.
 
 ### Direct curve shaping
 
@@ -17,7 +23,17 @@ In **Select** mode, hold **Ctrl** and drag the middle of a spline segment to ben
 
 **Shift-click** continues to insert an anchor at the cursor, while **right-drag** and **RMB+WASD** remain viewport navigation. Ctrl-clicking an anchor or native gizmo retains its previous behavior.
 
-The **left modeling rail** and top toolbar render their artwork through matching independent, centered 28×28 icon layers instead of constraining the art within native Slate button padding. Dropdown icons occupy an independent left-aligned icon surface clear of the chevron; the existing 48×36 action buttons and 60×36 dropdown dimensions remain unchanged.
+The **left modeling rail** and top toolbar render their artwork through independent 21×21 icon layers in compact 36×27 action buttons. Both top and left dropdowns use independently rendered 16×16 icons and 9×9 chevrons (45×27), with an adjusted, balanced gap and 5 px right inset. No SVG is stretched to compensate for native Slate button padding.
+### Joining two Strand spline assets
+
+Select **exactly two open Strand Spline assets** in the Content Browser, right-click, and choose **Strand > Join Two Strand Spline Assets...**. Strand selects the closest endpoints in **asset-local coordinates**, reverses either path's traversal if required, and creates a **new** asset named with `_Joined`. The originals, their actor references, and their imported-source associations are unchanged. The new asset has no external reimport association.
+
+If the two endpoints coincide to within **0.001 cm**, Strand welds the common anchor, retaining the first path's arriving tangent and the second path's leaving tangent. If the endpoints differ, Strand asks for confirmation and inserts a **straight segment** between them. This preserves existing curve shapes but does not automatically make a smooth G1/C1 join across independently authored paths. Use the handle tools after joining if a smooth bridge is desired. Strand assets have spline-local geometry only; it does not apply actor/component world transforms during this operation. Closed loops and assets with fewer than two points are rejected. The operation creates a new asset and does not modify either original through the asset editor's geometry Undo stack. Delete the joined asset if you do not want to keep it.
+
+### Viewport and selection visual refinements
+
+Dropdown glyphs are **25% smaller** than regular toolbar icons, with a consistent gap before the dropdown arrow and reduced right inset. The **Frame Entire Spline** icon now depicts a Bézier curve inside framing corners, rather than a grid or rectangle. **Box Select** and **Lasso Select** use thin foreground outlines (0.85 px) rather than heavy strokes. These are presentation-only changes and do not affect geometry.
+
 ## Install
 
 1. Close Unreal Editor and replace the **entire** `<Project>/Plugins/Strand/` folder with the `Strand/` folder from this ZIP. Do not merge the ZIP into an old source tree. UnrealBuildTool will compile leftover `.cpp` files from older versions.
@@ -40,6 +56,10 @@ This archive contains C++ source, test fixtures, documentation, and editor artwo
 7. For direct editing, move the pointer over an anchor (hand cursor), a Bézier handle (grab cursor), or empty canvas (arrow cursor). **Shift-hover a curve segment** to display a cyan segment and a dot at the actual insertion location; **Shift-click** to insert there. A *stationary* right-click on an anchor opens contextual point actions (insert, delete, Bézier mode, interpolation and orientation); a stationary right-click on a curve segment opens **Insert Anchor Here** and **Select Segment Endpoints**. Right-drag and RMB+WASD remain native Unreal camera navigation. For precision, hold **Ctrl+Shift** and use J/L for asset -X/+X, I/K for +Y/-Y, and U/O for +Z/-Z (1 cm each). These inputs create separate Undo steps and respect the active edit plane. Arrow/Page keys remain native Unreal camera navigation.
 8. Select one or more anchors and choose a **Bézier Handles** mode in the right inspector: **Free** (separate handles), **Aligned** (shared direction, independent lengths), **Mirrored** (shared direction and length), **Auto (Unreal)** (native smoothing), or **Corner** (zero-length handles). On a single anchor, click the **Incoming Handle** or **Outgoing Handle** or pick its viewport marker to edit numerically or via the Strand axis handles. Linked constraints persist across subsequent drags and asset saves. The old one-shot Align/Mirror operations are still available as distinct commands; they switch that point back to Free.
 9. Use **Insert After** for a single selected point or **Delete Selected** for a set that leaves at least two points. Whole-spline tools remain separate from selection tools. The left-side modeling strip begins with Pen and includes **Replace Current Spline** beside the modeling dropdowns: Circle, Rectangle and Helix replace the points in the open asset (Undo/Redo supported). **Asset toolbar > Primitives** creates a separate Strand asset instead. The left strip also includes a state-sensitive Open/Close Path action. In More > Resample by Arc Length you can enter an exact point count (2 to 4096, default 16) and apply an approximately equal-distance reconstruction. The last applied count is remembered per-user (Undo restores the original curve). Save via Unreal's native asset toolbar.
+
+### Split a spline into two independent assets
+
+For an **open** spline with at least three anchors, select exactly one internal anchor (not the first or last). Right-click the anchor and choose **Split into Two Strand Assets**, or use the left modeling **More > Create and Path > Split at Selected Anchor into Two Assets**. Strand creates two new assets, named with `_Start` and `_End` suffixes, in the original asset folder and highlights both in the Content Browser. Both contain the split anchor. Strand bakes evaluated native Auto tangents before splitting so curve segments stay geometrically consistent. The **original asset and all linked actors remain unchanged**. This operation creates assets rather than editing the original; use Content Browser asset management to discard unwanted results. Source import/reimport links are not carried over. Closed-loop paths must first be explicitly opened.
 
 ### Capture an existing native Unreal spline
 

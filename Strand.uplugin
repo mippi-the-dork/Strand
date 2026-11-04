@@ -1,9 +1,9 @@
 {
   "FileVersion": 3,
-  "Version": 58,
-  "VersionName": "0.6.25",
+  "Version": 62,
+  "VersionName": "0.6.29",
   "FriendlyName": "Strand",
-  "Description": "Native Unreal spline asset editor with direct segment reshaping, independent aspect-safe left and top toolbar icon layers, precision spline insertion, live path statistics, directional tangent handles, editable primitives, and SVG/Alembic interchange.",
+  "Description": "Native Unreal spline authoring with camera-aware curve framing, sharp-corner selection, compact toolbars, lasso/box selection, direct shaping, and split/join asset workflows.",
   "Category": "Editor",
   "CreatedBy": "Strand",
   "CanContainContent": false,

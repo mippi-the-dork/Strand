@@ -65,6 +65,7 @@ private:
     int32 SelectedHandle = 0; // 0 anchor, 1 incoming, 2 outgoing.
     bool bPenMode = false;
     bool bMarqueeMode = false;
+    bool bLassoMode = false;
     int32 ActiveWidgetMode = 0; // Move, Rotate, Scale: native Unreal viewport widgets.
     bool bWidgetLocal = false; // Preview/asset axes vs primary point's local orientation.
     bool bRelativePositionEntry = false; // Absolute target vs additive numeric offset.
@@ -86,6 +87,7 @@ private:
     TSharedRef<SWidget> MakeReplacePrimitiveMenu();
     void ReplaceSplineWithPrimitive(int32 Kind);
     void CreatePrimitiveAsset(int32 Kind);
+    void SplitAtSelectedAnchor();
     void RebuildNativePreview();
     void OnPropertyChanged(const FPropertyChangedEvent& Event);
     bool CanReimport() const;
@@ -110,6 +112,9 @@ private:
     FReply SelectAllPoints();
     FReply InvertPointSelection();
     FReply ClearPointSelection();
+    FReply GrowAnchorSelection();
+    FReply ShrinkAnchorSelection();
+    FReply SelectSharpCorners(double ThresholdDegrees);
     TSharedRef<SWidget> MakeSelectionMenu();
     bool HasMultipleSelectedPoints() const;
     bool CanEditAxis(int32 Axis) const;
@@ -121,6 +126,7 @@ private:
     FReply ClearSpline();
     void SetPenMode(bool bEnabled);
     void SetMarqueeMode(bool bEnabled);
+    void SetLassoMode(bool bEnabled);
     void SetWidgetMode(int32 Mode);
     void SetWidgetLocal(bool bLocal);
     void SelectMarqueePoints(const TArray<int32>& Indices, bool bAdd, bool bToggle);
@@ -128,6 +134,7 @@ private:
     void ApplyViewportScale(double Factor);
     void SetPenSnapStep(double Step);
     TSharedRef<SWidget> MakePenSnapMenu();
+    TSharedRef<SWidget> MakeViewportOptionsMenu();
     FText GetPenSnapLabel() const;
     FText GetEditorHint() const;
     bool BeginPenStroke(const FStrandPenHit& Hit);
