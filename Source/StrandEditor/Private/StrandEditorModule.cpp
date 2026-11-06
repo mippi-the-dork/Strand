@@ -50,6 +50,8 @@
 #include "Styling/SlateStyleRegistry.h"
 #include "Interfaces/IPluginManager.h"
 #include "Misc/Paths.h"
+#include "ISettingsModule.h"
+#include "StrandEditorPreferences.h"
 
 #define LOCTEXT_NAMESPACE "StrandEditor"
 
@@ -175,6 +177,15 @@ class FStrandEditorModule final : public IModuleInterface
 public:
     virtual void StartupModule() override
     {
+        // UDeveloperSettings is MinimalAPI in UE 5.8; use a normal config UObject
+        // with explicit Editor Settings registration to avoid non-exported vtable symbols.
+        if (ISettingsModule* Settings = FModuleManager::LoadModulePtr<ISettingsModule>(TEXT("Settings")))
+        {
+            Settings->RegisterSettings(TEXT("Editor"), TEXT("Plugins"), TEXT("Strand Editor"),
+                LOCTEXT("StrandPreferencesName", "Strand Editor"),
+                LOCTEXT("StrandPreferencesDescription", "Strand viewport numeric presets and visualization preferences."),
+                GetMutableDefault<UStrandEditorPreferences>());
+        }
         RegisterAssetStyle();
 
         IAssetTools& AssetTools = FAssetToolsModule::GetModule().Get();
@@ -259,6 +270,11 @@ public:
 
     virtual void ShutdownModule() override
     {
+        if (ISettingsModule* Settings = FModuleManager::GetModulePtr<ISettingsModule>(TEXT("Settings")))
+        {
+            Settings->UnregisterSettings(TEXT("Editor"), TEXT("Plugins"), TEXT("Strand Editor"));
+        }
+
         if (ActorDetailsExtensionHandle.IsValid())
         {
             OnExtendActorDetails.Remove(ActorDetailsExtensionHandle);

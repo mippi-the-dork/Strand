@@ -31,12 +31,22 @@ public:
     ELevelViewportType GetProjection() const;
     void FrameSpline();
     void FrameSelectedPoint();
+    /** Non-destructive cleanup preview sampled in spline-local space. */
+    void SetCleanupPreviewPolyline(const TArray<FVector>& Points);
+    void SetSoftSelectionWeights(const TArray<double>& Weights);
     void SetShowControlPoints(bool bShow);
     bool GetShowControlPoints() const;
     void SetShowGrid(bool bShow);
     bool GetShowGrid() const;
     void SetShowTangents(bool bShow);
     bool GetShowTangents() const;
+    void SetOrientationVisual(int32 Mode, bool bEnabled);
+    bool GetOrientationVisual(int32 Mode) const;
+    void SetOrientationSpacing(double Centimeters);
+    double GetOrientationSpacing() const;
+    void SetOrientationSize(double Centimeters);
+    double GetOrientationSize() const;
+    FVector GetCameraForward() const;
     void SetSelectedPointIndex(int32 Index);
     void SetSelectedPoints(const TArray<int32>& Indices, int32 PrimaryIndex);
     void SetOnPointSelected(TFunction<void(int32, bool, bool)> InCallback);

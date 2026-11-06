@@ -14,6 +14,7 @@ struct FToolMenuContext;
 class USplineDataAsset;
 class USplineComponent;
 class SDockTab;
+class SWindow;
 class SStrandSplineViewport;
 struct FStrandPenHit;
 struct FPropertyChangedEvent;
@@ -24,12 +25,14 @@ enum class EStrandEditPlane : uint8
     Free3D,
     XY,
     XZ,
-    YZ
+    YZ,
+    CameraPlane
 };
 
 class FStrandSplineAssetEditor final : public FAssetEditorToolkit, public FSelfRegisteringEditorUndoClient
 {
 public:
+    virtual ~FStrandSplineAssetEditor() override;
     void Init(USplineDataAsset* InAsset, const TSharedPtr<IToolkitHost>& InHost);
     virtual void PostUndo(bool bSuccess) override;
     virtual void PostRedo(bool bSuccess) override;
@@ -50,10 +53,13 @@ private:
     TStrongObjectPtr<USplineComponent> NativePreview;
     TSharedPtr<IDetailsView> DetailsView;
     TSharedPtr<SStrandSplineViewport> PreviewWidget;
+    TWeakPtr<SWindow> ActiveCleanupWindow; // One modeless live curve cleanup preview.
     int32 SelectedPointIndex = INDEX_NONE;
     TSet<int32> SelectedPointIndices;
     TUniquePtr<FScopedTransaction> ActivePointDragTransaction;
     bool bPointChangedDuringDrag = false;
+    TArray<double> FrozenSoftSelectionWeights; // Capture only once per transform interaction.
+    void RefreshSoftSelectionVisualization();
     TUniquePtr<FScopedTransaction> ActiveSegmentBendTransaction;
     TArray<FSplinePointData> BendBaselinePoints;
     FSplinePoint BendEvaluatedStart;
@@ -62,6 +68,12 @@ private:
     double BendSegmentAlpha = 0.5;
     bool bSegmentBendChanged = false;
     EStrandEditPlane EditPlane = EStrandEditPlane::Free3D;
+    FVector LockedCameraPlaneNormal = FVector::XAxisVector;
+    int32 SoftSelectionMode = 0; // 0 disabled, 1 Euclidean 3D, 2 native spline arc length
+    int32 SoftSelectionFalloff = 1; // 0 linear, 1 smooth, 2 sharp
+    double SoftSelectionRadius = 150.0;
+    void FlattenSelectionToCameraPlane();
+    void RotateSelectionAroundCamera(double Degrees);
     int32 SelectedHandle = 0; // 0 anchor, 1 incoming, 2 outgoing.
     bool bPenMode = false;
     bool bMarqueeMode = false;
@@ -69,6 +81,8 @@ private:
     int32 ActiveWidgetMode = 0; // Move, Rotate, Scale: native Unreal viewport widgets.
     bool bWidgetLocal = false; // Preview/asset axes vs primary point's local orientation.
     bool bRelativePositionEntry = false; // Absolute target vs additive numeric offset.
+    int32 SubdivideCuts = 2; // Last-used exact number of cuts per segment.
+    bool bDistanceUniformSubdivision = false;
     int32 ResampleTargetCount = 16; // Per-user remembered target count. Shared spline asset stays clean.
     double PenSnapStep = 0.0;
     TUniquePtr<FScopedTransaction> ActivePenTransaction;
@@ -147,6 +161,14 @@ private:
     FReply SnapSelectedPoint(double Step);
     FReply SubdivideSpline();
     FReply ResampleSpline(int32 TargetPoints);
+    FReply SubdivideWithCuts(int32 Cuts, bool bDistanceUniform);
+    FReply SetSelectedContinuity(bool bC1);
+    FReply NormalizeTangents(double LengthCm);
+    FReply RecalculateTangents();
+    FReply WeldEndpoints(double DistanceCm);
+    FReply SelectDuplicateAnchors(double ToleranceCm);
+    FReply SelectBySegmentLength(double ThresholdCm, bool bShorter);
+    void OpenCurveCleanupDialog();
     FReply LinearizeSpline();
     FReply SmoothSpline();
     FReply MirrorSpline(int32 Axis);
@@ -178,6 +200,8 @@ private:
     TOptional<double> GetAnchorRotationCoordinate(int32 Axis) const;
     void SetAnchorRotationCoordinate(double Value, int32 Axis);
     FReply ResetSelectedOrientations();
+    FReply SetSelectedRoll(double Degrees, bool bAdditive);
+    FReply DistributeSelectedRoll();
     FReply AlignSelectedOrientationsToCurve();
     TOptional<double> GetTangentCoordinate(int32 Axis) const;
     void SetTangentCoordinate(double Value, int32 Axis);

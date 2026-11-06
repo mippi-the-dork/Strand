@@ -1,4 +1,5 @@
 #include "StrandSplineViewport.h"
+#include "StrandEditorPreferences.h"
 
 #include "Components/SplineComponent.h"
 #include "EditorViewportClient.h"
@@ -117,6 +118,9 @@ public:
         : FEditorViewportClient(InModeTools, InScene, InWidget)
     {
         SetViewportType(LVT_Perspective);
+        const UStrandEditorPreferences* Preferences = GetDefault<UStrandEditorPreferences>();
+        OrientationSpacing = FMath::IsFinite(Preferences->OrientationSpacing) ? FMath::Clamp(Preferences->OrientationSpacing, 0.01, 100000.0) : 100.0;
+        OrientationSize = FMath::IsFinite(Preferences->OrientationSize) ? FMath::Clamp(Preferences->OrientationSize, 0.01, 10000.0) : 35.0;
         SetViewMode(VMI_Unlit);
         SetRealtime(false);
         bDrawAxes = true;
@@ -131,13 +135,44 @@ public:
         SetViewRotation(FRotator(-25.0, 45.0, 0.0));
     }
 
+    FVector GetCameraForward() const { return GetViewRotation().Vector().GetSafeNormal(); }
     void SetSpline(USplineComponent* InSpline) { if (Spline.Get() != InSpline) { bWidgetFrameFrozen = false; } Spline = InSpline; RefreshNativeWidget(); Invalidate(); }
+    void SetCleanupPreviewPolyline(const TArray<FVector>& Points) { CleanupPreviewPolyline = Points; Invalidate(); }
+    void SetSoftSelectionWeights(const TArray<double>& Weights) { SoftSelectionWeights = Weights; Invalidate(); }
     void SetShowPoints(bool bShow) { bShowPoints = bShow; RefreshNativeWidget(); Invalidate(); }
     bool GetShowPoints() const { return bShowPoints; }
     void SetShowGrid(bool bShow) { bShowGrid = bShow; Invalidate(); }
     bool GetShowGrid() const { return bShowGrid; }
     void SetShowTangents(bool bShow) { bShowTangents = bShow; Invalidate(); }
     bool GetShowTangents() const { return bShowTangents; }
+    void SetOrientationVisual(int32 Mode, bool bEnabled)
+    {
+        if (Mode >= 0 && Mode < 4) { bOrientationVisuals[Mode] = bEnabled; Invalidate(); }
+    }
+    bool GetOrientationVisual(int32 Mode) const
+    {
+        return Mode >= 0 && Mode < 4 && bOrientationVisuals[Mode];
+    }
+    void SetOrientationSpacing(double Value)
+    {
+        if (!FMath::IsFinite(Value) || Value <= 0.0) { return; }
+        OrientationSpacing = FMath::Clamp(Value, 0.01, 100000.0);
+        UStrandEditorPreferences* Preferences = GetMutableDefault<UStrandEditorPreferences>();
+        Preferences->OrientationSpacing = OrientationSpacing;
+        Preferences->SaveConfig();
+        Invalidate();
+    }
+    double GetOrientationSpacing() const { return OrientationSpacing; }
+    void SetOrientationSize(double Value)
+    {
+        if (!FMath::IsFinite(Value) || Value <= 0.0) { return; }
+        OrientationSize = FMath::Clamp(Value, 0.01, 10000.0);
+        UStrandEditorPreferences* Preferences = GetMutableDefault<UStrandEditorPreferences>();
+        Preferences->OrientationSize = OrientationSize;
+        Preferences->SaveConfig();
+        Invalidate();
+    }
+    double GetOrientationSize() const { return OrientationSize; }
     void SetSelectedPoint(int32 InIndex)
     {
         TArray<int32> Indices;
@@ -1305,6 +1340,77 @@ public:
             }
         }
 
+        // Editor-only orientation visualization, evaluated using the same native
+        // spline frames consumed by spline-following Unreal components.
+        // Cap the number of samples regardless of length to bound draw cost.
+        if (PointCount >= 2 &&
+            (bOrientationVisuals[0] || bOrientationVisuals[1] || bOrientationVisuals[2] || bOrientationVisuals[3]))
+        {
+            const double Length = Native->GetSplineLength();
+            if (Length > UE_DOUBLE_SMALL_NUMBER)
+            {
+                const int32 Steps = FMath::Clamp(FMath::CeilToInt(FMath::Min(Length / OrientationSpacing, 2048.0)), 1, 2048);
+                const bool bClosed = Native->IsClosedLoop();
+                const int32 Samples = bClosed ? Steps : Steps + 1;
+                const FLinearColor UpColor(0.25f, 0.58f, 1.0f);
+                const FLinearColor RightColor(0.24f, 0.84f, 0.40f);
+                const FLinearColor ForwardColor(1.0f, 0.30f, 0.28f);
+                const FLinearColor RibbonColor(0.95f, 0.68f, 0.20f, 0.85f);
+                FVector PreviousEdge = FVector::ZeroVector;
+                bool bHavePreviousEdge = false;
+                for (int32 Index = 0; Index < Samples; ++Index)
+                {
+                    const double Distance = Length * static_cast<double>(Index) / Steps;
+                    const FVector Position = Native->GetLocationAtDistanceAlongSpline(Distance, ESplineCoordinateSpace::Local);
+                    const FQuat Rotation = Native->GetQuaternionAtDistanceAlongSpline(Distance, ESplineCoordinateSpace::Local);
+                    const FVector Forward = Rotation.GetAxisX();
+                    const FVector Right = Rotation.GetAxisY();
+                    const FVector Up = Rotation.GetAxisZ();
+                    if (Position.ContainsNaN() || Rotation.ContainsNaN()) { bHavePreviousEdge = false; continue; }
+                    const auto DrawArrow = [PDI, &Position](const FVector& Direction, double Size, const FLinearColor& Color)
+                    {
+                        const FVector Tip = Position + Direction * Size;
+                        PDI->DrawLine(Position, Tip, Color, SDPG_World, 1.4f);
+                        // Small unambiguous arrowhead, orthogonal to arrow direction.
+                        FVector Side = FVector::CrossProduct(Direction, FVector::XAxisVector).GetSafeNormal();
+                        if (Side.IsNearlyZero()) { Side = FVector::CrossProduct(Direction, FVector::ZAxisVector).GetSafeNormal(); }
+                        PDI->DrawLine(Tip, Tip - Direction * (Size * 0.22) + Side * (Size * 0.12), Color, SDPG_World, 1.4f);
+                        PDI->DrawLine(Tip, Tip - Direction * (Size * 0.22) - Side * (Size * 0.12), Color, SDPG_World, 1.4f);
+                    };
+                    if (bOrientationVisuals[0] && !bOrientationVisuals[2]) { DrawArrow(Up, OrientationSize, UpColor); }
+                    if (bOrientationVisuals[1] && !bOrientationVisuals[2]) { DrawArrow(Right, OrientationSize, RightColor); }
+                    if (bOrientationVisuals[2])
+                    {
+                        DrawArrow(Forward, OrientationSize * 0.7, ForwardColor);
+                        DrawArrow(Right, OrientationSize * 0.7, RightColor);
+                        DrawArrow(Up, OrientationSize * 0.7, UpColor);
+                    }
+                    if (bOrientationVisuals[3])
+                    {
+                        const FVector Edge = Position + Right * OrientationSize * 0.7;
+                        PDI->DrawLine(Position, Edge, RibbonColor, SDPG_World, 0.9f);
+                        if (bHavePreviousEdge) { PDI->DrawLine(PreviousEdge, Edge, RibbonColor, SDPG_World, 2.5f); }
+                        PreviousEdge = Edge;
+                        bHavePreviousEdge = true;
+                    }
+                }
+                if (bClosed && bOrientationVisuals[3] && bHavePreviousEdge)
+                {
+                    const FVector StartPos = Native->GetLocationAtDistanceAlongSpline(0.0, ESplineCoordinateSpace::Local);
+                    const FVector StartRight = Native->GetQuaternionAtDistanceAlongSpline(0.0, ESplineCoordinateSpace::Local).GetAxisY();
+                    PDI->DrawLine(PreviousEdge, StartPos + StartRight * OrientationSize * 0.7, RibbonColor, SDPG_World, 2.5f);
+                }
+            }
+        }
+
+        // Preview of a pending cleanup operation. This is never a second hit
+        // proxy and never modifies the Strand asset or the native preview.
+        for (int32 Index = 1; Index < CleanupPreviewPolyline.Num(); ++Index)
+        {
+            PDI->DrawLine(CleanupPreviewPolyline[Index - 1], CleanupPreviewPolyline[Index],
+                FLinearColor(1.0f, 0.64f, 0.20f, 1.0f), SDPG_Foreground, 3.0f);
+        }
+
         // Shift previews the insertion dot while the sampled segment itself
         // is tinted in the base draw pass to avoid overlapping curve lines.
         const bool bPreviewInsert = !bPenMode && !bMarqueeMode &&
@@ -1356,6 +1462,15 @@ public:
                 const FLinearColor Color = SelectedPoints.Contains(Index) ? StrandSelectedColor
                     : Index == 0 ? StrandStartColor
                     : (Index == PointCount - 1 && !Native->IsClosedLoop() ? StrandEndColor : StrandControlColor);
+                // Soft-selection rings show influence before the drag. Keep the native
+                // hit-proxy core and selection colors unchanged for reliable picking.
+                if (SoftSelectionWeights.IsValidIndex(Index) && !SelectedPoints.Contains(Index) &&
+                    SoftSelectionWeights[Index] > 0.001)
+                {
+                    const float Weight = static_cast<float>(FMath::Clamp(SoftSelectionWeights[Index], 0.0, 1.0));
+                    PDI->DrawPoint(Position, FLinearColor(Weight, 0.25f + 0.55f * (1.0f - Weight), 0.15f, 1.0f),
+                        12.0f + Weight * 12.0f, SDPG_Foreground);
+                }
                 // White halo is hover feedback, while the colored core retains
                 // start (green), end (red), selected (yellow) semantics.
                 if (HoveredPoint == Index && HoveredHandle == 0)
@@ -1564,6 +1679,8 @@ private:
     }
 
     TWeakObjectPtr<USplineComponent> Spline;
+    TArray<FVector> CleanupPreviewPolyline;
+    TArray<double> SoftSelectionWeights;
     TFunction<void(int32, bool, bool)> OnPointSelected;
     TFunction<void(int32, double)> OnSegmentInsert;
     TFunction<void(int32, double)> OnSegmentBendBegin;
@@ -1604,6 +1721,9 @@ private:
     bool bShowPoints = true;
     bool bShowGrid = true;
     bool bShowTangents = true;
+    bool bOrientationVisuals[4] = { false, false, false, false };
+    double OrientationSpacing = 100.0;
+    double OrientationSize = 35.0;
     bool bPenMode = false;
     bool bMarqueeMode = false;
     bool bLassoMode = false;
@@ -1679,7 +1799,9 @@ void SStrandSplineViewport::SetProjection(ELevelViewportType Projection)
     if (StrandViewportClient.IsValid())
     {
         StrandViewportClient->SetViewportType(Projection);
-        StrandViewportClient->FrameSpline();
+        // Changing perspective/orthographic must not silently frame the entire asset.
+        // Framing is available as a separate, explicit action.
+        StrandViewportClient->Invalidate();
     }
 }
 ELevelViewportType SStrandSplineViewport::GetProjection() const
@@ -1692,6 +1814,31 @@ void SStrandSplineViewport::SetShowControlPoints(bool bShow) { if (StrandViewpor
 bool SStrandSplineViewport::GetShowControlPoints() const { return StrandViewportClient.IsValid() && StrandViewportClient->GetShowPoints(); }
 void SStrandSplineViewport::SetShowGrid(bool bShow) { if (StrandViewportClient.IsValid()) { StrandViewportClient->SetShowGrid(bShow); } }
 bool SStrandSplineViewport::GetShowGrid() const { return StrandViewportClient.IsValid() && StrandViewportClient->GetShowGrid(); }
+void SStrandSplineViewport::SetOrientationVisual(int32 Mode, bool bEnabled)
+{
+    if (StrandViewportClient.IsValid()) { StrandViewportClient->SetOrientationVisual(Mode, bEnabled); }
+}
+bool SStrandSplineViewport::GetOrientationVisual(int32 Mode) const
+{
+    return StrandViewportClient.IsValid() && StrandViewportClient->GetOrientationVisual(Mode);
+}
+void SStrandSplineViewport::SetOrientationSpacing(double Value)
+{
+    if (StrandViewportClient.IsValid()) { StrandViewportClient->SetOrientationSpacing(Value); }
+}
+double SStrandSplineViewport::GetOrientationSpacing() const
+{
+    return StrandViewportClient.IsValid() ? StrandViewportClient->GetOrientationSpacing() : 100.0;
+}
+void SStrandSplineViewport::SetOrientationSize(double Value)
+{
+    if (StrandViewportClient.IsValid()) { StrandViewportClient->SetOrientationSize(Value); }
+}
+double SStrandSplineViewport::GetOrientationSize() const
+{
+    return StrandViewportClient.IsValid() ? StrandViewportClient->GetOrientationSize() : 35.0;
+}
+
 void SStrandSplineViewport::SetShowTangents(bool bShow) { if (StrandViewportClient.IsValid()) { StrandViewportClient->SetShowTangents(bShow); } }
 bool SStrandSplineViewport::GetShowTangents() const { return StrandViewportClient.IsValid() && StrandViewportClient->GetShowTangents(); }
 void SStrandSplineViewport::SetSelectedPointIndex(int32 Index) { if (StrandViewportClient.IsValid()) { StrandViewportClient->SetSelectedPoint(Index); } }
@@ -1743,6 +1890,15 @@ void SStrandSplineViewport::SetLassoMode(bool bEnabled)
 {
     if (StrandViewportClient.IsValid()) { StrandViewportClient->SetLassoMode(bEnabled); }
 }
+void SStrandSplineViewport::SetSoftSelectionWeights(const TArray<double>& Weights)
+{
+    if (StrandViewportClient.IsValid()) { StrandViewportClient->SetSoftSelectionWeights(Weights); }
+}
+void SStrandSplineViewport::SetCleanupPreviewPolyline(const TArray<FVector>& Points)
+{
+    if (StrandViewportClient.IsValid()) { StrandViewportClient->SetCleanupPreviewPolyline(Points); }
+}
+
 void SStrandSplineViewport::SetAuthoredAnchorRotation(const FRotator& Rotation)
 {
     if (StrandViewportClient.IsValid()) { StrandViewportClient->SetAuthoredAnchorRotation(Rotation); }
@@ -1842,4 +1998,9 @@ void SStrandSplineViewport::SetPenCallbacks(TFunction<bool(const FStrandPenHit&)
         StrandViewportClient->SetPenCallbacks(MoveTemp(OnDown), MoveTemp(OnDrag), MoveTemp(OnUp), MoveTemp(OnCancel));
         StrandViewportClient->SetPenExit(MoveTemp(OnExit));
     }
+}
+
+FVector SStrandSplineViewport::GetCameraForward() const
+{
+    return StrandViewportClient.IsValid() ? StrandViewportClient->GetCameraForward() : FVector::XAxisVector;
 }

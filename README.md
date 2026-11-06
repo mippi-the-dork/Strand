@@ -9,7 +9,15 @@ Strand has two complementary editing workflows:
 - **Strand Spline Editor:** Double-click a Strand Spline asset to edit its saved curve in a dedicated 2D/3D preview. These changes modify the asset, not existing level actors.
 - **Native Level Editor spline editing:** Drag a Strand asset into the level or associate it with an existing native spline component. Continue using Unreal's native actor, spline, and viewport tools. Explicitly **Apply Asset** or **Update Asset** to synchronize the two copies.
 
-**Package:** v0.6.29 source, targeting Unreal Engine 5.8.3 on Windows 64-bit. The editor uses Unreal's host-provided asset toolbar, direct authoring buttons, separate Spline Details and Source & Import tabs, and contextual hover actions. See [TEST_PLAN_0.6.29.md](TEST_PLAN_0.6.29.md) for build and live-editor verification.
+**Package:** v0.6.30 source, targeting Unreal Engine 5.8.3 on Windows 64-bit. The editor uses Unreal's host-provided asset toolbar, direct authoring buttons, separate Spline Details and Source & Import tabs, and contextual hover actions. See [TEST_PLAN_0.6.30.md](TEST_PLAN_0.6.30.md) for build and live-editor verification.
+
+### Curve Cleanup and Precision Modeling (v0.6.30)
+
+**More > Curve Cleanup...** opens a non-destructive preview for **Simplify**, **Dissolve Selected**, and **Repair Degenerates**. Adjust a tolerance in centimeters: orange shows the proposed curve over the unmodified cyan spline, while the panel reports original/result anchor count and the measured sampled 3D deviation. Cancel does not modify the asset; Apply creates one Undo transaction. The dialog remembers the last tolerance for the current editor user. The source must contain at most 512 anchors for this preview path. Deviations are sample-based, not mathematically certified continuous maxima.
+
+**More > Exact Subdivision** offers 1–32 cuts per segment, by equal parameter or approximate equal distance, using an exact de Casteljau split of each native cubic. It is different from **Resample by Arc Length**, which produces an exact **total** point count but approximates the curve. The cut count is remembered per user.
+
+**More > Selected Points** provides **G1/C1 continuity**, **Recalculate Selected Tangents**, **Normalize Selected Handle Lengths**, **Select Duplicate Anchors**, and **Select by Segment Length**. **More > Create and Path > Weld Start and End** joins an open spline into a closed loop when the endpoints are within a chosen gap threshold. Contextual anchor right-click also exposes cleanup and continuity. These operations use native Undo/Redo and do not change the runtime spline schema. See [CURVE_CLEANUP_0.6.30.md](Docs/CURVE_CLEANUP_0.6.30.md) for behavior and limitations.
 
 ### Camera-aware Frame Entire Spline (v0.6.29)
 
@@ -263,3 +271,8 @@ The native Move/Rotate/Scale widget should highlight the axis under the pointer 
 Use **Asset toolbar > Primitives** (alongside Save/Browse) to create an independent Circle, Rectangle or Helix spline asset in the current Content Browser folder. The open asset is never replaced by this command. Use the **Edit strip > Replace Current Spline** dropdown to instead replace the active asset’s geometry in place with one of those primitives. This keeps the asset identity and linked actors, preserves placement defaults, clears its prior source curve association to prevent unexpected Reimport, and is a single Undo/Redo transaction. The preview automatically refreshes and prior point selection is cleared. Undo restores the original geometry and source curve association. Replacement does not automatically push updates to already placed native spline components.
 
 Shift-hover over a spline segment previews an insertion dot using a stable screen-space curve target. Shift-click inserts that point while preserving the cubic shape; native controls take priority over the segment target. Source/import properties are in the separate **Source & Import** tab.
+
+
+### 0.6.30 Hotfix 1
+
+Fixes exact 3D/closed-loop subdivision tangent math, makes the Cleanup preview modeless so the orange candidate is visible while settings change, adds Refresh Preview and no-candidate status, and removes the redundant Cleanup submenu entry. See `CHANGELOG_0.6.30_HOTFIX1.md` and `TEST_PLAN_0.6.30_HOTFIX1.md`.
