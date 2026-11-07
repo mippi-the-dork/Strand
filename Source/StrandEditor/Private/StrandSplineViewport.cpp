@@ -15,6 +15,7 @@
 #include "StrandSplineInputUtils.h"
 #include "StrandSplineSelectionUtils.h"
 #include "StrandSplineFraming.h"
+#include "StrandCameraSpaceMath.h"
 #include "Framework/Application/SlateApplication.h"
 
 namespace
@@ -136,6 +137,9 @@ public:
     }
 
     FVector GetCameraForward() const { return GetViewRotation().Vector().GetSafeNormal(); }
+    FVector GetCameraLocation() const { return GetViewLocation(); }
+    double GetCameraHorizontalFOV() const { return ViewFOV; }
+    int32 GetCameraViewportWidth() const { return Viewport ? Viewport->GetSizeXY().X : 1280; }
     void SetSpline(USplineComponent* InSpline) { if (Spline.Get() != InSpline) { bWidgetFrameFrozen = false; } Spline = InSpline; RefreshNativeWidget(); Invalidate(); }
     void SetCleanupPreviewPolyline(const TArray<FVector>& Points) { CleanupPreviewPolyline = Points; Invalidate(); }
     void SetSoftSelectionWeights(const TArray<double>& Weights) { SoftSelectionWeights = Weights; Invalidate(); }
@@ -251,6 +255,17 @@ public:
     {
         OnPointRotation = MoveTemp(Callback);
     }
+    void SetTangentRollCallback(TFunction<void(double)> Callback)
+    {
+        OnTangentRoll = MoveTemp(Callback);
+    }
+    void SetCameraAlignedEditing(bool bEnabled)
+    {
+        bCameraAlignedEditing = bEnabled;
+        bWidgetFrameFrozen = false;
+        RefreshNativeWidget();
+        Invalidate();
+    }
     void SetPointScaleCallback(TFunction<void(double)> Callback)
     {
         OnPointScale = MoveTemp(Callback);
@@ -301,6 +316,9 @@ public:
     {
         if (bLassoMode) { return FText::FromString(TEXT("LASSO SELECT  |  Draw freely around anchors  |  Shift: add  |  Ctrl: toggle  |  Esc: exit")); }
         if (bPenMode || bMarqueeMode) { return FText::GetEmpty(); }
+        if (bDraggingScreenPlane) { return FText::FromString(TEXT("CAMERA 2D MOVE  |  Drag in screen X/Y, depth preserved  |  Release: finish")); }
+        if (bCameraAlignedEditing && WidgetMode == 0 && IsSelectionWidgetAvailable())
+        { return FText::FromString(TEXT("CAMERA 2D  |  Drag square handle in screen X/Y  |  Orbit freely between edits")); }
         if (GetCurrentWidgetAxis() != EAxisList::None)
         {
             return FText::FromString(TEXT("TRANSFORM GIZMO  |  Drag the highlighted axis or ring  |  Space: cycle mode  |  RMB+WASD: fly"));
@@ -324,6 +342,8 @@ public:
     // camera cursors always take precedence over Strand's editing cursors.
     virtual EMouseCursor::Type GetCursor(FViewport* InViewport, int32 X, int32 Y) override
     {
+        if (bDraggingScreenPlane) { return EMouseCursor::GrabHandClosed; }
+        if (ScreenPlaneHit(X, Y)) { return EMouseCursor::GrabHand; }
         if (bSegmentBending) { return EMouseCursor::GrabHandClosed; }
         if (!InViewport || InViewport->KeyState(EKeys::RightMouseButton) ||
             InViewport->KeyState(EKeys::MiddleMouseButton) ||
@@ -466,6 +486,53 @@ public:
         Invalidate();
     }
 
+    // Camera-aligned 2D translate handle. The camera frame is captured at
+    // gesture start; the mouse maps to world units at the original pivot depth.
+    // Both anchor and tangent drags use the same plane interaction.
+    static constexpr double ScreenPlaneHandleHalfSizePx = 12.0;
+    static constexpr double ScreenPlaneAxisLengthPx = 54.0;
+    bool GetScreenPlaneCenter(FVector2D& OutCenter) const
+    {
+        return bCameraAlignedEditing && WidgetMode == 0 &&
+            IsSelectionWidgetAvailable() && bHasCachedView &&
+            ProjectAnchor(GetWidgetLocation(), OutCenter);
+    }
+    bool ScreenPlaneHit(int32 X, int32 Y) const
+    {
+        FVector2D Center;
+        if (!GetScreenPlaneCenter(Center)) { return false; }
+        return FMath::Abs(X - Center.X) <= ScreenPlaneHandleHalfSizePx &&
+            FMath::Abs(Y - Center.Y) <= ScreenPlaneHandleHalfSizePx;
+    }
+    void UpdateScreenPlaneDrag(int32 X, int32 Y)
+    {
+        if (!bDraggingScreenPlane) { return; }
+        const FIntPoint Mouse(X, Y);
+        const FIntPoint Pixels = Mouse - ScreenPlaneLastMouse;
+        ScreenPlaneLastMouse = Mouse;
+        if (Pixels.X == 0 && Pixels.Y == 0) { return; }
+        const FVector Delta = StrandCameraSpace::ScreenPixelsToPlaneDelta(
+            FVector2D(Pixels.X, Pixels.Y), ScreenPlaneRight, ScreenPlaneUp,
+            ScreenPlaneLockedDepth, ScreenPlaneLockedFov, ScreenPlaneLockedWidth);
+        if (SelectedHandle != 0 && OnTangentDragDelta)
+        { OnTangentDragDelta(SelectedHandle, Delta); }
+        else if (OnPointDragDelta) { OnPointDragDelta(Delta); }
+        Invalidate();
+    }
+    void EndScreenPlaneDrag()
+    {
+        if (!bDraggingScreenPlane) { return; }
+        bDraggingScreenPlane = false;
+        if (OnPointDragEnd) { OnPointDragEnd(); }
+        Invalidate();
+    }
+    bool IsSelectionWidgetAvailable() const
+    {
+        const USplineComponent* Native = Spline.Get();
+        return !bPenMode && !bMarqueeMode && bShowPoints && IsValid(Native) &&
+            SelectedPoint >= 0 && SelectedPoint < Native->GetNumberOfSplinePoints() &&
+            SelectedPoints.Contains(SelectedPoint);
+    }
     void SetOnSelectAll(TFunction<void()> InCallback) { OnSelectAll = MoveTemp(InCallback); }
     void SetOnClearSelection(TFunction<void()> InCallback) { OnClearSelection = MoveTemp(InCallback); }
     void SetPointDragCallbacks(TFunction<void(const FVector&)> InDelta, TFunction<void()> InEnd)
@@ -488,13 +555,16 @@ public:
             SelectedPoints.Contains(SelectedPoint);
         const bool bCanTransform = bHasAnchor && bShowPoints && !bPenMode && !bMarqueeMode;
         Modes->SetSelectionHasSceneComponent(bCanTransform);
-        Modes->SetShowWidget(bCanTransform);
-        Modes->SetWidgetMode(bCanTransform ? GetWidgetMode() : UE::Widget::WM_None);
+        // Camera-aligned translation uses Strand's planar drag handle, not a
+        // misleading native 3D widget with a selectable depth axis.
+        const bool bNativeWidget = bCanTransform && !(bCameraAlignedEditing && WidgetMode == 0);
+        Modes->SetShowWidget(bNativeWidget);
+        Modes->SetWidgetMode(bNativeWidget ? GetWidgetMode() : UE::Widget::WM_None);
         if (bCanTransform)
         {
             Modes->SetPivotLocation(GetWidgetLocation(), false);
         }
-        ShowWidget(bCanTransform);
+        ShowWidget(bCanTransform && !(bCameraAlignedEditing && WidgetMode == 0));
     }
 
     bool IsNativeWidgetReady()
@@ -547,12 +617,21 @@ public:
 
     virtual ECoordSystem GetWidgetCoordSystemSpace() const override
     {
-        return bWidgetLocal ? COORD_Local : COORD_World;
+        return (bCameraAlignedEditing && WidgetMode == 0) || bWidgetLocal ? COORD_Local : COORD_World;
     }
 
     virtual FMatrix GetWidgetCoordSystem() const override
     {
         const USplineComponent* Native = Spline.Get();
+        if (bWidgetFrameFrozen) { return FrozenWidgetFrame; }
+        if (bCameraAlignedEditing && WidgetMode == 0)
+        {
+            // The X/Y handles lie in screen space; native Z remains visible
+            // but the editor's movement constraint rejects depth translation.
+            const FRotationMatrix Camera(GetViewRotation());
+            return FRotationMatrix::MakeFromXY(
+                Camera.GetScaledAxis(EAxis::Y), Camera.GetScaledAxis(EAxis::Z));
+        }
         if (!bWidgetLocal || !IsValid(Native) ||
             SelectedPoint < 0 || SelectedPoint >= Native->GetNumberOfSplinePoints())
         {
@@ -620,7 +699,7 @@ public:
         }
         // Cache the tangent-aligned basis before the first edit delta.
         // The spline's outgoing tangent may rotate during this drag.
-        if (!bWidgetFrameFrozen && bWidgetLocal)
+        if (!bWidgetFrameFrozen && (bWidgetLocal || bCameraAlignedEditing))
         {
             FrozenWidgetFrame = GetWidgetCoordSystem();
             bWidgetFrameFrozen = true;
@@ -632,6 +711,22 @@ public:
             const FQuat WidgetDelta = Rot.Quaternion();
             if (!WidgetDelta.IsIdentity(0.000001))
             {
+                // For a single anchor, local red/X is a pure roll around the
+                // outgoing tangent, not a curve-shape rotation. Keep the
+                // authored tangents and anchor position intact.
+                if (bWidgetLocal && CurrentAxis == EAxisList::X &&
+                    SelectedPoints.Num() == 1 && OnTangentRoll)
+                {
+                    FVector Axis;
+                    double Angle = 0.0;
+                    WidgetDelta.ToAxisAndAngle(Axis, Angle);
+                    const double SignedDegrees = FMath::RadiansToDegrees(Angle * Axis.X);
+                    if (FMath::IsFinite(SignedDegrees) && FMath::Abs(SignedDegrees) > 0.00001)
+                    {
+                        OnTangentRoll(SignedDegrees);
+                    }
+                    return true;
+                }
                 const FQuat Frame = bWidgetLocal
                     ? FQuat(GetWidgetCoordSystem()).GetNormalized()
                     : FQuat::Identity;
@@ -758,6 +853,35 @@ public:
     // standard click-on-release selection path in ProcessClick.
     virtual bool InputKey(const FInputKeyEventArgs& EventArgs) override
     {
+        if (EventArgs.Key == EKeys::LeftMouseButton && EventArgs.Event == IE_Pressed &&
+            !bDraggingScreenPlane && !EventArgs.Viewport->KeyState(EKeys::LeftAlt) &&
+            !EventArgs.Viewport->KeyState(EKeys::RightAlt) &&
+            ScreenPlaneHit(EventArgs.Viewport->GetMouseX(), EventArgs.Viewport->GetMouseY()))
+        {
+            const FRotationMatrix Camera(GetViewRotation());
+            ScreenPlaneRight = Camera.GetScaledAxis(EAxis::Y).GetSafeNormal();
+            ScreenPlaneUp = Camera.GetScaledAxis(EAxis::Z).GetSafeNormal();
+            const double Depth = FMath::Max(1.0, FVector::DotProduct(
+                GetWidgetLocation() - GetViewLocation(), GetCameraForward()));
+            const double Width = FMath::Max(1, EventArgs.Viewport->GetSizeXY().X);
+            ScreenPlaneLockedDepth = Depth;
+            ScreenPlaneLockedFov = ViewFOV;
+            ScreenPlaneLockedWidth = Width;
+            ScreenPlaneLastMouse = FIntPoint(EventArgs.Viewport->GetMouseX(), EventArgs.Viewport->GetMouseY());
+            bDraggingScreenPlane = true;
+            Invalidate();
+            return true;
+        }
+        if (EventArgs.Key == EKeys::LeftMouseButton && EventArgs.Event == IE_Released && bDraggingScreenPlane)
+        {
+            EndScreenPlaneDrag();
+            return true;
+        }
+        if (EventArgs.Key == EKeys::Escape && bDraggingScreenPlane)
+        {
+            EndScreenPlaneDrag();
+            return true;
+        }
         // Only a stationary RMB click on an editing target opens Strand's
         // context menu. RMB drags and RMB+WASD always stay native camera input.
         if (EventArgs.Key == EKeys::LeftMouseButton && EventArgs.Event == IE_Pressed &&
@@ -1084,7 +1208,7 @@ public:
         }
         // Consuming press/release alone is insufficient: native viewport mouse
         // deltas can still move the camera during an active Pen drag.
-        if ((bPenMode && bPenDragging) || bMarqueeDragging || bSegmentBending) { return true; }
+        if ((bPenMode && bPenDragging) || bMarqueeDragging || bSegmentBending || bDraggingScreenPlane) { return true; }
         return FEditorViewportClient::InputAxis(EventArgs);
     }
 
@@ -1095,6 +1219,7 @@ public:
         { bRightClickMoved = true; }
         if (bMarqueeDragging) { UpdateMarqueeCursor(X, Y); }
         UpdatePenMouse();
+        if (bDraggingScreenPlane) { UpdateScreenPlaneDrag(X, Y); return; }
         if (bSegmentBending) { UpdateSegmentBendCursor(X, Y); return; }
         if ((!bPenMode || !bPenDragging) && !bMarqueeDragging)
         {
@@ -1110,6 +1235,7 @@ public:
         { bRightClickMoved = true; }
         if (bMarqueeDragging) { UpdateMarqueeCursor(X, Y); }
         UpdatePenMouse();
+        if (bDraggingScreenPlane) { UpdateScreenPlaneDrag(X, Y); return; }
         if (bSegmentBending) { UpdateSegmentBendCursor(X, Y); return; }
         if ((!bPenMode || !bPenDragging) && !bMarqueeDragging)
         {
@@ -1198,6 +1324,40 @@ public:
         const USplineComponent* Native = Spline.Get();
         if (!IsValid(Native)) { return; }
         const int32 PointCount = Native->GetNumberOfSplinePoints();
+        FVector2D ScreenPlaneScreenCenter;
+        if (GetScreenPlaneCenter(ScreenPlaneScreenCenter) && !bPenMode && !bMarqueeMode)
+        {
+            const FVector Pivot = GetWidgetLocation();
+            const FRotationMatrix Camera(GetViewRotation());
+            const FVector Right = Camera.GetScaledAxis(EAxis::Y).GetSafeNormal();
+            const FVector Up = Camera.GetScaledAxis(EAxis::Z).GetSafeNormal();
+            const double Depth = FMath::Max(1.0, FVector::DotProduct(
+                Pivot - GetViewLocation(), GetCameraForward()));
+            const double PixelScale = Depth * 2.0 *
+                FMath::Tan(FMath::DegreesToRadians(ViewFOV * 0.5)) /
+                FMath::Max(1, CachedViewRect.Width());
+            const double CenterSize = PixelScale * ScreenPlaneHandleHalfSizePx;
+            const double AxisSize = PixelScale * ScreenPlaneAxisLengthPx;
+            const bool bHovered = bDraggingScreenPlane || ScreenPlaneHit(PenMouseX, PenMouseY);
+            const FLinearColor Color = bHovered ? FLinearColor(1.0f, 0.85f, 0.3f) :
+                FLinearColor(0.82f, 0.90f, 0.97f);
+            const FVector A = Pivot - Right * CenterSize - Up * CenterSize;
+            const FVector B = Pivot + Right * CenterSize - Up * CenterSize;
+            const FVector C = Pivot + Right * CenterSize + Up * CenterSize;
+            const FVector D = Pivot - Right * CenterSize + Up * CenterSize;
+            PDI->DrawLine(A, B, Color, SDPG_Foreground, 2.0f);
+            PDI->DrawLine(B, C, Color, SDPG_Foreground, 2.0f);
+            PDI->DrawLine(C, D, Color, SDPG_Foreground, 2.0f);
+            PDI->DrawLine(D, A, Color, SDPG_Foreground, 2.0f);
+            PDI->DrawLine(Pivot - Right * AxisSize, Pivot - Right * CenterSize,
+                FLinearColor(0.95f, 0.30f, 0.30f), SDPG_Foreground, 1.5f);
+            PDI->DrawLine(Pivot + Right * CenterSize, Pivot + Right * AxisSize,
+                FLinearColor(0.95f, 0.30f, 0.30f), SDPG_Foreground, 1.5f);
+            PDI->DrawLine(Pivot - Up * AxisSize, Pivot - Up * CenterSize,
+                FLinearColor(0.25f, 0.86f, 0.40f), SDPG_Foreground, 1.5f);
+            PDI->DrawLine(Pivot + Up * CenterSize, Pivot + Up * AxisSize,
+                FLinearColor(0.25f, 0.86f, 0.40f), SDPG_Foreground, 1.5f);
+        }
 
         // Foreground marquee uses four projected cursor rays, so it works in
         // perspective and all orthographic viewport projections.
@@ -1707,6 +1867,7 @@ private:
     TFunction<void(const TArray<int32>&, bool, bool)> OnMarqueeSelected;
     TFunction<void()> OnMarqueeExit;
     TFunction<void(const FQuat&)> OnPointRotation;
+    TFunction<void(double)> OnTangentRoll;
     TFunction<void(double)> OnPointScale;
     TFunction<void(int32)> OnWidgetModeChanged;
     TFunction<void(int32)> OnToolShortcut;
@@ -1734,6 +1895,14 @@ private:
     bool bDelegatedMarqueeCameraClick = false;
     int32 WidgetMode = 0;
     bool bWidgetLocal = false;
+    bool bDraggingScreenPlane = false;
+    FIntPoint ScreenPlaneLastMouse = FIntPoint::ZeroValue;
+    FVector ScreenPlaneRight = FVector::YAxisVector;
+    FVector ScreenPlaneUp = FVector::ZAxisVector;
+    double ScreenPlaneLockedDepth = 1.0;
+    double ScreenPlaneLockedFov = 90.0;
+    double ScreenPlaneLockedWidth = 1280.0;
+    bool bCameraAlignedEditing = false;
     bool bWidgetFrameFrozen = false;
     FMatrix FrozenWidgetFrame = FMatrix::Identity;
     FRotator AuthoredAnchorRotation = FRotator::ZeroRotator;
@@ -1911,6 +2080,16 @@ FVector SStrandSplineViewport::GetCurrentWidgetAxisX() const
 {
     return StrandViewportClient.IsValid() ? StrandViewportClient->GetCurrentWidgetAxisX() : FVector::XAxisVector;
 }
+void SStrandSplineViewport::SetCameraAlignedEditing(bool bEnabled)
+{
+    if (StrandViewportClient.IsValid()) { StrandViewportClient->SetCameraAlignedEditing(bEnabled); }
+}
+
+void SStrandSplineViewport::SetTangentRollCallback(TFunction<void(double)> Callback)
+{
+    if (StrandViewportClient.IsValid()) { StrandViewportClient->SetTangentRollCallback(MoveTemp(Callback)); }
+}
+
 void SStrandSplineViewport::SetWidgetLocal(bool bLocal)
 {
     if (StrandViewportClient.IsValid()) { StrandViewportClient->SetStrandWidgetLocal(bLocal); }
@@ -2000,6 +2179,18 @@ void SStrandSplineViewport::SetPenCallbacks(TFunction<bool(const FStrandPenHit&)
     }
 }
 
+FVector SStrandSplineViewport::GetCameraLocation() const
+{
+    return StrandViewportClient.IsValid() ? StrandViewportClient->GetCameraLocation() : FVector::ZeroVector;
+}
+double SStrandSplineViewport::GetCameraHorizontalFOV() const
+{
+    return StrandViewportClient.IsValid() ? StrandViewportClient->GetCameraHorizontalFOV() : 90.0;
+}
+int32 SStrandSplineViewport::GetCameraViewportWidth() const
+{
+    return StrandViewportClient.IsValid() ? StrandViewportClient->GetCameraViewportWidth() : 1280;
+}
 FVector SStrandSplineViewport::GetCameraForward() const
 {
     return StrandViewportClient.IsValid() ? StrandViewportClient->GetCameraForward() : FVector::XAxisVector;

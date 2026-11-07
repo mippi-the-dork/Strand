@@ -47,6 +47,9 @@ public:
     void SetOrientationSize(double Centimeters);
     double GetOrientationSize() const;
     FVector GetCameraForward() const;
+    FVector GetCameraLocation() const;
+    double GetCameraHorizontalFOV() const;
+    int32 GetCameraViewportWidth() const;
     void SetSelectedPointIndex(int32 Index);
     void SetSelectedPoints(const TArray<int32>& Indices, int32 PrimaryIndex);
     void SetOnPointSelected(TFunction<void(int32, bool, bool)> InCallback);
@@ -67,6 +70,8 @@ public:
     void SetLassoMode(bool bEnabled);
     void SetWidgetMode(int32 Mode);
     void SetWidgetLocal(bool bLocal);
+    void SetCameraAlignedEditing(bool bEnabled);
+    void SetTangentRollCallback(TFunction<void(double)> InCallback);
     void SetAuthoredAnchorRotation(const FRotator& Rotation);
     /** The actual saved rotation driving Local gizmo axes; also used by regression tests. */
     FRotator GetAuthoredAnchorRotation() const;

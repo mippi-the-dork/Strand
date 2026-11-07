@@ -114,3 +114,32 @@ bool FStrandNativeOrientationFrameTest::RunTest(const FString& Parameters)
     return true;
 }
 #endif
+
+#if WITH_DEV_AUTOMATION_TESTS
+#include "StrandSplineEditOperations.h"
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStrandLocalTangentRollTest,
+    "Strand.Editor.Authoring.Orientation.LocalTangentRollPreservesShape",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FStrandLocalTangentRollTest::RunTest(const FString& Parameters)
+{
+    FSplinePointData Point;
+    Point.LocalPosition = FVector(15, -25, 90);
+    Point.ArriveTangent = FVector(8, 12, -3);
+    Point.LeaveTangent = FVector(45, 15, 30);
+    Point.LocalRotation = FRotator(10, 20, 30);
+    const FSplinePointData Before = Point;
+    const FVector Forward = Point.LeaveTangent.GetSafeNormal();
+    const FVector OriginalUp = Point.LocalRotation.Quaternion().RotateVector(FVector::ZAxisVector);
+    TestTrue(TEXT("Local X roll modifies orientation"),
+        StrandSplineEditOperations::RollAnchorAroundForward(Point, Forward, 42.0));
+    const FVector ActualUp = Point.LocalRotation.Quaternion().RotateVector(FVector::ZAxisVector);
+    const FVector ExpectedUp = FQuat(Forward, FMath::DegreesToRadians(42.0)).RotateVector(OriginalUp);
+    TestTrue(TEXT("Orientation rotates around forward tangent"), ActualUp.Equals(ExpectedUp, 0.0001));
+    TestTrue(TEXT("Anchor position unchanged"), Point.LocalPosition.Equals(Before.LocalPosition));
+    TestTrue(TEXT("Incoming tangent unchanged"), Point.ArriveTangent.Equals(Before.ArriveTangent));
+    TestTrue(TEXT("Outgoing tangent unchanged"), Point.LeaveTangent.Equals(Before.LeaveTangent));
+    TestFalse(TEXT("Zero roll is a no-op"), StrandSplineEditOperations::RollAnchorAroundForward(Point, Forward, 0.0));
+    TestFalse(TEXT("Degenerate tangent rejected"), StrandSplineEditOperations::RollAnchorAroundForward(Point, FVector::ZeroVector, 35.0));
+    return true;
+}
+#endif

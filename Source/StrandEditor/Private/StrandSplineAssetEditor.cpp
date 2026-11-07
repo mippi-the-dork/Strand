@@ -1,6 +1,7 @@
 #include "StrandSplineAssetEditor.h"
 #include "StrandEditorPreferences.h"
 #include "StrandCameraSpaceMath.h"
+#include "StrandPerspectiveFlatten.h"
 #include "StrandSplineViewport.h"
 #include "SplineDataAsset.h"
 #include "SplineDataAssetFactory.h"
@@ -179,6 +180,8 @@ FText FStrandSplineAssetEditor::GetToolkitToolTipText() const
 FStrandSplineAssetEditor::~FStrandSplineAssetEditor()
 {
     if (TSharedPtr<SWindow> Window = ActiveCleanupWindow.Pin())
+    { Window->RequestDestroyWindow(); }
+    if (TSharedPtr<SWindow> Window = ActiveFlattenWindow.Pin())
     { Window->RequestDestroyWindow(); }
     if (PreviewWidget.IsValid()) { PreviewWidget->SetCleanupPreviewPolyline({}); }
 }
@@ -784,6 +787,7 @@ TSharedRef<SDockTab> FStrandSplineAssetEditor::SpawnPreviewTab(const FSpawnTabAr
             { SelectMarqueePoints(Points, bAdd, bToggle); });
         PreviewWidget->SetOnMarqueeExit([this]() { SetMarqueeMode(false); });
         PreviewWidget->SetPointRotationCallback([this](const FQuat& Delta) { ApplyViewportRotation(Delta); });
+        PreviewWidget->SetTangentRollCallback([this](double Degrees) { ApplyViewportTangentRoll(Degrees); });
         PreviewWidget->SetPointScaleCallback([this](double Factor) { ApplyViewportScale(Factor); });
         PreviewWidget->SetOnWidgetModeChanged([this](int32 Mode) { SetWidgetMode(Mode); });
         PreviewWidget->SetOnToolShortcut([this](int32 Tool)
@@ -812,6 +816,7 @@ TSharedRef<SDockTab> FStrandSplineAssetEditor::SpawnPreviewTab(const FSpawnTabAr
         else { PreviewWidget->SetMarqueeMode(bMarqueeMode); }
         PreviewWidget->SetWidgetMode(ActiveWidgetMode);
         PreviewWidget->SetWidgetLocal(bWidgetLocal);
+        PreviewWidget->SetCameraAlignedEditing(EditPlane == EStrandEditPlane::CameraPlane);
         PreviewWidget->SetPenSnap(PenSnapStep);
         PreviewWidget->SetPenPlane(EditPlane == EStrandEditPlane::XY ? 2 :
             EditPlane == EStrandEditPlane::XZ ? 1 : EditPlane == EStrandEditPlane::YZ ? 0 : -1);
@@ -1352,6 +1357,13 @@ void FStrandSplineAssetEditor::RefreshSoftSelectionVisualization()
 {
     if (!PreviewWidget.IsValid()) { return; }
     TArray<double> Weights;
+    // Keep the visible falloff identical to the actual frozen gesture weights.
+    // Re-evaluating after every geometry rebuild would make the halos drift.
+    if (ActivePointDragTransaction && FrozenSoftSelectionWeights.Num() > 0)
+    {
+        PreviewWidget->SetSoftSelectionWeights(FrozenSoftSelectionWeights);
+        return;
+    }
     if (SoftSelectionMode != 0 && NativePreview.IsValid())
     {
         if (const USplineDataAsset* Current = Asset.Get())
@@ -1372,10 +1384,13 @@ void FStrandSplineAssetEditor::RefreshSoftSelectionVisualization()
 void FStrandSplineAssetEditor::BeginViewportPointDrag()
 {
     if (ActivePointDragTransaction || !HasSelectedPoint()) { return; }
+    if (EditPlane == EStrandEditPlane::CameraPlane && PreviewWidget.IsValid())
+    { LockedCameraPlaneNormal = PreviewWidget->GetCameraForward(); }
     ActivePointDragTransaction = MakeUnique<FScopedTransaction>(
         LOCTEXT("DragSplinePoint", "Move Strand Spline Selection"));
     bPointChangedDuringDrag = false;
     FrozenSoftSelectionWeights.Reset();
+    FrozenSoftSelectionPivot = StrandSplineEditOperations::SelectionCenter(Asset->Points, GetSelectedIndices());
     if (SoftSelectionMode != 0 && NativePreview.IsValid())
     {
         const TArray<int32> Sources = GetSelectedIndices();
@@ -1428,6 +1443,25 @@ void FStrandSplineAssetEditor::ApplyViewportPointDrag(const FVector& LocalDelta)
     }
 }
 
+void FStrandSplineAssetEditor::ApplyViewportTangentRoll(double Degrees)
+{
+    USplineDataAsset* Current = Asset.Get();
+    if (!Current || !NativePreview.IsValid() || !HasSelectedPoint() ||
+        HasMultipleSelectedPoints() || !FMath::IsFinite(Degrees)) { return; }
+    const FVector Forward = NativePreview->GetTangentAtSplinePoint(
+        SelectedPointIndex, ESplineCoordinateSpace::Local);
+    if (Forward.IsNearlyZero()) { return; }
+    if (!ActivePointDragTransaction) { BeginViewportPointDrag(); }
+    if (!ActivePointDragTransaction) { return; }
+    if (StrandSplineEditOperations::RollAnchorAroundForward(
+        Current->Points[SelectedPointIndex], Forward, Degrees))
+    {
+        bPointChangedDuringDrag = true;
+        Current->PostEditChange();
+        RebuildNativePreview();
+    }
+}
+
 void FStrandSplineAssetEditor::ApplyViewportRotation(const FQuat& RotationDelta)
 {
     USplineDataAsset* Current = Asset.Get();
@@ -1446,7 +1480,11 @@ void FStrandSplineAssetEditor::ApplyViewportRotation(const FQuat& RotationDelta)
     }
     if (!ActivePointDragTransaction) { BeginViewportPointDrag(); }
     if (!ActivePointDragTransaction) { return; }
-    if (StrandSplineEditOperations::RotateSelectedQuat(Current->Points, GetSelectedIndices(), Delta))
+    const bool bChanged = SoftSelectionMode == 0
+        ? StrandSplineEditOperations::RotateSelectedQuat(Current->Points, GetSelectedIndices(), Delta)
+        : StrandCameraSpace::ApplyWeightedRotation(Current->Points, FrozenSoftSelectionWeights,
+            FrozenSoftSelectionPivot, Delta);
+    if (bChanged)
     {
         bPointChangedDuringDrag = true;
         Current->PostEditChange();
@@ -1461,7 +1499,11 @@ void FStrandSplineAssetEditor::ApplyViewportScale(double Factor)
         FMath::IsNearlyEqual(Factor, 1.0, 0.000001)) { return; }
     if (!ActivePointDragTransaction) { BeginViewportPointDrag(); }
     if (!ActivePointDragTransaction) { return; }
-    if (StrandSplineEditOperations::ScaleSelected(Current->Points, GetSelectedIndices(), Factor))
+    const bool bChanged = SoftSelectionMode == 0
+        ? StrandSplineEditOperations::ScaleSelected(Current->Points, GetSelectedIndices(), Factor)
+        : StrandCameraSpace::ApplyWeightedScale(Current->Points, FrozenSoftSelectionWeights,
+            FrozenSoftSelectionPivot, Factor);
+    if (bChanged)
     {
         bPointChangedDuringDrag = true;
         Current->PostEditChange();
@@ -2421,20 +2463,148 @@ void FStrandSplineAssetEditor::RotateSelectionAroundCamera(double Degrees)
     CommitSplineEdit(SelectedPointIndex, true);
 }
 
-void FStrandSplineAssetEditor::FlattenSelectionToCameraPlane()
+void FStrandSplineAssetEditor::OpenPerspectiveFlattenDialog()
 {
     USplineDataAsset* Current = Asset.Get();
-    if (!Current || !PreviewWidget.IsValid() || GetSelectedIndices().IsEmpty()) { return; }
-    EndViewportPointDrag();
-    const TArray<int32> Selection = GetSelectedIndices();
-    const FVector PlaneOrigin = StrandSplineEditOperations::SelectionCenter(Current->Points, Selection);
-    const FVector PlaneNormal = PreviewWidget->GetCameraForward();
-    TArray<FSplinePointData> Result = Current->Points;
-    if (!StrandCameraSpace::Flatten(Result, Selection, PlaneOrigin, PlaneNormal)) { return; }
-    const FScopedTransaction Transaction(LOCTEXT("FlattenCameraPlaneUndo", "Flatten Strand Selection to Camera Plane"));
-    Current->Modify();
-    Current->Points = MoveTemp(Result);
-    CommitSplineEdit(SelectedPointIndex, true);
+    if (!Current || !NativePreview.IsValid() || !PreviewWidget.IsValid() || Current->Points.Num() < 2) { return; }
+    if (TSharedPtr<SWindow> OpenWindow = ActiveFlattenWindow.Pin())
+    {
+        OpenWindow->BringToFront(true);
+        return;
+    }
+    if (TSharedPtr<SWindow> Cleanup = ActiveCleanupWindow.Pin()) { Cleanup->RequestDestroyWindow(); }
+
+    struct FFlattenState
+    {
+        double TolerancePixels = 1.0;
+        StrandPerspectiveFlatten::FCamera Camera;
+        TArray<FSplinePointData> Candidate;
+        FString Summary;
+        bool bValid = false;
+        bool bShowOverlay = true;
+    };
+    TSharedRef<FFlattenState> State = MakeShared<FFlattenState>();
+    TSharedRef<SWindow> Dialog = SNew(SWindow)
+        .Title(LOCTEXT("CameraFlattenTitle", "Flatten to Camera View — Perspective Preview"))
+        .ClientSize(FVector2D(520.0, 300.0))
+        .SizingRule(ESizingRule::UserSized)
+        .SupportsMaximize(false).SupportsMinimize(false);
+    ActiveFlattenWindow = Dialog;
+    TWeakPtr<FStrandSplineAssetEditor> WeakOwner = SharedThis(this);
+    TWeakPtr<SWindow> WeakWindow = Dialog;
+    TWeakPtr<SStrandSplineViewport> WeakViewport = PreviewWidget;
+    Dialog->SetOnWindowClosed(FOnWindowClosed::CreateLambda([WeakOwner, WeakViewport](const TSharedRef<SWindow>&)
+    {
+        if (TSharedPtr<SStrandSplineViewport> Viewport = WeakViewport.Pin())
+        { Viewport->SetCleanupPreviewPolyline({}); }
+        if (TSharedPtr<FStrandSplineAssetEditor> Owner = WeakOwner.Pin()) { Owner->ActiveFlattenWindow.Reset(); }
+    }));
+    auto CaptureCamera = [WeakViewport, State]()
+    {
+        if (TSharedPtr<SStrandSplineViewport> Viewport = WeakViewport.Pin())
+        {
+            State->Camera.Location = Viewport->GetCameraLocation();
+            State->Camera.Forward = Viewport->GetCameraForward();
+            State->Camera.HorizontalFOVDegrees = Viewport->GetCameraHorizontalFOV();
+            State->Camera.ViewportWidth = Viewport->GetCameraViewportWidth();
+        }
+    };
+    auto Refresh = [WeakOwner, WeakViewport, State]()
+    {
+        TSharedPtr<FStrandSplineAssetEditor> Owner = WeakOwner.Pin();
+        USplineDataAsset* AssetNow = Owner.IsValid() ? Owner->Asset.Get() : nullptr;
+        State->bValid = false;
+        State->Candidate.Reset();
+        if (!AssetNow || !Owner->NativePreview.IsValid())
+        { State->Summary = TEXT("Source spline unavailable."); return; }
+        State->bValid = StrandPerspectiveFlatten::Build(Owner->NativePreview.Get(), AssetNow->Points,
+            AssetNow->bIsClosedLoop, State->Camera, State->TolerancePixels,
+            State->Candidate, State->Summary);
+        if (TSharedPtr<SStrandSplineViewport> Viewport = WeakViewport.Pin())
+        {
+            TArray<FVector> Sampled;
+            if (State->bValid && State->bShowOverlay)
+            {
+                USplineComponent* Proposed = NewObject<USplineComponent>(GetTransientPackage(), NAME_None, RF_Transient);
+                Proposed->ClearSplinePoints(false);
+                for (int32 I = 0; I < State->Candidate.Num(); ++I)
+                { Proposed->AddPoint(State->Candidate[I].ToSplinePoint(I), false); }
+                Proposed->SetClosedLoop(AssetNow->bIsClosedLoop, false);
+                Proposed->UpdateSpline();
+                const int32 Segments = FMath::Clamp(State->Candidate.Num() * 12, 128, 2048);
+                const double Length = Proposed->GetSplineLength();
+                for (int32 I = 0; I <= Segments; ++I)
+                { Sampled.Add(Proposed->GetLocationAtDistanceAlongSpline(Length * I / Segments, ESplineCoordinateSpace::Local)); }
+            }
+            if (State->bValid)
+            {
+                State->Summary = FString::Printf(TEXT("%d -> %d anchors | Target deviation <= %.2f px (sampled) | Camera captured; refresh to recapture view."),
+                    AssetNow->Points.Num(), State->Candidate.Num(), State->TolerancePixels);
+            }
+            Viewport->SetCleanupPreviewPolyline(Sampled);
+        }
+    };
+    CaptureCamera();
+    Dialog->SetContent(SNew(SBorder).Padding(FMargin(16.0f))
+        [SNew(SVerticalBox)
+        + SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 12)
+        [SNew(STextBlock).AutoWrapText(true)
+            .Text(LOCTEXT("FlattenIntro", "Orange is the proposed flattened curve; cyan is unchanged. The entire spline is projected through the captured perspective camera onto one plane. It should keep the same silhouette from that view; orbit afterward to see the flattened result."))]
+        + SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 10)
+        [SNew(SHorizontalBox)
+            + SHorizontalBox::Slot().FillWidth(1)
+            [SNew(STextBlock).Text(LOCTEXT("FlattenToleranceLabel", "Maximum screen deviation (pixels)"))]
+            + SHorizontalBox::Slot().AutoWidth()
+            [SNew(SBox).WidthOverride(130)
+                [SNew(SNumericEntryBox<double>)
+                    .MinValue(0.25).MaxValue(16.0)
+                    .MinSliderValue(0.25).MaxSliderValue(8.0)
+                    .AllowSpin(true)
+                    .Value_Lambda([State]() -> TOptional<double> { return State->TolerancePixels; })
+                    .OnValueChanged_Lambda([State, Refresh](double Value)
+                    { State->TolerancePixels = FMath::Clamp(Value, 0.25, 16.0); Refresh(); })]]]
+        + SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 8)
+        [SNew(SCheckBox)
+            .IsChecked_Lambda([State]() { return State->bShowOverlay ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
+            .OnCheckStateChanged_Lambda([State, Refresh](ECheckBoxState Value)
+            { State->bShowOverlay = Value == ECheckBoxState::Checked; Refresh(); })
+            [SNew(STextBlock).Text(LOCTEXT("FlattenShowPreview", "Show proposed curve overlay"))]]
+        + SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 8)
+        [SNew(SButton).Text(LOCTEXT("FlattenRefresh", "Capture Current View and Refresh Preview"))
+            .OnClicked_Lambda([CaptureCamera, Refresh]() { CaptureCamera(); Refresh(); return FReply::Handled(); })]
+        + SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 10)
+        [SNew(STextBlock).AutoWrapText(true).Text_Lambda([State]() { return FText::FromString(State->Summary); })]
+        + SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 12)
+        [SNew(STextBlock).AutoWrapText(true)
+            .Text(LOCTEXT("FlattenCaveat", "The preview approximates the captured image-plane curve within a sampled pixel tolerance. It may insert anchors and convert tangent modes. Original point rotations/scales are retained at source anchors. Cancel leaves the asset untouched."))]
+        + SVerticalBox::Slot().FillHeight(1) [SNullWidget::NullWidget]
+        + SVerticalBox::Slot().AutoHeight()
+        [SNew(SHorizontalBox)
+            + SHorizontalBox::Slot().FillWidth(1) [SNullWidget::NullWidget]
+            + SHorizontalBox::Slot().AutoWidth().Padding(0,0,8,0)
+            [SNew(SButton).Text(LOCTEXT("FlattenCancel", "Cancel"))
+                .OnClicked_Lambda([WeakWindow]()
+                { if (TSharedPtr<SWindow> Window = WeakWindow.Pin()) { Window->RequestDestroyWindow(); } return FReply::Handled(); })]
+            + SHorizontalBox::Slot().AutoWidth()
+            [SNew(SButton).Text(LOCTEXT("FlattenApply", "Apply Flatten"))
+                .IsEnabled_Lambda([State]() { return State->bValid; })
+                .OnClicked_Lambda([WeakOwner, WeakWindow, WeakViewport, State, Refresh]()
+                {
+                    Refresh(); // Prevent a modeless dialog committing a stale source curve.
+                    TSharedPtr<FStrandSplineAssetEditor> Owner = WeakOwner.Pin();
+                    USplineDataAsset* AssetNow = Owner.IsValid() ? Owner->Asset.Get() : nullptr;
+                    if (!AssetNow || !State->bValid) { return FReply::Handled(); }
+                    Owner->EndViewportPointDrag();
+                    const FScopedTransaction Transaction(LOCTEXT("PerspectiveFlattenUndo", "Flatten Strand to Captured Camera View"));
+                    AssetNow->Modify();
+                    AssetNow->Points = State->Candidate;
+                    if (TSharedPtr<SStrandSplineViewport> Viewport = WeakViewport.Pin()) { Viewport->SetCleanupPreviewPolyline({}); }
+                    Owner->CommitSplineEdit(INDEX_NONE);
+                    if (TSharedPtr<SWindow> Window = WeakWindow.Pin()) { Window->RequestDestroyWindow(); }
+                    return FReply::Handled();
+                })]]]);
+    Refresh();
+    FSlateApplication::Get().AddWindow(Dialog);
 }
 
 FText FStrandSplineAssetEditor::GetEditPlaneLabel() const
@@ -2459,6 +2629,7 @@ void FStrandSplineAssetEditor::SetEditPlane(EStrandEditPlane NewPlane)
     }
     if (PreviewWidget.IsValid())
     {
+        PreviewWidget->SetCameraAlignedEditing(NewPlane == EStrandEditPlane::CameraPlane);
         PreviewWidget->SetPenPlane(NewPlane == EStrandEditPlane::XY ? 2 :
             NewPlane == EStrandEditPlane::XZ ? 1 : NewPlane == EStrandEditPlane::YZ ? 0 : -1);
     }
@@ -2480,17 +2651,12 @@ TSharedRef<SWidget> FStrandSplineAssetEditor::MakeEditPlaneMenu()
     Entry(EStrandEditPlane::XY, LOCTEXT("EditXY", "World XY Plane"), LOCTEXT("EditXYHelp", "Edit only X/Y; leave existing Z coordinates untouched."));
     Entry(EStrandEditPlane::XZ, LOCTEXT("EditXZ", "World XZ Plane"), LOCTEXT("EditXZHelp", "Edit only X/Z; leave existing Y coordinates untouched."));
     Entry(EStrandEditPlane::YZ, LOCTEXT("EditYZ", "World YZ Plane"), LOCTEXT("EditYZHelp", "Edit only Y/Z; leave existing X coordinates untouched."));
-    Entry(EStrandEditPlane::CameraPlane, LOCTEXT("EditCameraPlane", "Camera-Aligned Plane"),
-        LOCTEXT("EditCameraPlaneHelp", "Move selected anchors parallel to the camera image plane. Camera alignment is captured when enabling the mode; existing point depth is preserved."));
+    Entry(EStrandEditPlane::CameraPlane, LOCTEXT("EditCameraPlane", "Camera-Aligned 2D Editing"),
+        LOCTEXT("EditCameraPlaneHelp", "Keep perspective camera navigation. Each new drag captures the current camera-aligned plane; original depth is preserved. This does not flatten the spline."));
     Menu.AddMenuSeparator();
-    Menu.BeginSection(TEXT("StrandViewProjection"), LOCTEXT("StrandViewProjectionTitle", "View Projection (Does Not Change Edit Plane)"));
-    Menu.AddMenuEntry(LOCTEXT("CameraOrthographicView", "Camera Orthographic View"),
-        LOCTEXT("CameraOrthographicViewHelp", "Switch to orthographic projection while retaining the camera direction. Does not change spline data."),
-        FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this]() { if (PreviewWidget.IsValid()) { PreviewWidget->SetProjection(LVT_OrthoFreelook); } })));
-    Menu.AddMenuEntry(LOCTEXT("ReturnPerspectiveView", "Perspective View"),
-        LOCTEXT("ReturnPerspectiveViewHelp", "Return to perspective projection."),
-        FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this]() { if (PreviewWidget.IsValid()) { PreviewWidget->SetProjection(LVT_Perspective); } })));
-    Menu.EndSection();
+    // The removed "Perspective (Navigable Camera-Aligned Editing)" entry
+    // merely reset viewport projection; it was not a separate edit mode.
+    // Camera navigation remains available through the normal viewport controls.
     Menu.AddSubMenu(LOCTEXT("ScreenSpaceRotate", "Rotate Around Camera (Numeric)"),
         LOCTEXT("ScreenSpaceRotateHelp", "Undoable screen-space rotation about the camera forward axis. Relative to the current selection pivot."),
         FNewMenuDelegate::CreateLambda([this](FMenuBuilder& Sub)
@@ -2506,10 +2672,10 @@ TSharedRef<SWidget> FStrandSplineAssetEditor::MakeEditPlaneMenu()
                 LOCTEXT("ScreenRotationCustom", "Custom Delta (deg)"), true);
         }));
     Menu.AddMenuSeparator();
-    Menu.AddMenuEntry(LOCTEXT("FlattenCameraPlane", "Flatten Selection to Camera Plane (Immediate)"),
-        LOCTEXT("FlattenCameraPlaneHelp", "Applies immediately without a preview. Projects selected anchors and their tangent vectors to the camera plane through the selection center. Undoable; authored rotations are preserved."),
-        FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this]() { FlattenSelectionToCameraPlane(); }),
-            FCanExecuteAction::CreateLambda([this]() { return !GetSelectedIndices().IsEmpty(); })));
+    Menu.AddMenuEntry(LOCTEXT("FlattenCameraPlane", "Flatten Entire Spline to Camera View..."),
+        LOCTEXT("FlattenCameraPlaneHelp", "Preview the complete spline projected along perspective rays onto one camera-aligned plane. Preserves its on-screen silhouette, with adaptive curves and a user-selected pixel tolerance. Apply/Cancel; Undo supported."),
+        FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this]() { OpenPerspectiveFlattenDialog(); }),
+            FCanExecuteAction::CreateLambda([this]() { return Asset.IsValid() && Asset->Points.Num() >= 2; })));
     return Menu.MakeWidget();
 }
 
@@ -2529,20 +2695,44 @@ void FStrandSplineAssetEditor::ApplyViewportTangentDrag(int32 Handle, const FVec
     FVector Constrained = LocalDelta;
     const int32 LockedAxis = EditPlane == EStrandEditPlane::XY ? 2 : EditPlane == EStrandEditPlane::XZ ? 1 : EditPlane == EStrandEditPlane::YZ ? 0 : -1;
     if (LockedAxis >= 0) { Constrained[LockedAxis] = 0.0; }
+    if (EditPlane == EStrandEditPlane::CameraPlane && PreviewWidget.IsValid())
+    { Constrained = StrandCameraSpace::ProjectDelta(Constrained, PreviewWidget->GetCameraForward()); }
     if (Constrained.IsNearlyZero()) { return; }
     if (!ActivePointDragTransaction) { BeginViewportPointDrag(); }
     if (!ActivePointDragTransaction) { return; }
-    FSplinePointData& Point = Current->Points[SelectedPointIndex];
-    if (Point.PointType != ESplinePointType::CurveCustomTangent)
+    // A handle drag is a shape edit, not an anchor translation. When soft
+    // selection is active, move the corresponding tangent of each influenced
+    // anchor by a frozen proportion of the same handle delta. Do not move
+    // anchor positions or change the untouched anchors' handle modes.
+    bool bEdited = false;
+    if (SoftSelectionMode != 0 && FrozenSoftSelectionWeights.Num() == Current->Points.Num())
     {
-        const FSplinePoint Evaluated = NativePreview->GetSplinePointAt(SelectedPointIndex, ESplineCoordinateSpace::Local);
-        Point.ArriveTangent = Evaluated.ArriveTangent;
-        Point.LeaveTangent = Evaluated.LeaveTangent;
-        Point.PointType = ESplinePointType::CurveCustomTangent;
+        // Snapshot evaluated Auto tangents before modifying any data. A rebuild
+        // must never change the input to another anchor in the same gesture.
+        TArray<FSplinePoint> EvaluatedPoints;
+        EvaluatedPoints.Reserve(Current->Points.Num());
+        for (int32 Index = 0; Index < Current->Points.Num(); ++Index)
+        {
+            EvaluatedPoints.Add(NativePreview->GetSplinePointAt(Index, ESplineCoordinateSpace::Local));
+        }
+        bEdited = StrandCameraSpace::ApplyWeightedTangentDelta(Current->Points,
+            EvaluatedPoints, FrozenSoftSelectionWeights, Handle, Constrained * 3.0);
     }
-    const FVector Target = Handle == 1 ? Point.ArriveTangent - Constrained * 3.0
-        : Point.LeaveTangent + Constrained * 3.0;
-    if (!StrandSplineEditOperations::EditHandle(Point, Handle, Target)) { return; }
+    else
+    {
+        FSplinePointData& Point = Current->Points[SelectedPointIndex];
+        if (Point.PointType != ESplinePointType::CurveCustomTangent)
+        {
+            const FSplinePoint Evaluated = NativePreview->GetSplinePointAt(SelectedPointIndex, ESplineCoordinateSpace::Local);
+            Point.ArriveTangent = Evaluated.ArriveTangent;
+            Point.LeaveTangent = Evaluated.LeaveTangent;
+            Point.PointType = ESplinePointType::CurveCustomTangent;
+        }
+        const FVector Target = Handle == 1 ? Point.ArriveTangent - Constrained * 3.0
+            : Point.LeaveTangent + Constrained * 3.0;
+        bEdited = StrandSplineEditOperations::EditHandle(Point, Handle, Target);
+    }
+    if (!bEdited) { return; }
     bPointChangedDuringDrag = true;
     Current->PostEditChange();
     RebuildNativePreview();
@@ -2936,6 +3126,7 @@ void FStrandSplineAssetEditor::OpenCurveCleanupDialog()
 {
     USplineDataAsset* Current = Asset.Get();
     if (!Current || !NativePreview.IsValid() || Current->Points.Num() < 3) { return; }
+    if (TSharedPtr<SWindow> Flatten = ActiveFlattenWindow.Pin()) { Flatten->RequestDestroyWindow(); }
     if (TSharedPtr<SWindow> OpenWindow = ActiveCleanupWindow.Pin())
     {
         OpenWindow->BringToFront(true);

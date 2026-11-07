@@ -102,3 +102,142 @@ bool FStrandSoftSelectionDragConsistency::RunTest(const FString& Parameters)
     return true;
 }
 #endif
+
+#if WITH_DEV_AUTOMATION_TESTS
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStrandSoftTransformConsistency,
+    "Strand.Editor.Authoring.CameraSpace.WeightedRotateScaleChunkIndependence",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FStrandSoftTransformConsistency::RunTest(const FString& Parameters)
+{
+    TArray<FSplinePointData> Initial;
+    Initial.SetNum(3);
+    Initial[0].LocalPosition = FVector(0, 0, 0);
+    Initial[1].LocalPosition = FVector(100, 10, 0);
+    Initial[2].LocalPosition = FVector(200, 40, 20);
+    for (FSplinePointData& P : Initial)
+    {
+        P.ArriveTangent = FVector(12, 3, 1);
+        P.LeaveTangent = FVector(9, -4, 2);
+    }
+    const TArray<double> Weights{1.0, 0.5, 0.0};
+    const FVector Pivot(0, 0, 0);
+    TArray<FSplinePointData> Whole = Initial;
+    TArray<FSplinePointData> Chunks = Initial;
+    const FVector Axis = FVector(1, 2, 3).GetSafeNormal();
+    const double TotalAngle = PI / 3.0;
+    TestTrue(TEXT("Weighted rotation changes influenced points"),
+        StrandCameraSpace::ApplyWeightedRotation(Whole, Weights, Pivot, FQuat(Axis, TotalAngle)));
+    for (int32 I = 0; I < 24; ++I)
+    {
+        StrandCameraSpace::ApplyWeightedRotation(Chunks, Weights, Pivot, FQuat(Axis, TotalAngle / 24.0));
+    }
+    for (int32 I = 0; I < Whole.Num(); ++I)
+    {
+        TestTrue(FString::Printf(TEXT("Rotation point %d position independent of drag chunking"), I),
+            Whole[I].LocalPosition.Equals(Chunks[I].LocalPosition, 1.e-5));
+        TestTrue(FString::Printf(TEXT("Rotation point %d incoming tangent independent of chunking"), I),
+            Whole[I].ArriveTangent.Equals(Chunks[I].ArriveTangent, 1.e-5));
+        TestTrue(FString::Printf(TEXT("Rotation point %d outgoing tangent independent of chunking"), I),
+            Whole[I].LeaveTangent.Equals(Chunks[I].LeaveTangent, 1.e-5));
+    }
+    TestTrue(TEXT("Zero influence does not affect point position"),
+        Whole[2].LocalPosition.Equals(Initial[2].LocalPosition));
+    TestFalse(TEXT("Reject mismatched weights on rotation"),
+        StrandCameraSpace::ApplyWeightedRotation(Chunks, TArray<double>{1.0}, Pivot, FQuat(Axis, TotalAngle)));
+    Whole = Initial;
+    Chunks = Initial;
+    const double Factor = 2.0;
+    TestTrue(TEXT("Weighted scale changes influenced points"),
+        StrandCameraSpace::ApplyWeightedScale(Whole, Weights, Pivot, Factor));
+    for (int32 I = 0; I < 20; ++I)
+    {
+        StrandCameraSpace::ApplyWeightedScale(Chunks, Weights, Pivot, FMath::Pow(Factor, 1.0 / 20.0));
+    }
+    for (int32 I = 0; I < Whole.Num(); ++I)
+    {
+        TestTrue(FString::Printf(TEXT("Scale point %d position independent of drag chunking"), I),
+            Whole[I].LocalPosition.Equals(Chunks[I].LocalPosition, 1.e-5));
+        TestTrue(FString::Printf(TEXT("Scale point %d incoming tangent independent of chunking"), I),
+            Whole[I].ArriveTangent.Equals(Chunks[I].ArriveTangent, 1.e-5));
+    }
+    TestFalse(TEXT("Reject negative scale"),
+        StrandCameraSpace::ApplyWeightedScale(Chunks, Weights, Pivot, -1.0));
+    return true;
+}
+#endif
+
+#if WITH_DEV_AUTOMATION_TESTS
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStrandCameraScreenGestureTest,
+    "Strand.Editor.Authoring.CameraSpace.ScreenGizmoMath",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FStrandCameraScreenGestureTest::RunTest(const FString& Parameters)
+{
+    const FVector Right = FVector::YAxisVector;
+    const FVector Up = FVector::ZAxisVector;
+    const FVector Delta = StrandCameraSpace::ScreenPixelsToPlaneDelta(
+        FVector2D(100, -50), Right, Up, 1000.0, 90.0, 1000.0);
+    TestTrue(TEXT("100 pixels right at given depth becomes 200 world units right"),
+        Delta.Equals(FVector(0, 200, 100), 1.e-6));
+    TestTrue(TEXT("Planar drag never changes camera-forward depth"),
+        FMath::Abs(FVector::DotProduct(Delta, FVector::XAxisVector)) < 1.e-6);
+    const FVector Invalid = StrandCameraSpace::ScreenPixelsToPlaneDelta(
+        FVector2D(10, 20), Right, Up, 1000.0, 90.0, 0.0);
+    TestTrue(TEXT("Invalid viewport dimensions rejected"), Invalid.IsNearlyZero());
+    const double Seam = StrandCameraSpace::ScreenRotationDelta(
+        FMath::DegreesToRadians(179.0), FMath::DegreesToRadians(-179.0));
+    TestTrue(TEXT("Screen ring angle is wrapped across 180-degree seam"),
+        FMath::IsNearlyEqual(FMath::RadiansToDegrees(Seam), -2.0, 1.e-6));
+    TestTrue(TEXT("No movement yields zero screen rotation"),
+        FMath::IsNearlyZero(StrandCameraSpace::ScreenRotationDelta(0.5, 0.5)));
+    return true;
+}
+#endif
+
+#if WITH_DEV_AUTOMATION_TESTS
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStrandSoftTangentGestureTest,
+    "Strand.Editor.Authoring.CameraSpace.SoftTangentDragConsistency",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FStrandSoftTangentGestureTest::RunTest(const FString& Parameters)
+{
+    TArray<FSplinePointData> Whole;
+    Whole.SetNum(3);
+    TArray<FSplinePoint> Evaluated;
+    for (int32 Index = 0; Index < 3; ++Index)
+    {
+        Whole[Index].LocalPosition = FVector(Index * 100.0, 0, 0);
+        Whole[Index].ArriveTangent = FVector(30, 0, 0);
+        Whole[Index].LeaveTangent = FVector(30, 0, 0);
+        Whole[Index].PointType = ESplinePointType::CurveCustomTangent;
+        Whole[Index].HandleMode = EStrandBezierHandleMode::Free;
+        Evaluated.Add(Whole[Index].ToSplinePoint(Index));
+    }
+    const TArray<FSplinePointData> Before = Whole;
+    TArray<FSplinePointData> Chunked = Whole;
+    const TArray<double> Weights{1.0, 0.5, 0.0};
+    const FVector Delta(0, 18, 6);
+    TestTrue(TEXT("Whole handle gesture changes the selected handle"),
+        StrandCameraSpace::ApplyWeightedTangentDelta(Whole, Evaluated, Weights, 2, Delta));
+    for (int32 Step = 0; Step < 12; ++Step)
+    {
+        StrandCameraSpace::ApplyWeightedTangentDelta(Chunked, Evaluated, Weights, 2, Delta / 12.0);
+    }
+    for (int32 Index = 0; Index < 3; ++Index)
+    {
+        TestTrue(FString::Printf(TEXT("Anchor %d stays fixed"), Index),
+            Whole[Index].LocalPosition.Equals(Before[Index].LocalPosition));
+        TestTrue(FString::Printf(TEXT("Handle %d is chunk-independent"), Index),
+            Whole[Index].LeaveTangent.Equals(Chunked[Index].LeaveTangent, 0.0001));
+        TestTrue(FString::Printf(TEXT("Incoming handle %d unchanged"), Index),
+            Whole[Index].ArriveTangent.Equals(Before[Index].ArriveTangent));
+    }
+    TestTrue(TEXT("Nearest unselected tangent moves at half influence"),
+        Whole[1].LeaveTangent.Equals(Before[1].LeaveTangent + Delta * 0.5, 0.0001));
+    TestTrue(TEXT("Outside influence remains untouched"),
+        Whole[2].LeaveTangent.Equals(Before[2].LeaveTangent));
+    TestFalse(TEXT("Invalid handle rejected"),
+        StrandCameraSpace::ApplyWeightedTangentDelta(Whole, Evaluated, Weights, 0, Delta));
+    TestFalse(TEXT("Mismatched weights rejected"),
+        StrandCameraSpace::ApplyWeightedTangentDelta(Whole, Evaluated, TArray<double>{1.0}, 2, Delta));
+    return true;
+}
+#endif

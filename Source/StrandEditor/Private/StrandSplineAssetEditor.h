@@ -53,12 +53,14 @@ private:
     TStrongObjectPtr<USplineComponent> NativePreview;
     TSharedPtr<IDetailsView> DetailsView;
     TSharedPtr<SStrandSplineViewport> PreviewWidget;
+    TWeakPtr<SWindow> ActiveFlattenWindow; // Modeless camera-ray projection preview.
     TWeakPtr<SWindow> ActiveCleanupWindow; // One modeless live curve cleanup preview.
     int32 SelectedPointIndex = INDEX_NONE;
     TSet<int32> SelectedPointIndices;
     TUniquePtr<FScopedTransaction> ActivePointDragTransaction;
     bool bPointChangedDuringDrag = false;
-    TArray<double> FrozenSoftSelectionWeights; // Capture only once per transform interaction.
+    TArray<double> FrozenSoftSelectionWeights;
+    FVector FrozenSoftSelectionPivot = FVector::ZeroVector; // Capture only once per transform interaction.
     void RefreshSoftSelectionVisualization();
     TUniquePtr<FScopedTransaction> ActiveSegmentBendTransaction;
     TArray<FSplinePointData> BendBaselinePoints;
@@ -72,7 +74,7 @@ private:
     int32 SoftSelectionMode = 0; // 0 disabled, 1 Euclidean 3D, 2 native spline arc length
     int32 SoftSelectionFalloff = 1; // 0 linear, 1 smooth, 2 sharp
     double SoftSelectionRadius = 150.0;
-    void FlattenSelectionToCameraPlane();
+    void OpenPerspectiveFlattenDialog();
     void RotateSelectionAroundCamera(double Degrees);
     int32 SelectedHandle = 0; // 0 anchor, 1 incoming, 2 outgoing.
     bool bPenMode = false;
@@ -145,6 +147,7 @@ private:
     void SetWidgetLocal(bool bLocal);
     void SelectMarqueePoints(const TArray<int32>& Indices, bool bAdd, bool bToggle);
     void ApplyViewportRotation(const FQuat& RotationDelta);
+    void ApplyViewportTangentRoll(double Degrees);
     void ApplyViewportScale(double Factor);
     void SetPenSnapStep(double Step);
     TSharedRef<SWidget> MakePenSnapMenu();

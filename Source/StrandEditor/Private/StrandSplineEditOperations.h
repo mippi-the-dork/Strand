@@ -704,6 +704,18 @@ namespace StrandSplineEditOperations
         return (Frame * Delta * Frame.Inverse()).GetNormalized();
     }
 
+    // Local gizmo X rotation is *orientation roll*, not a deformation.
+    // Apply in asset space about the evaluated outgoing tangent. This leaves
+    // the curve's anchor position and Bezier derivatives untouched.
+    inline bool RollAnchorAroundForward(FSplinePointData& Point, const FVector& Forward, double Degrees)
+    {
+        if (!FMath::IsFinite(Degrees) || Forward.ContainsNaN() ||
+            Forward.IsNearlyZero() || FMath::IsNearlyZero(Degrees, 0.000001)) { return false; }
+        const FQuat Delta(Forward.GetSafeNormal(), FMath::DegreesToRadians(Degrees));
+        Point.LocalRotation = (Delta * Point.LocalRotation.Quaternion()).GetNormalized().Rotator();
+        return true;
+    }
+
     inline bool RotateSelectedQuat(TArray<FSplinePointData>& Points, const TArray<int32>& Indices,
         const FQuat& InRotation)
     {
