@@ -1,3 +1,5 @@
+﻿// Copyright Mippithedork 2026, Inc. All Rights Reserved.
+
 #include "SplineDataAssetFactory.h"
 #include "SplineImportHelpers.h"
 #include "StrandProjectSettings.h"

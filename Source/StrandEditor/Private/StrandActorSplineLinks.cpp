@@ -1,3 +1,5 @@
+﻿// Copyright Mippithedork 2026, Inc. All Rights Reserved.
+
 #include "StrandActorSplineLinks.h"
 #include "ActorDetailsDelegates.h"
 #include "DetailLayoutBuilder.h"

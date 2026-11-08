@@ -1,3 +1,5 @@
+﻿// Copyright Mippithedork 2026, Inc. All Rights Reserved.
+
 #include "StrandSplineMeshAdapter.h"
 #include "SplineDataAsset.h"
 #include "StrandSplineUserData.h"

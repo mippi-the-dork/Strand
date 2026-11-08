@@ -1,4 +1,7 @@
+﻿// Copyright Mippithedork 2026, Inc. All Rights Reserved.
+
 #include "StrandCameraSpaceMath.h"
+#include "StrandSoftSelectionVisuals.h"
 #include <limits>
 #if WITH_DEV_AUTOMATION_TESTS
 #include "Misc/AutomationTest.h"
@@ -238,6 +241,44 @@ bool FStrandSoftTangentGestureTest::RunTest(const FString& Parameters)
         StrandCameraSpace::ApplyWeightedTangentDelta(Whole, Evaluated, Weights, 0, Delta));
     TestFalse(TEXT("Mismatched weights rejected"),
         StrandCameraSpace::ApplyWeightedTangentDelta(Whole, Evaluated, TArray<double>{1.0}, 2, Delta));
+    return true;
+}
+#endif
+
+#if WITH_DEV_AUTOMATION_TESTS
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStrandSoftSelectionAnchorColorsTest,
+    "Strand.Editor.Authoring.CameraSpace.SoftSelectionAnchorColors",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FStrandSoftSelectionAnchorColorsTest::RunTest(const FString& Parameters)
+{
+    using namespace StrandSoftSelectionVisuals;
+    TestTrue(TEXT("Zero influence is white"),
+        GetAnchorColor(0.0).Equals(FLinearColor::White, KINDA_SMALL_NUMBER));
+    TestTrue(TEXT("Full influence is magenta"),
+        GetAnchorColor(1.0).Equals(FLinearColor(1.0f, 0.0f, 1.0f), KINDA_SMALL_NUMBER));
+    TestTrue(TEXT("Half influence is halfway from white to magenta"),
+        GetAnchorColor(0.5).Equals(FLinearColor(1.0f, 0.5f, 1.0f), KINDA_SMALL_NUMBER));
+    TestTrue(TEXT("Selected anchor uses full magenta when soft selection is active"),
+        GetDisplayedAnchorColor(true, true, 0.0, FLinearColor::Green, FLinearColor::Yellow)
+            .Equals(FLinearColor(1.0f, 0.0f, 1.0f), KINDA_SMALL_NUMBER));
+    TestTrue(TEXT("Unselected anchor retains partial magenta influence"),
+        GetDisplayedAnchorColor(true, false, 0.5, FLinearColor::Green, FLinearColor::Yellow)
+            .Equals(FLinearColor(1.0f, 0.5f, 1.0f), KINDA_SMALL_NUMBER));
+    TestTrue(TEXT("Unselected anchor is white at zero influence"),
+        GetDisplayedAnchorColor(true, false, 0.0, FLinearColor::Green, FLinearColor::Yellow)
+            .Equals(FLinearColor::White, KINDA_SMALL_NUMBER));
+    TestTrue(TEXT("Selection color restores when soft selection is disabled"),
+        GetDisplayedAnchorColor(false, true, 1.0, FLinearColor::Green, FLinearColor::Yellow)
+            .Equals(FLinearColor::Yellow, KINDA_SMALL_NUMBER));
+    TestTrue(TEXT("Ordinary anchor colors restore when soft selection is disabled"),
+        GetDisplayedAnchorColor(false, false, 0.5, FLinearColor::Green, FLinearColor::Yellow)
+            .Equals(FLinearColor::Green, KINDA_SMALL_NUMBER));
+    TestTrue(TEXT("Influence clamps low"),
+        GetAnchorColor(-2.0).Equals(FLinearColor::White, KINDA_SMALL_NUMBER));
+    TestTrue(TEXT("Influence clamps high"),
+        GetAnchorColor(2.0).Equals(FLinearColor(1.0f, 0.0f, 1.0f), KINDA_SMALL_NUMBER));
+    TestTrue(TEXT("Non-finite influence displays as zero"),
+        GetAnchorColor(std::numeric_limits<double>::quiet_NaN()).Equals(FLinearColor::White, KINDA_SMALL_NUMBER));
     return true;
 }
 #endif

@@ -1,3 +1,5 @@
+﻿// Copyright Mippithedork 2026, Inc. All Rights Reserved.
+
 #include "StrandSplineViewport.h"
 #include "StrandEditorPreferences.h"
 
@@ -16,6 +18,7 @@
 #include "StrandSplineSelectionUtils.h"
 #include "StrandSplineFraming.h"
 #include "StrandCameraSpaceMath.h"
+#include "StrandSoftSelectionVisuals.h"
 #include "Framework/Application/SlateApplication.h"
 
 namespace
@@ -286,6 +289,13 @@ public:
         Invalidate();
     }
     void SetPenPlane(int32 InLockedAxis) { LockedAxis = InLockedAxis; Invalidate(); }
+    void SetPenCustomPlane(bool bEnabled, const FVector& Origin, const FVector& Normal)
+    {
+        bPenCustomPlane = bEnabled && !Origin.ContainsNaN() && !Normal.ContainsNaN() && !Normal.IsNearlyZero();
+        PenCustomOrigin = Origin;
+        PenCustomNormal = Normal.GetSafeNormal();
+        Invalidate();
+    }
     void SetPenSnap(double InStep) { PenSnap = InStep; Invalidate(); }
     void SetPenCallbacks(TFunction<bool(const FStrandPenHit&)> InDown,
         TFunction<void(const FVector&)> InDrag, TFunction<void()> InUp,
@@ -319,6 +329,10 @@ public:
         if (bDraggingScreenPlane) { return FText::FromString(TEXT("CAMERA 2D MOVE  |  Drag in screen X/Y, depth preserved  |  Release: finish")); }
         if (bCameraAlignedEditing && WidgetMode == 0 && IsSelectionWidgetAvailable())
         { return FText::FromString(TEXT("CAMERA 2D  |  Drag square handle in screen X/Y  |  Orbit freely between edits")); }
+        if (WidgetMode == 1 && IsSelectionWidgetAvailable())
+        {
+            return FText::FromString(TEXT("ROTATE  |  Native screen rotation ring: Editor Preferences > Level Editor > Viewports > Enable Screen Rotate"));
+        }
         if (GetCurrentWidgetAxis() != EAxisList::None)
         {
             return FText::FromString(TEXT("TRANSFORM GIZMO  |  Drag the highlighted axis or ring  |  Space: cycle mode  |  RMB+WASD: fly"));
@@ -1619,27 +1633,30 @@ public:
             for (int32 Index = 0; Index < PointCount; Index += Step)
             {
                 const FVector Position = Native->GetLocationAtSplinePoint(Index, ESplineCoordinateSpace::Local);
-                const FLinearColor Color = SelectedPoints.Contains(Index) ? StrandSelectedColor
-                    : Index == 0 ? StrandStartColor
-                    : (Index == PointCount - 1 && !Native->IsClosedLoop() ? StrandEndColor : StrandControlColor);
-                // Soft-selection rings show influence before the drag. Keep the native
-                // hit-proxy core and selection colors unchanged for reliable picking.
-                if (SoftSelectionWeights.IsValidIndex(Index) && !SelectedPoints.Contains(Index) &&
-                    SoftSelectionWeights[Index] > 0.001)
-                {
-                    const float Weight = static_cast<float>(FMath::Clamp(SoftSelectionWeights[Index], 0.0, 1.0));
-                    PDI->DrawPoint(Position, FLinearColor(Weight, 0.25f + 0.55f * (1.0f - Weight), 0.15f, 1.0f),
-                        12.0f + Weight * 12.0f, SDPG_Foreground);
-                }
-                // White halo is hover feedback, while the colored core retains
-                // start (green), end (red), selected (yellow) semantics.
+                const bool bIsSelected = SelectedPoints.Contains(Index);
+                const bool bSoftSelectionActive = SoftSelectionWeights.Num() == PointCount;
+                const FLinearColor Color = StrandSoftSelectionVisuals::GetDisplayedAnchorColor(
+                    bSoftSelectionActive, bIsSelected, bSoftSelectionActive ? SoftSelectionWeights[Index] : 0.0,
+                    Index == 0 ? StrandStartColor
+                        : (Index == PointCount - 1 && !Native->IsClosedLoop() ? StrandEndColor : StrandControlColor),
+                    StrandSelectedColor);
                 if (HoveredPoint == Index && HoveredHandle == 0)
                 {
                     PDI->DrawPoint(Position, StrandHoverColor, 22.0f, SDPG_Foreground);
                 }
                 PDI->SetHitProxy(new HStrandSplinePointProxy(Index));
-                PDI->DrawPoint(Position, Color, Index == SelectedPoint ? 17.0f
-                    : SelectedPoints.Contains(Index) ? 13.0f : 10.0f, SDPG_Foreground);
+                // The selected anchor is the 100% influence reference. Show its
+                // magenta core, surrounded by Strand's existing yellow selection
+                // marker so selection stays legible against the falloff gradient.
+                if (bSoftSelectionActive && bIsSelected)
+                {
+                    PDI->DrawPoint(Position, StrandSelectedColor,
+                        Index == SelectedPoint ? 20.0f : 16.0f, SDPG_Foreground);
+                }
+                PDI->DrawPoint(Position, Color,
+                    Index == SelectedPoint ? (bSoftSelectionActive ? 15.0f : 17.0f)
+                        : bIsSelected ? (bSoftSelectionActive ? 11.0f : 13.0f) : 10.0f,
+                    SDPG_Foreground);
                 PDI->SetHitProxy(nullptr);
             }
             // All selected anchors are drawn on smaller splines. On extremely
@@ -1651,23 +1668,48 @@ public:
                 {
                     if (Index < 0 || Index >= PointCount || Index % Step == 0) { continue; }
                     PDI->SetHitProxy(new HStrandSplinePointProxy(Index));
-                    PDI->DrawPoint(Native->GetLocationAtSplinePoint(Index, ESplineCoordinateSpace::Local),
-                        StrandSelectedColor, Index == SelectedPoint ? 17.0f : 13.0f, SDPG_Foreground);
+                    const FVector SelectedLocation = Native->GetLocationAtSplinePoint(Index, ESplineCoordinateSpace::Local);
+                    const bool bSoftSelectionActive = SoftSelectionWeights.Num() == PointCount;
+                    if (bSoftSelectionActive)
+                    {
+                        PDI->DrawPoint(SelectedLocation, StrandSelectedColor,
+                            Index == SelectedPoint ? 20.0f : 16.0f, SDPG_Foreground);
+                    }
+                    PDI->DrawPoint(SelectedLocation,
+                        bSoftSelectionActive ? StrandSoftSelectionVisuals::GetAnchorColor(1.0) : StrandSelectedColor,
+                        Index == SelectedPoint ? (bSoftSelectionActive ? 15.0f : 17.0f)
+                            : (bSoftSelectionActive ? 11.0f : 13.0f), SDPG_Foreground);
                     PDI->SetHitProxy(nullptr);
                 }
             }
             else if (SelectedPoint >= 0 && SelectedPoint < PointCount && SelectedPoint % Step != 0)
             {
                 PDI->SetHitProxy(new HStrandSplinePointProxy(SelectedPoint));
-                PDI->DrawPoint(Native->GetLocationAtSplinePoint(SelectedPoint, ESplineCoordinateSpace::Local),
-                    StrandSelectedColor, 17.0f, SDPG_Foreground);
+                const FVector SelectedLocation = Native->GetLocationAtSplinePoint(SelectedPoint, ESplineCoordinateSpace::Local);
+                const bool bSoftSelectionActive = SoftSelectionWeights.Num() == PointCount;
+                if (bSoftSelectionActive)
+                {
+                    PDI->DrawPoint(SelectedLocation, StrandSelectedColor, 20.0f, SDPG_Foreground);
+                }
+                PDI->DrawPoint(SelectedLocation,
+                    bSoftSelectionActive ? StrandSoftSelectionVisuals::GetAnchorColor(1.0) : StrandSelectedColor,
+                    bSoftSelectionActive ? 15.0f : 17.0f, SDPG_Foreground);
                 PDI->SetHitProxy(nullptr);
             }
             if (PointCount > 1 && !Native->IsClosedLoop() && (PointCount - 1) % Step != 0 && SelectedPoint != PointCount - 1)
             {
                 PDI->SetHitProxy(new HStrandSplinePointProxy(PointCount - 1));
-                PDI->DrawPoint(Native->GetLocationAtSplinePoint(PointCount - 1, ESplineCoordinateSpace::Local),
-                    StrandEndColor, 11.0f, SDPG_Foreground);
+                const bool bSoftSelectionActive = SoftSelectionWeights.Num() == PointCount;
+                const bool bIsSelected = SelectedPoints.Contains(PointCount - 1);
+                const FVector EndLocation = Native->GetLocationAtSplinePoint(PointCount - 1, ESplineCoordinateSpace::Local);
+                if (bSoftSelectionActive && bIsSelected)
+                {
+                    PDI->DrawPoint(EndLocation, StrandSelectedColor, 16.0f, SDPG_Foreground);
+                }
+                PDI->DrawPoint(EndLocation,
+                    StrandSoftSelectionVisuals::GetDisplayedAnchorColor(bSoftSelectionActive, bIsSelected,
+                        bSoftSelectionActive ? SoftSelectionWeights.Last() : 0.0, StrandEndColor, StrandSelectedColor),
+                    11.0f, SDPG_Foreground);
                 PDI->SetHitProxy(nullptr);
             }
         }
@@ -1761,20 +1803,27 @@ private:
                 PlanePoint = Native->GetLocationAtSplinePoint(Anchor, ESplineCoordinateSpace::Local);
             }
         }
-        FVector Normal = LockedAxis == 0 ? FVector::XAxisVector : LockedAxis == 1 ? FVector::YAxisVector
-            : LockedAxis == 2 ? FVector::ZAxisVector : GetViewRotation().Vector();
+        FVector Normal = bPenCustomPlane ? PenCustomNormal : LockedAxis == 0 ? FVector::XAxisVector
+            : LockedAxis == 1 ? FVector::YAxisVector : LockedAxis == 2 ? FVector::ZAxisVector : GetViewRotation().Vector();
+        if (bPenCustomPlane) { PlanePoint = PenCustomOrigin; }
         const double Denominator = FVector::DotProduct(RayDirection, Normal);
         if (FMath::Abs(Denominator) < 0.00001) { return false; }
         const double T = FVector::DotProduct(PlanePoint - RayOrigin, Normal) / Denominator;
         if (!FMath::IsFinite(T) || T < 0.0) { return false; }
         FVector Position = RayOrigin + RayDirection * T;
-        if (LockedAxis >= 0) { Position[LockedAxis] = PlanePoint[LockedAxis]; }
+        if (!bPenCustomPlane && LockedAxis >= 0) { Position[LockedAxis] = PlanePoint[LockedAxis]; }
         if (PenSnap > 0.0)
         {
             for (int32 Axis = 0; Axis < 3; ++Axis)
             {
                 if (Axis != LockedAxis) { Position[Axis] = FMath::RoundHalfFromZero(Position[Axis] / PenSnap) * PenSnap; }
             }
+        }
+        // Grid quantization may leave a tilted plane; reproject to enforce the
+        // construction-plane constraint exactly, even when snapping is enabled.
+        if (bPenCustomPlane)
+        {
+            Position -= FVector::DotProduct(Position - PenCustomOrigin, PenCustomNormal) * PenCustomNormal;
         }
         if (Position.ContainsNaN()) { return false; }
         OutHit.Position = Position;
@@ -1914,6 +1963,9 @@ private:
     bool bHasPenHover = false;
     bool bFrameSplineWhenReady = false;
     int32 LockedAxis = -1;
+    bool bPenCustomPlane = false;
+    FVector PenCustomOrigin = FVector::ZeroVector;
+    FVector PenCustomNormal = FVector::ZAxisVector;
     int32 PenMouseX = 0;
     int32 PenMouseY = 0;
     double PenSnap = 0.0;
@@ -2160,6 +2212,11 @@ void SStrandSplineViewport::SetPenMode(bool bEnabled)
 {
     if (StrandViewportClient.IsValid()) { StrandViewportClient->SetPenMode(bEnabled); }
 }
+void SStrandSplineViewport::SetPenCustomPlane(bool bEnabled, const FVector& Origin, const FVector& Normal)
+{
+    if (StrandViewportClient.IsValid()) { StrandViewportClient->SetPenCustomPlane(bEnabled, Origin, Normal); }
+}
+
 void SStrandSplineViewport::SetPenPlane(int32 LockedAxis)
 {
     if (StrandViewportClient.IsValid()) { StrandViewportClient->SetPenPlane(LockedAxis); }

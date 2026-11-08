@@ -1,3 +1,5 @@
+﻿// Copyright Mippithedork 2026, Inc. All Rights Reserved.
+
 #pragma once
 
 #include "CoreMinimal.h"
@@ -26,7 +28,8 @@ enum class EStrandEditPlane : uint8
     XY,
     XZ,
     YZ,
-    CameraPlane
+    CameraPlane,
+    ThreePointPlane
 };
 
 class FStrandSplineAssetEditor final : public FAssetEditorToolkit, public FSelfRegisteringEditorUndoClient
@@ -71,6 +74,9 @@ private:
     bool bSegmentBendChanged = false;
     EStrandEditPlane EditPlane = EStrandEditPlane::Free3D;
     FVector LockedCameraPlaneNormal = FVector::XAxisVector;
+    FVector CustomPlaneOrigin = FVector::ZeroVector;
+    FVector CustomPlaneNormal = FVector::ZAxisVector;
+    double PrecisionSnapToleranceCm = 100.0;
     int32 SoftSelectionMode = 0; // 0 disabled, 1 Euclidean 3D, 2 native spline arc length
     int32 SoftSelectionFalloff = 1; // 0 linear, 1 smooth, 2 sharp
     double SoftSelectionRadius = 150.0;
@@ -162,6 +168,8 @@ private:
     FReply ReverseSpline();
     FReply SetSelectedAsFirst();
     FReply SnapSelectedPoint(double Step);
+    FReply SnapSelectionToOtherGeometry(bool bSegmentTarget);
+    void SetPlaneFromThreeSelectedAnchors();
     FReply SubdivideSpline();
     FReply ResampleSpline(int32 TargetPoints);
     FReply SubdivideWithCuts(int32 Cuts, bool bDistanceUniform);

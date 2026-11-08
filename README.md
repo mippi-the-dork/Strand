@@ -9,7 +9,13 @@ Strand has two complementary editing workflows:
 - **Strand Spline Editor:** Double-click a Strand Spline asset to edit its saved curve in a dedicated 2D/3D preview. These changes modify the asset, not existing level actors.
 - **Native Level Editor spline editing:** Drag a Strand asset into the level or associate it with an existing native spline component. Continue using Unreal's native actor, spline, and viewport tools. Explicitly **Apply Asset** or **Update Asset** to synchronize the two copies.
 
-**Package:** v0.6.30 source, targeting Unreal Engine 5.8.3 on Windows 64-bit. The editor uses Unreal's host-provided asset toolbar, direct authoring buttons, separate Spline Details and Source & Import tabs, and contextual hover actions. See [TEST_PLAN_0.6.30.md](TEST_PLAN_0.6.30.md) for build and live-editor verification.
+**Package:** v0.6.40 source, targeting Unreal Engine 5.8.3 on Windows 64-bit. The editor uses Unreal's host-provided asset toolbar, direct authoring buttons, separate Spline Details and Source & Import tabs, and contextual hover actions. See [TEST_PLAN_0.6.30.md](TEST_PLAN_0.6.30.md) for build and live-editor verification.
+
+### Native screen rotation and soft-selection display (v0.6.40)
+
+Strand uses **Unreal Engine's native screen-space rotation ring** rather than drawing a duplicate widget. If the white outer ring does not appear in Rotate mode, enable **Edit > Editor Preferences > Level Editor > Viewports > Enable Screen Rotate** (Look and Feel). This is an **Unreal Editor preference**, not a Strand option; Strand does not change it globally. Select an anchor and activate the rotation widget to use the native ring. Local red/X rotation on a single spline point remains Strand's separate tangent-axis roll behavior.
+
+In the Strand Spline Asset Editor, enable **Viewport Options > Soft Selection** and choose **3D Distance** or **Spline Distance**. With Soft Selection active, the selected anchor is **full magenta with a yellow selection outline** (100% influence). Other anchors fade from white (0%) to magenta (100%) by their falloff weights. When soft selection is off, the ordinary selected/start/end/control colors are restored. Anchor selection, shape, and falloff are independent; color is only visual feedback. This convention also applies to selected anchors skipped by dense-preview marker subsampling.
 
 ### Curve Cleanup and Precision Modeling (v0.6.30)
 
@@ -276,3 +282,13 @@ Shift-hover over a spline segment previews an insertion dot using a stable scree
 ### 0.6.30 Hotfix 1
 
 Fixes exact 3D/closed-loop subdivision tangent math, makes the Cleanup preview modeless so the orange candidate is visible while settings change, adds Refresh Preview and no-candidate status, and removes the redundant Cleanup submenu entry. See `CHANGELOG_0.6.30_HOTFIX1.md` and `TEST_PLAN_0.6.30_HOTFIX1.md`.
+
+
+### Precision editing (v0.6.41 development)
+
+In the **Strand Spline Asset Editor**:
+
+- **More → Selected Points → Snap to Existing Spline Geometry**: set a custom maximum distance and snap selected anchors to nearest unselected anchors or to other native evaluated curve segments. Snapping acts in asset-local space. It does not target level actors.
+- **Edit Plane → Working Plane from 3 Selected Anchors**: select exactly three non-collinear anchors to define a fixed custom construction plane. Move/handle adjustments and Pen creation respect the plane. Select **Edit Plane → Free 3D** to restore unconstrained editing.
+
+These editing operations do not replace Unreal's own viewport transform widgets. The editor user preference **Enable Screen Rotate** is still required for the native white camera-rotation ring.

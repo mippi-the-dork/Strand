@@ -1,7 +1,7 @@
 {
   "FileVersion": 3,
-  "Version": 70,
-  "VersionName": "0.6.37-dev.1",
+  "Version": 74,
+  "VersionName": "0.6.41-dev.1",
   "FriendlyName": "Strand",
   "Description": "Native Unreal spline authoring with preview-based curve cleanup, tolerance-guided simplify/dissolve, exact subdivision, continuity and repair tools, split/join workflows, and 3D editing.",
   "Category": "Editor",

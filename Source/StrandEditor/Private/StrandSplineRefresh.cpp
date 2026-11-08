@@ -1,3 +1,5 @@
+﻿// Copyright Mippithedork 2026, Inc. All Rights Reserved.
+
 #include "StrandSplineRefresh.h"
 #include "Components/SplineComponent.h"
 #include "Engine/Blueprint.h"

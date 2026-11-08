@@ -1,3 +1,5 @@
+﻿// Copyright Mippithedork 2026, Inc. All Rights Reserved.
+
 #include "StrandCurveTestGenerator.h"
 #include "Misc/Paths.h"
 #include "HAL/FileManager.h"

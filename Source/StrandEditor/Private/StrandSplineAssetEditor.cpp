@@ -1,6 +1,9 @@
+﻿// Copyright Mippithedork 2026, Inc. All Rights Reserved.
+
 #include "StrandSplineAssetEditor.h"
 #include "StrandEditorPreferences.h"
 #include "StrandCameraSpaceMath.h"
+#include "StrandPrecisionOperations.h"
 #include "StrandPerspectiveFlatten.h"
 #include "StrandSplineViewport.h"
 #include "SplineDataAsset.h"
@@ -196,6 +199,10 @@ void FStrandSplineAssetEditor::Init(USplineDataAsset* InAsset, const TSharedPtr<
     ResampleTargetCount = FMath::Clamp(ResampleTargetCount, 2, 4096);
     GConfig->GetInt(TEXT("StrandSplineEditor"), TEXT("LastExactSubdivideCuts"), SubdivideCuts, GEditorPerProjectIni);
     SubdivideCuts = FMath::Clamp(SubdivideCuts, 1, 32);
+    GConfig->GetDouble(TEXT("StrandSplineEditor"), TEXT("PrecisionSnapToleranceCm"),
+        PrecisionSnapToleranceCm, GEditorPerProjectIni);
+    PrecisionSnapToleranceCm = FMath::IsFinite(PrecisionSnapToleranceCm)
+        ? FMath::Clamp(PrecisionSnapToleranceCm, 0.001, 100000.0) : 100.0;
     NativePreview.Reset(NewObject<USplineComponent>(GetTransientPackage(), NAME_None, RF_Transient));
     RebuildNativePreview();
 
@@ -820,6 +827,8 @@ TSharedRef<SDockTab> FStrandSplineAssetEditor::SpawnPreviewTab(const FSpawnTabAr
         PreviewWidget->SetPenSnap(PenSnapStep);
         PreviewWidget->SetPenPlane(EditPlane == EStrandEditPlane::XY ? 2 :
             EditPlane == EStrandEditPlane::XZ ? 1 : EditPlane == EStrandEditPlane::YZ ? 0 : -1);
+        PreviewWidget->SetPenCustomPlane(EditPlane == EStrandEditPlane::ThreePointPlane,
+            CustomPlaneOrigin, CustomPlaneNormal);
     }
     return Tab;
 }
@@ -1425,6 +1434,7 @@ void FStrandSplineAssetEditor::ApplyViewportPointDrag(const FVector& LocalDelta)
     const int32 LockedAxis = EditPlane == EStrandEditPlane::XY ? 2 : EditPlane == EStrandEditPlane::XZ ? 1 : EditPlane == EStrandEditPlane::YZ ? 0 : -1;
     if (LockedAxis >= 0) { Constrained[LockedAxis] = 0.0; }
     if (EditPlane == EStrandEditPlane::CameraPlane) { Constrained = StrandCameraSpace::ProjectDelta(Constrained, LockedCameraPlaneNormal); }
+    if (EditPlane == EStrandEditPlane::ThreePointPlane) { Constrained = StrandCameraSpace::ProjectDelta(Constrained, CustomPlaneNormal); }
     if (Constrained.IsNearlyZero()) { return; }
     bool bMoved = false;
     if (SoftSelectionMode == 0)
@@ -2615,6 +2625,7 @@ FText FStrandSplineAssetEditor::GetEditPlaneLabel() const
     case EStrandEditPlane::XZ: return LOCTEXT("EditXZLabel", "Edit: XZ");
     case EStrandEditPlane::YZ: return LOCTEXT("EditYZLabel", "Edit: YZ");
     case EStrandEditPlane::CameraPlane: return LOCTEXT("EditCameraLabel", "Edit: Camera");
+    case EStrandEditPlane::ThreePointPlane: return LOCTEXT("Edit3PointLabel", "Edit: 3-Point");
     default: return LOCTEXT("Edit3DLabel", "Edit: 3D");
     }
 }
@@ -2632,6 +2643,8 @@ void FStrandSplineAssetEditor::SetEditPlane(EStrandEditPlane NewPlane)
         PreviewWidget->SetCameraAlignedEditing(NewPlane == EStrandEditPlane::CameraPlane);
         PreviewWidget->SetPenPlane(NewPlane == EStrandEditPlane::XY ? 2 :
             NewPlane == EStrandEditPlane::XZ ? 1 : NewPlane == EStrandEditPlane::YZ ? 0 : -1);
+        PreviewWidget->SetPenCustomPlane(NewPlane == EStrandEditPlane::ThreePointPlane,
+            CustomPlaneOrigin, CustomPlaneNormal);
     }
     // A working plane never changes the camera projection. View and edit constraints
     // are independent; framing and view selection are explicit user operations.
@@ -2653,6 +2666,10 @@ TSharedRef<SWidget> FStrandSplineAssetEditor::MakeEditPlaneMenu()
     Entry(EStrandEditPlane::YZ, LOCTEXT("EditYZ", "World YZ Plane"), LOCTEXT("EditYZHelp", "Edit only Y/Z; leave existing X coordinates untouched."));
     Entry(EStrandEditPlane::CameraPlane, LOCTEXT("EditCameraPlane", "Camera-Aligned 2D Editing"),
         LOCTEXT("EditCameraPlaneHelp", "Keep perspective camera navigation. Each new drag captures the current camera-aligned plane; original depth is preserved. This does not flatten the spline."));
+    Menu.AddMenuEntry(LOCTEXT("CaptureThreePointPlane", "Working Plane from 3 Selected Anchors"),
+        LOCTEXT("CaptureThreePointPlaneTip", "Select exactly three non-collinear anchors. Capture their plane for constrained movement. No geometry changes; remains fixed while orbiting the camera."),
+        FSlateIcon(), FUIAction(FExecuteAction::CreateSP(this, &FStrandSplineAssetEditor::SetPlaneFromThreeSelectedAnchors),
+            FCanExecuteAction::CreateLambda([this]() { return GetSelectedIndices().Num() == 3; })));
     Menu.AddMenuSeparator();
     // The removed "Perspective (Navigable Camera-Aligned Editing)" entry
     // merely reset viewport projection; it was not a separate edit mode.
@@ -2697,6 +2714,8 @@ void FStrandSplineAssetEditor::ApplyViewportTangentDrag(int32 Handle, const FVec
     if (LockedAxis >= 0) { Constrained[LockedAxis] = 0.0; }
     if (EditPlane == EStrandEditPlane::CameraPlane && PreviewWidget.IsValid())
     { Constrained = StrandCameraSpace::ProjectDelta(Constrained, PreviewWidget->GetCameraForward()); }
+    if (EditPlane == EStrandEditPlane::ThreePointPlane)
+    { Constrained = StrandCameraSpace::ProjectDelta(Constrained, CustomPlaneNormal); }
     if (Constrained.IsNearlyZero()) { return; }
     if (!ActivePointDragTransaction) { BeginViewportPointDrag(); }
     if (!ActivePointDragTransaction) { return; }
@@ -2839,6 +2858,54 @@ FReply FStrandSplineAssetEditor::SnapSelectedPoint(double Step)
     RebuildNativePreview();
     if (DetailsView.IsValid()) { DetailsView->ForceRefresh(); }
     return FReply::Handled();
+}
+
+FReply FStrandSplineAssetEditor::SnapSelectionToOtherGeometry(bool bSegmentTarget)
+{
+    USplineDataAsset* Current = Asset.Get();
+    if (!Current || !NativePreview.IsValid() || SelectedPointIndices.IsEmpty() ||
+        !FMath::IsFinite(PrecisionSnapToleranceCm) || PrecisionSnapToleranceCm <= 0.0) { return FReply::Handled(); }
+    EndViewportPointDrag();
+    const TArray<int32> Selection = GetSelectedIndices();
+    // Resolve every target from the unchanged source before starting a transaction.
+    TArray<TPair<int32, FVector>> Changes;
+    for (int32 Index : Selection)
+    {
+        FVector Target = FVector::ZeroVector;
+        int32 Found = INDEX_NONE;
+        const bool bFound = bSegmentTarget
+            ? StrandPrecision::FindNearestOtherSegment(NativePreview.Get(), Selection, Index,
+                PrecisionSnapToleranceCm, Target, Found)
+            : StrandPrecision::FindNearestOtherAnchor(Current->Points, Selection, Index,
+                PrecisionSnapToleranceCm, Target, Found);
+        if (bFound && !Current->Points[Index].LocalPosition.Equals(Target, 0.000001))
+        { Changes.Emplace(Index, Target); }
+    }
+    if (Changes.IsEmpty()) { return FReply::Handled(); }
+    const FScopedTransaction Transaction(bSegmentTarget
+        ? LOCTEXT("SnapSelectedToCurveTransaction", "Snap Strand Anchors to Other Curve Segments")
+        : LOCTEXT("SnapSelectedToAnchorsTransaction", "Snap Strand Anchors to Other Anchors"));
+    Current->Modify();
+    for (const TPair<int32, FVector>& Change : Changes)
+    {
+        Current->Points[Change.Key].LocalPosition = Change.Value;
+    }
+    Current->PostEditChange();
+    Current->MarkPackageDirty();
+    RebuildNativePreview();
+    if (DetailsView.IsValid()) { DetailsView->ForceRefresh(); }
+    return FReply::Handled();
+}
+
+void FStrandSplineAssetEditor::SetPlaneFromThreeSelectedAnchors()
+{
+    USplineDataAsset* Current = Asset.Get();
+    if (!Current) { return; }
+    FVector Origin, Normal;
+    if (!StrandPrecision::PlaneFromThreePoints(Current->Points, GetSelectedIndices(), Origin, Normal)) { return; }
+    CustomPlaneOrigin = Origin;
+    CustomPlaneNormal = Normal;
+    SetEditPlane(EStrandEditPlane::ThreePointPlane);
 }
 
 FReply FStrandSplineAssetEditor::AlignSelection(int32 Axis)
@@ -3512,6 +3579,29 @@ TSharedRef<SWidget> FStrandSplineAssetEditor::MakeSplineToolsMenu()
                         Steps.AddMenuEntry(Label, LOCTEXT("SnapStepsTip", "Round selected anchor positions to this centimeter step. Undoable."), FSlateIcon(),
                             FUIAction(FExecuteAction::CreateLambda([this, Step]() { SnapSelectedPoint(Step); })));
                     }
+                }));
+            Sub.AddSubMenu(LOCTEXT("SnapToGeometry", "Snap to Existing Spline Geometry"),
+                LOCTEXT("SnapToGeometryTip", "Snap selected anchors to other anchors or non-adjacent evaluated spline segments. Targets are resolved before edits; keeps tangents and roll unchanged."),
+                FNewMenuDelegate::CreateLambda([this](FMenuBuilder& Snap)
+                {
+                    Snap.AddWidget(SNew(SNumericEntryBox<double>)
+                        .Value_Lambda([this]() { return TOptional<double>(PrecisionSnapToleranceCm); })
+                        .MinValue(0.001).MaxValue(100000.0).AllowSpin(false)
+                        .OnValueCommitted_Lambda([this](double Value, ETextCommit::Type)
+                        {
+                            if (!FMath::IsFinite(Value)) { return; }
+                            PrecisionSnapToleranceCm = FMath::Clamp(Value, 0.001, 100000.0);
+                            GConfig->SetDouble(TEXT("StrandSplineEditor"), TEXT("PrecisionSnapToleranceCm"),
+                                PrecisionSnapToleranceCm, GEditorPerProjectIni);
+                            GConfig->Flush(false, GEditorPerProjectIni);
+                        }),
+                        LOCTEXT("SnapToleranceLabel", "Max snap distance (cm)"), true);
+                    Snap.AddMenuEntry(LOCTEXT("SnapToOtherAnchor", "Nearest Unselected Anchor"),
+                        LOCTEXT("SnapToOtherAnchorTip", "Snap selected anchor positions to the nearest unselected anchor within range; no change if none qualifies."),
+                        FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this]() { SnapSelectionToOtherGeometry(false); })));
+                    Snap.AddMenuEntry(LOCTEXT("SnapToOtherSegment", "Nearest Unselected Curve Segment"),
+                        LOCTEXT("SnapToOtherSegmentTip", "Snap to evaluated curve geometry, excluding segments adjoining selected anchors. Does not alter point rotation or tangent vectors."),
+                        FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this]() { SnapSelectionToOtherGeometry(true); })));
                 }));
             Sub.AddMenuSeparator();
             AddAction(Sub, LOCTEXT("AlignHandles", "Align Tangents Once"),
