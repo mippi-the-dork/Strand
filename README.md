@@ -292,3 +292,9 @@ In the **Strand Spline Asset Editor**:
 - **Edit Plane → Working Plane from 3 Selected Anchors**: select exactly three non-collinear anchors to define a fixed custom construction plane. Move/handle adjustments and Pen creation respect the plane. Select **Edit Plane → Free 3D** to restore unconstrained editing.
 
 These editing operations do not replace Unreal's own viewport transform widgets. The editor user preference **Enable Screen Rotate** is still required for the native white camera-rotation ring.
+
+
+### Interactive snap-on-drag (v0.6.43 development)
+In the Strand Spline Asset Editor, enable **Edit Plane → Snap to Other Anchors While Moving**. The neighboring **Snap During Drag: Target Priority** submenu selects anchor targets, eligible evaluated curve segments, or both. During a Move gesture, the magenta target indicator previews where the primary selected anchor will land. The final group offset is committed on mouse release as part of one Undo operation. Hold **Ctrl** to temporarily suppress snapping; snapping is also disabled while soft selection is active. The saved distance tolerance is set in **More → Selected Points → Snap to Existing Spline Geometry**. These targets belong to the currently edited spline asset; they do not represent level-world surface snapping.
+
+The selected anchor's soft-selection marker can be enlarged from **Editor Preferences → Plugins → Strand Editor → Selection Visualization**.

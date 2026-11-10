@@ -1,5 +1,3 @@
-﻿// Copyright Mippithedork 2026, Inc. All Rights Reserved.
-
 #pragma once
 
 #include "CoreMinimal.h"
@@ -31,4 +29,9 @@ public:
 
     UPROPERTY(EditAnywhere, Config, Category="Orientation Visualization", meta=(ClampMin="0.01", UIMin="1.0", DisplayName="Last Marker Size (cm)"))
     double OrientationSize = 35.0;
+
+    /** Visual size of the primary selected anchor, in screen pixels. Does not change hit testing. */
+    UPROPERTY(EditAnywhere, Config, Category="Selection Visualization", meta=(ClampMin="16.0", ClampMax="64.0", UIMin="20.0", UIMax="40.0"))
+    float SelectedAnchorMarkerSize = 30.0f;
+
 };

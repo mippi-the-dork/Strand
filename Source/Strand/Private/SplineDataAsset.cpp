@@ -1,5 +1,3 @@
-﻿// Copyright Mippithedork 2026, Inc. All Rights Reserved.
-
 #include "SplineDataAsset.h"
 #if WITH_EDITOR && WITH_EDITORONLY_DATA
 #include "EditorFramework/AssetImportData.h"

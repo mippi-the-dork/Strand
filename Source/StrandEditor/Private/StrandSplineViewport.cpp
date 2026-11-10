@@ -1,5 +1,3 @@
-﻿// Copyright Mippithedork 2026, Inc. All Rights Reserved.
-
 #include "StrandSplineViewport.h"
 #include "StrandEditorPreferences.h"
 
@@ -18,6 +16,7 @@
 #include "StrandSplineSelectionUtils.h"
 #include "StrandSplineFraming.h"
 #include "StrandCameraSpaceMath.h"
+#include "StrandPrecisionProjection.h"
 #include "StrandSoftSelectionVisuals.h"
 #include "Framework/Application/SlateApplication.h"
 
@@ -145,6 +144,7 @@ public:
     int32 GetCameraViewportWidth() const { return Viewport ? Viewport->GetSizeXY().X : 1280; }
     void SetSpline(USplineComponent* InSpline) { if (Spline.Get() != InSpline) { bWidgetFrameFrozen = false; } Spline = InSpline; RefreshNativeWidget(); Invalidate(); }
     void SetCleanupPreviewPolyline(const TArray<FVector>& Points) { CleanupPreviewPolyline = Points; Invalidate(); }
+    void SetSnapPreviewSegments(const TArray<TPair<FVector, FVector>>& Segments) { SnapPreviewSegments = Segments; Invalidate(); }
     void SetSoftSelectionWeights(const TArray<double>& Weights) { SoftSelectionWeights = Weights; Invalidate(); }
     void SetShowPoints(bool bShow) { bShowPoints = bShow; RefreshNativeWidget(); Invalidate(); }
     bool GetShowPoints() const { return bShowPoints; }
@@ -288,12 +288,18 @@ public:
         RefreshNativeWidget();
         Invalidate();
     }
-    void SetPenPlane(int32 InLockedAxis) { LockedAxis = InLockedAxis; Invalidate(); }
+    void SetPenPlane(int32 InLockedAxis)
+    {
+        LockedAxis = InLockedAxis;
+        bWidgetFrameFrozen = false;
+        Invalidate();
+    }
     void SetPenCustomPlane(bool bEnabled, const FVector& Origin, const FVector& Normal)
     {
         bPenCustomPlane = bEnabled && !Origin.ContainsNaN() && !Normal.ContainsNaN() && !Normal.IsNearlyZero();
         PenCustomOrigin = Origin;
         PenCustomNormal = Normal.GetSafeNormal();
+        bWidgetFrameFrozen = false;
         Invalidate();
     }
     void SetPenSnap(double InStep) { PenSnap = InStep; Invalidate(); }
@@ -631,13 +637,28 @@ public:
 
     virtual ECoordSystem GetWidgetCoordSystemSpace() const override
     {
-        return (bCameraAlignedEditing && WidgetMode == 0) || bWidgetLocal ? COORD_Local : COORD_World;
+        return (WidgetMode == 0 && (bCameraAlignedEditing || LockedAxis >= 0 || bPenCustomPlane)) || bWidgetLocal
+            ? COORD_Local : COORD_World;
     }
 
     virtual FMatrix GetWidgetCoordSystem() const override
     {
         const USplineComponent* Native = Spline.Get();
         if (bWidgetFrameFrozen) { return FrozenWidgetFrame; }
+        // Constrained translation uses actual plane axes, never an unrelated
+        // native world/local frame. Keep rotation and scale on their authored frames.
+        if (WidgetMode == 0 && (LockedAxis >= 0 || bPenCustomPlane) && !bCameraAlignedEditing)
+        {
+            FVector Normal = bPenCustomPlane ? PenCustomNormal :
+                LockedAxis == 0 ? FVector::XAxisVector :
+                LockedAxis == 1 ? FVector::YAxisVector : FVector::ZAxisVector;
+            FVector Preferred = LockedAxis == 0 ? FVector::YAxisVector : FVector::XAxisVector;
+            FVector U, V, N;
+            if (StrandPrecisionProjection::MakePlaneFrame(Normal, Preferred, U, V, N))
+            {
+                return FRotationMatrix::MakeFromXY(U, V);
+            }
+        }
         if (bCameraAlignedEditing && WidgetMode == 0)
         {
             // The X/Y handles lie in screen space; native Z remains visible
@@ -713,7 +734,8 @@ public:
         }
         // Cache the tangent-aligned basis before the first edit delta.
         // The spline's outgoing tangent may rotate during this drag.
-        if (!bWidgetFrameFrozen && (bWidgetLocal || bCameraAlignedEditing))
+        if (!bWidgetFrameFrozen && (bWidgetLocal || bCameraAlignedEditing ||
+            (WidgetMode == 0 && (LockedAxis >= 0 || bPenCustomPlane))))
         {
             FrozenWidgetFrame = GetWidgetCoordSystem();
             bWidgetFrameFrozen = true;
@@ -1577,12 +1599,53 @@ public:
             }
         }
 
+        // All constrained editing modes show the same non-interactive plane
+        // feedback. The plane is centered at the selection, not world origin,
+        // except a captured three-anchor plane which has a fixed authored origin.
+        if (bPenCustomPlane || LockedAxis >= 0 || bCameraAlignedEditing)
+        {
+            const FVector Normal = bPenCustomPlane ? PenCustomNormal :
+                bCameraAlignedEditing ? GetCameraForward() :
+                LockedAxis == 0 ? FVector::XAxisVector :
+                LockedAxis == 1 ? FVector::YAxisVector : FVector::ZAxisVector;
+            const FVector Origin = bPenCustomPlane ? PenCustomOrigin :
+                SelectedPoint >= 0 && SelectedPoint < PointCount ? GetWidgetLocation() :
+                FVector::ZeroVector;
+            const FVector Preferred = bCameraAlignedEditing ?
+                FRotationMatrix(GetViewRotation()).GetScaledAxis(EAxis::Y) :
+                LockedAxis == 0 ? FVector::YAxisVector : FVector::XAxisVector;
+            FVector U, V, N;
+            if (StrandPrecisionProjection::MakePlaneFrame(Normal, Preferred, U, V, N))
+            {
+                constexpr double Step = 50.0;
+                constexpr int32 HalfCells = 4;
+                const FLinearColor PlaneColor(0.60f, 0.33f, 0.82f, 0.55f);
+                for (int32 I = -HalfCells; I <= HalfCells; ++I)
+                {
+                    const double Offset = static_cast<double>(I) * Step;
+                    PDI->DrawLine(Origin + U * Offset - V * (HalfCells * Step),
+                        Origin + U * Offset + V * (HalfCells * Step), PlaneColor, SDPG_World, 0.6f);
+                    PDI->DrawLine(Origin + V * Offset - U * (HalfCells * Step),
+                        Origin + V * Offset + U * (HalfCells * Step), PlaneColor, SDPG_World, 0.6f);
+                }
+                PDI->DrawLine(Origin, Origin + N * 65.0,
+                    FLinearColor(0.78f, 0.45f, 1.0f), SDPG_Foreground, 2.0f);
+            }
+        }
+
         // Preview of a pending cleanup operation. This is never a second hit
         // proxy and never modifies the Strand asset or the native preview.
         for (int32 Index = 1; Index < CleanupPreviewPolyline.Num(); ++Index)
         {
             PDI->DrawLine(CleanupPreviewPolyline[Index - 1], CleanupPreviewPolyline[Index],
                 FLinearColor(1.0f, 0.64f, 0.20f, 1.0f), SDPG_Foreground, 3.0f);
+        }
+
+        // Precision snap preview: yellow source to magenta target. No hit proxy and no asset mutation.
+        for (const TPair<FVector, FVector>& Segment : SnapPreviewSegments)
+        {
+            PDI->DrawLine(Segment.Key, Segment.Value, FLinearColor(1.0f, 0.32f, 0.80f), SDPG_Foreground, 2.0f);
+            PDI->DrawPoint(Segment.Value, FLinearColor(1.0f, 0.0f, 0.75f), 12.0f, SDPG_Foreground);
         }
 
         // Shift previews the insertion dot while the sampled segment itself
@@ -1651,10 +1714,10 @@ public:
                 if (bSoftSelectionActive && bIsSelected)
                 {
                     PDI->DrawPoint(Position, StrandSelectedColor,
-                        Index == SelectedPoint ? 20.0f : 16.0f, SDPG_Foreground);
+                        Index == SelectedPoint ? FMath::Clamp(GetDefault<UStrandEditorPreferences>()->SelectedAnchorMarkerSize, 16.0f, 64.0f) + 5.0f : 16.0f, SDPG_Foreground);
                 }
                 PDI->DrawPoint(Position, Color,
-                    Index == SelectedPoint ? (bSoftSelectionActive ? 15.0f : 17.0f)
+                    Index == SelectedPoint ? (bSoftSelectionActive ? FMath::Clamp(GetDefault<UStrandEditorPreferences>()->SelectedAnchorMarkerSize, 16.0f, 64.0f) : 17.0f)
                         : bIsSelected ? (bSoftSelectionActive ? 11.0f : 13.0f) : 10.0f,
                     SDPG_Foreground);
                 PDI->SetHitProxy(nullptr);
@@ -1673,11 +1736,11 @@ public:
                     if (bSoftSelectionActive)
                     {
                         PDI->DrawPoint(SelectedLocation, StrandSelectedColor,
-                            Index == SelectedPoint ? 20.0f : 16.0f, SDPG_Foreground);
+                            Index == SelectedPoint ? FMath::Clamp(GetDefault<UStrandEditorPreferences>()->SelectedAnchorMarkerSize, 16.0f, 64.0f) + 5.0f : 16.0f, SDPG_Foreground);
                     }
                     PDI->DrawPoint(SelectedLocation,
                         bSoftSelectionActive ? StrandSoftSelectionVisuals::GetAnchorColor(1.0) : StrandSelectedColor,
-                        Index == SelectedPoint ? (bSoftSelectionActive ? 15.0f : 17.0f)
+                        Index == SelectedPoint ? (bSoftSelectionActive ? FMath::Clamp(GetDefault<UStrandEditorPreferences>()->SelectedAnchorMarkerSize, 16.0f, 64.0f) : 17.0f)
                             : (bSoftSelectionActive ? 11.0f : 13.0f), SDPG_Foreground);
                     PDI->SetHitProxy(nullptr);
                 }
@@ -1689,11 +1752,11 @@ public:
                 const bool bSoftSelectionActive = SoftSelectionWeights.Num() == PointCount;
                 if (bSoftSelectionActive)
                 {
-                    PDI->DrawPoint(SelectedLocation, StrandSelectedColor, 20.0f, SDPG_Foreground);
+                    PDI->DrawPoint(SelectedLocation, StrandSelectedColor, FMath::Clamp(GetDefault<UStrandEditorPreferences>()->SelectedAnchorMarkerSize, 16.0f, 64.0f) + 5.0f, SDPG_Foreground);
                 }
                 PDI->DrawPoint(SelectedLocation,
                     bSoftSelectionActive ? StrandSoftSelectionVisuals::GetAnchorColor(1.0) : StrandSelectedColor,
-                    bSoftSelectionActive ? 15.0f : 17.0f, SDPG_Foreground);
+                    bSoftSelectionActive ? FMath::Clamp(GetDefault<UStrandEditorPreferences>()->SelectedAnchorMarkerSize, 16.0f, 64.0f) : 17.0f, SDPG_Foreground);
                 PDI->SetHitProxy(nullptr);
             }
             if (PointCount > 1 && !Native->IsClosedLoop() && (PointCount - 1) % Step != 0 && SelectedPoint != PointCount - 1)
@@ -1889,6 +1952,7 @@ private:
 
     TWeakObjectPtr<USplineComponent> Spline;
     TArray<FVector> CleanupPreviewPolyline;
+    TArray<TPair<FVector, FVector>> SnapPreviewSegments;
     TArray<double> SoftSelectionWeights;
     TFunction<void(int32, bool, bool)> OnPointSelected;
     TFunction<void(int32, double)> OnSegmentInsert;
@@ -2118,6 +2182,10 @@ void SStrandSplineViewport::SetSoftSelectionWeights(const TArray<double>& Weight
 void SStrandSplineViewport::SetCleanupPreviewPolyline(const TArray<FVector>& Points)
 {
     if (StrandViewportClient.IsValid()) { StrandViewportClient->SetCleanupPreviewPolyline(Points); }
+}
+void SStrandSplineViewport::SetSnapPreviewSegments(const TArray<TPair<FVector, FVector>>& Segments)
+{
+    if (StrandViewportClient.IsValid()) { StrandViewportClient->SetSnapPreviewSegments(Segments); }
 }
 
 void SStrandSplineViewport::SetAuthoredAnchorRotation(const FRotator& Rotation)

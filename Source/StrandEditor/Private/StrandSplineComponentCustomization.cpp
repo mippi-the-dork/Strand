@@ -1,5 +1,3 @@
-﻿// Copyright Mippithedork 2026, Inc. All Rights Reserved.
-
 #include "StrandSplineComponentCustomization.h"
 #include "SplineEditorCommands.h"
 #include "SplineDataAsset.h"

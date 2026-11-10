@@ -1,5 +1,3 @@
-﻿// Copyright Mippithedork 2026, Inc. All Rights Reserved.
-
 #pragma once
 
 #include "CoreMinimal.h"
@@ -57,6 +55,7 @@ private:
     TSharedPtr<IDetailsView> DetailsView;
     TSharedPtr<SStrandSplineViewport> PreviewWidget;
     TWeakPtr<SWindow> ActiveFlattenWindow; // Modeless camera-ray projection preview.
+    TWeakPtr<SWindow> ActiveSnapWindow; // Preview candidate targets before changing anchor positions.
     TWeakPtr<SWindow> ActiveCleanupWindow; // One modeless live curve cleanup preview.
     int32 SelectedPointIndex = INDEX_NONE;
     TSet<int32> SelectedPointIndices;
@@ -77,6 +76,11 @@ private:
     FVector CustomPlaneOrigin = FVector::ZeroVector;
     FVector CustomPlaneNormal = FVector::ZAxisVector;
     double PrecisionSnapToleranceCm = 100.0;
+    bool bInteractiveAnchorSnap = false; // Opt-in, saved per editor user. Works with Move only.
+    int32 InteractiveSnapTargetMode = 0; // 0 other anchors, 1 other curves, 2 nearest of both.
+    bool bSnapDuringDragCandidate = false;
+    FVector SnapDuringDragTarget = FVector::ZeroVector;
+    void UpdateInteractiveSnapPreview();
     int32 SoftSelectionMode = 0; // 0 disabled, 1 Euclidean 3D, 2 native spline arc length
     int32 SoftSelectionFalloff = 1; // 0 linear, 1 smooth, 2 sharp
     double SoftSelectionRadius = 150.0;

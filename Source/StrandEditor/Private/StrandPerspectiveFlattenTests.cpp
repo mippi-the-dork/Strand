@@ -1,5 +1,3 @@
-﻿// Copyright Mippithedork 2026, Inc. All Rights Reserved.
-
 #include "StrandPerspectiveFlatten.h"
 #include <cfloat>
 #if WITH_DEV_AUTOMATION_TESTS

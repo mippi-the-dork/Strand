@@ -1,5 +1,3 @@
-﻿// Copyright Mippithedork 2026, Inc. All Rights Reserved.
-
 #include "StrandActorFactory.h"
 #include "StrandPlacement.h"
 #include "StrandSplineActor.h"

@@ -1,5 +1,3 @@
-﻿// Copyright Mippithedork 2026, Inc. All Rights Reserved.
-
 #include "StrandSplineAssetEditor.h"
 #include "StrandEditorPreferences.h"
 #include "StrandCameraSpaceMath.h"
@@ -182,6 +180,9 @@ FText FStrandSplineAssetEditor::GetToolkitToolTipText() const
 
 FStrandSplineAssetEditor::~FStrandSplineAssetEditor()
 {
+    if (TSharedPtr<SWindow> Window = ActiveSnapWindow.Pin())
+    { Window->RequestDestroyWindow(); }
+    if (PreviewWidget.IsValid()) { PreviewWidget->SetSnapPreviewSegments({}); }
     if (TSharedPtr<SWindow> Window = ActiveCleanupWindow.Pin())
     { Window->RequestDestroyWindow(); }
     if (TSharedPtr<SWindow> Window = ActiveFlattenWindow.Pin())
@@ -203,6 +204,11 @@ void FStrandSplineAssetEditor::Init(USplineDataAsset* InAsset, const TSharedPtr<
         PrecisionSnapToleranceCm, GEditorPerProjectIni);
     PrecisionSnapToleranceCm = FMath::IsFinite(PrecisionSnapToleranceCm)
         ? FMath::Clamp(PrecisionSnapToleranceCm, 0.001, 100000.0) : 100.0;
+    GConfig->GetBool(TEXT("StrandSplineEditor"), TEXT("InteractiveAnchorSnap"),
+        bInteractiveAnchorSnap, GEditorPerProjectIni);
+    GConfig->GetInt(TEXT("StrandSplineEditor"), TEXT("InteractiveSnapTargetMode"),
+        InteractiveSnapTargetMode, GEditorPerProjectIni);
+    InteractiveSnapTargetMode = FMath::Clamp(InteractiveSnapTargetMode, 0, 2);
     NativePreview.Reset(NewObject<USplineComponent>(GetTransientPackage(), NAME_None, RF_Transient));
     RebuildNativePreview();
 
@@ -1390,6 +1396,69 @@ void FStrandSplineAssetEditor::RefreshSoftSelectionVisualization()
     PreviewWidget->SetSoftSelectionWeights(Weights);
 }
 
+void FStrandSplineAssetEditor::UpdateInteractiveSnapPreview()
+{
+    bSnapDuringDragCandidate = false;
+    if (!PreviewWidget.IsValid()) { return; }
+    PreviewWidget->SetSnapPreviewSegments({});
+    USplineDataAsset* Current = Asset.Get();
+    if (!bInteractiveAnchorSnap || ActiveSnapWindow.IsValid() || SoftSelectionMode != 0 || ActiveWidgetMode != 0 ||
+        SelectedHandle != 0 || !Current || !Current->Points.IsValidIndex(SelectedPointIndex) ||
+        !FMath::IsFinite(PrecisionSnapToleranceCm) ||
+        FSlateApplication::Get().GetModifierKeys().IsControlDown()) { return; }
+    // Explicit initialization is required because anchor lookup can fail before
+    // a curve lookup runs; the distance comparison is guarded by bFound.
+    FVector Target = FVector::ZeroVector;
+    int32 TargetIndex = INDEX_NONE;
+    const FVector Position = Current->Points[SelectedPointIndex].LocalPosition;
+    const TArray<int32> Selection = GetSelectedIndices();
+    bool bFound = false;
+    if (InteractiveSnapTargetMode != 1)
+    {
+        bFound = StrandPrecision::FindLiveAnchorTarget(Current->Points, Selection, Position,
+            PrecisionSnapToleranceCm, Target, TargetIndex);
+    }
+    // Curve targets use native evaluated geometry; any segment touching a
+    // selected anchor is excluded so the curve cannot snap to itself.
+    if (InteractiveSnapTargetMode != 0 && NativePreview.IsValid())
+    {
+        FVector CurveTarget;
+        int32 CurveSegment = INDEX_NONE;
+        const double MaxDistance = bFound
+            ? FMath::Min(PrecisionSnapToleranceCm, FVector::Dist(Position, Target))
+            : PrecisionSnapToleranceCm;
+        if (StrandPrecision::FindNearestOtherSegment(NativePreview.Get(), Selection,
+            SelectedPointIndex, MaxDistance, CurveTarget, CurveSegment))
+        {
+            Target = CurveTarget;
+            bFound = true;
+        }
+    }
+    // A snap must not silently break the active editing plane. The target is
+    // eligible only if its correction is already in the allowed plane.
+    if (bFound)
+    {
+        const FVector Correction = Target - Position;
+        FVector Normal = FVector::ZeroVector;
+        if (EditPlane == EStrandEditPlane::XY) { Normal = FVector::ZAxisVector; }
+        else if (EditPlane == EStrandEditPlane::XZ) { Normal = FVector::YAxisVector; }
+        else if (EditPlane == EStrandEditPlane::YZ) { Normal = FVector::XAxisVector; }
+        else if (EditPlane == EStrandEditPlane::CameraPlane) { Normal = LockedCameraPlaneNormal; }
+        else if (EditPlane == EStrandEditPlane::ThreePointPlane) { Normal = CustomPlaneNormal; }
+        if (!Normal.IsNearlyZero() &&
+            FMath::Abs(FVector::DotProduct(Correction, Normal.GetSafeNormal())) > 0.01)
+        { bFound = false; }
+    }
+    if (bFound)
+    {
+        bSnapDuringDragCandidate = true;
+        SnapDuringDragTarget = Target;
+        TArray<TPair<FVector, FVector>> Segments;
+        Segments.Emplace(Position, Target);
+        PreviewWidget->SetSnapPreviewSegments(Segments);
+    }
+}
+
 void FStrandSplineAssetEditor::BeginViewportPointDrag()
 {
     if (ActivePointDragTransaction || !HasSelectedPoint()) { return; }
@@ -1398,6 +1467,7 @@ void FStrandSplineAssetEditor::BeginViewportPointDrag()
     ActivePointDragTransaction = MakeUnique<FScopedTransaction>(
         LOCTEXT("DragSplinePoint", "Move Strand Spline Selection"));
     bPointChangedDuringDrag = false;
+    bSnapDuringDragCandidate = false;
     FrozenSoftSelectionWeights.Reset();
     FrozenSoftSelectionPivot = StrandSplineEditOperations::SelectionCenter(Asset->Points, GetSelectedIndices());
     if (SoftSelectionMode != 0 && NativePreview.IsValid())
@@ -1450,6 +1520,7 @@ void FStrandSplineAssetEditor::ApplyViewportPointDrag(const FVector& LocalDelta)
         bPointChangedDuringDrag = true;
         Current->PostEditChange();
         RebuildNativePreview();
+        UpdateInteractiveSnapPreview();
     }
 }
 
@@ -1524,9 +1595,26 @@ void FStrandSplineAssetEditor::ApplyViewportScale(double Factor)
 void FStrandSplineAssetEditor::EndViewportPointDrag()
 {
     if (!ActivePointDragTransaction) { return; }
+    // Snap only once, on release, within the same transaction as the drag.
+    // This avoids magnetic oscillation and preserves selection spacing.
+    USplineDataAsset* Current = Asset.Get();
+    if (bSnapDuringDragCandidate && Current && bPointChangedDuringDrag &&
+        Current->Points.IsValidIndex(SelectedPointIndex) &&
+        !FSlateApplication::Get().GetModifierKeys().IsControlDown())
+    {
+        const FVector Offset = SnapDuringDragTarget - Current->Points[SelectedPointIndex].LocalPosition;
+        if (!Offset.IsNearlyZero() && !Offset.ContainsNaN() &&
+            StrandSplineEditOperations::TranslateSelected(Current->Points, GetSelectedIndices(), Offset))
+        {
+            Current->PostEditChange();
+            RebuildNativePreview();
+        }
+    }
+    bSnapDuringDragCandidate = false;
+    if (PreviewWidget.IsValid()) { PreviewWidget->SetSnapPreviewSegments({}); }
     if (bPointChangedDuringDrag)
     {
-        if (USplineDataAsset* Current = Asset.Get()) { Current->MarkPackageDirty(); }
+        if (Current) { Current->MarkPackageDirty(); }
         if (DetailsView.IsValid()) { DetailsView->ForceRefresh(); }
     }
     ActivePointDragTransaction.Reset();
@@ -2477,6 +2565,7 @@ void FStrandSplineAssetEditor::OpenPerspectiveFlattenDialog()
 {
     USplineDataAsset* Current = Asset.Get();
     if (!Current || !NativePreview.IsValid() || !PreviewWidget.IsValid() || Current->Points.Num() < 2) { return; }
+    if (TSharedPtr<SWindow> Snap = ActiveSnapWindow.Pin()) { Snap->RequestDestroyWindow(); }
     if (TSharedPtr<SWindow> OpenWindow = ActiveFlattenWindow.Pin())
     {
         OpenWindow->BringToFront(true);
@@ -2671,6 +2760,47 @@ TSharedRef<SWidget> FStrandSplineAssetEditor::MakeEditPlaneMenu()
         FSlateIcon(), FUIAction(FExecuteAction::CreateSP(this, &FStrandSplineAssetEditor::SetPlaneFromThreeSelectedAnchors),
             FCanExecuteAction::CreateLambda([this]() { return GetSelectedIndices().Num() == 3; })));
     Menu.AddMenuSeparator();
+    Menu.AddMenuEntry(LOCTEXT("LiveAnchorSnapToggle", "Snap to Other Anchors While Moving"),
+        LOCTEXT("LiveAnchorSnapTooltip", "Opt-in interactive snap while moving selected anchors. Uses the primary anchor as the reference, and moves the whole selection by the same final offset. The magenta preview is not committed until release. Disabled while soft selection is active. Hold Ctrl during a drag to temporarily suppress snapping."),
+        FSlateIcon(), FUIAction(
+            FExecuteAction::CreateLambda([this]()
+            {
+                bInteractiveAnchorSnap = !bInteractiveAnchorSnap;
+                GConfig->SetBool(TEXT("StrandSplineEditor"), TEXT("InteractiveAnchorSnap"),
+                    bInteractiveAnchorSnap, GEditorPerProjectIni);
+                GConfig->Flush(false, GEditorPerProjectIni);
+                if (!bInteractiveAnchorSnap && PreviewWidget.IsValid())
+                { PreviewWidget->SetSnapPreviewSegments({}); }
+            }), FCanExecuteAction(),
+            FIsActionChecked::CreateLambda([this]() { return bInteractiveAnchorSnap; })),
+        NAME_None, EUserInterfaceActionType::ToggleButton);
+    Menu.AddSubMenu(LOCTEXT("LiveSnapTargetsLabel", "Snap During Drag: Target Priority"),
+        LOCTEXT("LiveSnapTargetsHelp", "Choose whether interactive snapping targets unselected anchors, non-adjacent spline segments, or whichever is closest. For performance, curve evaluation is used only when enabled."),
+        FNewMenuDelegate::CreateLambda([this](FMenuBuilder& Sub)
+        {
+            struct FSnapModeOption { int32 Mode; const TCHAR* Name; };
+            const FSnapModeOption Options[] =
+            {
+                {0, TEXT("Other Anchors")},
+                {1, TEXT("Other Curve Segments")},
+                {2, TEXT("Nearest of Anchors and Segments")}
+            };
+            for (const auto& Option : Options)
+            {
+                Sub.AddMenuEntry(FText::FromString(Option.Name), FText::GetEmpty(), FSlateIcon(),
+                    FUIAction(FExecuteAction::CreateLambda([this, Mode=Option.Mode]()
+                    {
+                        InteractiveSnapTargetMode = Mode;
+                        GConfig->SetInt(TEXT("StrandSplineEditor"), TEXT("InteractiveSnapTargetMode"),
+                            Mode, GEditorPerProjectIni);
+                        GConfig->Flush(false, GEditorPerProjectIni);
+                    }), FCanExecuteAction(),
+                    FIsActionChecked::CreateLambda([this, Mode=Option.Mode]()
+                    { return InteractiveSnapTargetMode == Mode; })),
+                    NAME_None, EUserInterfaceActionType::RadioButton);
+            }
+        }));
+    Menu.AddMenuSeparator();
     // The removed "Perspective (Navigable Camera-Aligned Editing)" entry
     // merely reset viewport projection; it was not a separate edit mode.
     // Camera navigation remains available through the normal viewport controls.
@@ -2863,37 +2993,128 @@ FReply FStrandSplineAssetEditor::SnapSelectedPoint(double Step)
 FReply FStrandSplineAssetEditor::SnapSelectionToOtherGeometry(bool bSegmentTarget)
 {
     USplineDataAsset* Current = Asset.Get();
-    if (!Current || !NativePreview.IsValid() || SelectedPointIndices.IsEmpty() ||
-        !FMath::IsFinite(PrecisionSnapToleranceCm) || PrecisionSnapToleranceCm <= 0.0) { return FReply::Handled(); }
+    if (!Current || !NativePreview.IsValid() || !PreviewWidget.IsValid() || SelectedPointIndices.IsEmpty())
+    { return FReply::Handled(); }
+    if (TSharedPtr<SWindow> Existing = ActiveSnapWindow.Pin())
+    { Existing->BringToFront(true); return FReply::Handled(); }
+    if (TSharedPtr<SWindow> Flatten = ActiveFlattenWindow.Pin()) { Flatten->RequestDestroyWindow(); }
+    if (TSharedPtr<SWindow> Cleanup = ActiveCleanupWindow.Pin()) { Cleanup->RequestDestroyWindow(); }
     EndViewportPointDrag();
-    const TArray<int32> Selection = GetSelectedIndices();
-    // Resolve every target from the unchanged source before starting a transaction.
-    TArray<TPair<int32, FVector>> Changes;
-    for (int32 Index : Selection)
+
+    struct FSnapState
     {
-        FVector Target = FVector::ZeroVector;
-        int32 Found = INDEX_NONE;
-        const bool bFound = bSegmentTarget
-            ? StrandPrecision::FindNearestOtherSegment(NativePreview.Get(), Selection, Index,
-                PrecisionSnapToleranceCm, Target, Found)
-            : StrandPrecision::FindNearestOtherAnchor(Current->Points, Selection, Index,
-                PrecisionSnapToleranceCm, Target, Found);
-        if (bFound && !Current->Points[Index].LocalPosition.Equals(Target, 0.000001))
-        { Changes.Emplace(Index, Target); }
-    }
-    if (Changes.IsEmpty()) { return FReply::Handled(); }
-    const FScopedTransaction Transaction(bSegmentTarget
-        ? LOCTEXT("SnapSelectedToCurveTransaction", "Snap Strand Anchors to Other Curve Segments")
-        : LOCTEXT("SnapSelectedToAnchorsTransaction", "Snap Strand Anchors to Other Anchors"));
-    Current->Modify();
-    for (const TPair<int32, FVector>& Change : Changes)
+        TArray<TPair<int32, FVector>> Changes;
+        FString Summary;
+        bool bShowPreview = true;
+        double Tolerance = 100.0;
+    };
+    TSharedRef<FSnapState> State = MakeShared<FSnapState>();
+    State->Tolerance = PrecisionSnapToleranceCm;
+    const TWeakPtr<FStrandSplineAssetEditor> WeakOwner = SharedThis(this);
+    const TWeakPtr<SStrandSplineViewport> WeakViewport = PreviewWidget;
+    TSharedRef<SWindow> Dialog = SNew(SWindow)
+        .Title(bSegmentTarget ? LOCTEXT("SnapSegmentPreviewTitle", "Strand - Snap to Curve Preview")
+            : LOCTEXT("SnapAnchorPreviewTitle", "Strand - Snap to Anchor Preview"))
+        .ClientSize(FVector2D(480.0, 255.0)).SizingRule(ESizingRule::UserSized)
+        .SupportsMaximize(false).SupportsMinimize(false);
+    const TWeakPtr<SWindow> WeakWindow = Dialog;
+    ActiveSnapWindow = Dialog;
+    Dialog->SetOnWindowClosed(FOnWindowClosed::CreateLambda([WeakOwner, WeakViewport](const TSharedRef<SWindow>&)
     {
-        Current->Points[Change.Key].LocalPosition = Change.Value;
-    }
-    Current->PostEditChange();
-    Current->MarkPackageDirty();
-    RebuildNativePreview();
-    if (DetailsView.IsValid()) { DetailsView->ForceRefresh(); }
+        if (TSharedPtr<SStrandSplineViewport> Viewport = WeakViewport.Pin())
+        { Viewport->SetSnapPreviewSegments({}); }
+        if (TSharedPtr<FStrandSplineAssetEditor> Owner = WeakOwner.Pin())
+        { Owner->ActiveSnapWindow.Reset(); }
+    }));
+
+    auto Refresh = [WeakOwner, WeakViewport, State, bSegmentTarget]()
+    {
+        TSharedPtr<FStrandSplineAssetEditor> Owner = WeakOwner.Pin();
+        USplineDataAsset* Source = Owner.IsValid() ? Owner->Asset.Get() : nullptr;
+        State->Changes.Reset();
+        TArray<TPair<FVector, FVector>> PreviewLines;
+        if (Source && Owner->NativePreview.IsValid() && FMath::IsFinite(State->Tolerance) && State->Tolerance > 0.0)
+        {
+            const TArray<int32> Selection = Owner->GetSelectedIndices();
+            StrandPrecision::BuildSnapPlan(Source->Points, Owner->NativePreview.Get(), Selection,
+                bSegmentTarget, State->Tolerance, State->Changes);
+            for (const TPair<int32, FVector>& Change : State->Changes)
+            { PreviewLines.Emplace(Source->Points[Change.Key].LocalPosition, Change.Value); }
+            State->Summary = State->Changes.IsEmpty()
+                ? TEXT("No eligible targets within the maximum distance. Nothing will change.")
+                : FString::Printf(TEXT("%d of %d selected anchors will move. Magenta shows target positions; original curve stays unchanged until Apply."),
+                    State->Changes.Num(), Selection.Num());
+        }
+        else { State->Summary = TEXT("Source unavailable or invalid snap distance."); }
+        if (TSharedPtr<SStrandSplineViewport> Viewport = WeakViewport.Pin())
+        { Viewport->SetSnapPreviewSegments(State->bShowPreview ? PreviewLines : TArray<TPair<FVector, FVector>>()); }
+    };
+
+    Dialog->SetContent(SNew(SBorder).Padding(FMargin(16.0f))
+        [SNew(SVerticalBox)
+        + SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 12)
+        [SNew(STextBlock).AutoWrapText(true)
+            .Text(LOCTEXT("SnapPreviewIntro", "Preview the anchor positions before snapping. The magenta target dots and connecting lines are temporary. Drag the window aside to inspect the spline."))]
+        + SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 10)
+        [SNew(SHorizontalBox)
+            + SHorizontalBox::Slot().FillWidth(1)
+            [SNew(STextBlock).Text(LOCTEXT("SnapPreviewTolerance", "Maximum snap distance (cm)"))]
+            + SHorizontalBox::Slot().AutoWidth()
+            [SNew(SBox).WidthOverride(125)
+                [SNew(SNumericEntryBox<double>)
+                    .MinValue(0.001).MaxValue(100000.0).AllowSpin(false)
+                    .Value_Lambda([State]() -> TOptional<double> { return State->Tolerance; })
+                    .OnValueCommitted_Lambda([State, Refresh](double Value, ETextCommit::Type)
+                    { if (FMath::IsFinite(Value)) { State->Tolerance = FMath::Clamp(Value, 0.001, 100000.0); Refresh(); } })]]]
+        + SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 8)
+        [SNew(SCheckBox)
+            .IsChecked_Lambda([State]() { return State->bShowPreview ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
+            .OnCheckStateChanged_Lambda([State, Refresh](ECheckBoxState Value)
+            { State->bShowPreview = Value == ECheckBoxState::Checked; Refresh(); })
+            [SNew(STextBlock).Text(LOCTEXT("SnapPreviewToggle", "Show snap targets in viewport"))]]
+        + SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 8)
+        [SNew(SButton).Text(LOCTEXT("SnapPreviewRefresh", "Refresh Targets"))
+            .OnClicked_Lambda([Refresh]() { Refresh(); return FReply::Handled(); })]
+        + SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 12)
+        [SNew(STextBlock).AutoWrapText(true).Text_Lambda([State]() { return FText::FromString(State->Summary); })]
+        + SVerticalBox::Slot().FillHeight(1) [SNullWidget::NullWidget]
+        + SVerticalBox::Slot().AutoHeight()
+        [SNew(SHorizontalBox)
+            + SHorizontalBox::Slot().FillWidth(1) [SNullWidget::NullWidget]
+            + SHorizontalBox::Slot().AutoWidth().Padding(0, 0, 8, 0)
+            [SNew(SButton).Text(LOCTEXT("SnapPreviewCancel", "Cancel"))
+                .OnClicked_Lambda([WeakWindow]()
+                { if (TSharedPtr<SWindow> Window = WeakWindow.Pin()) { Window->RequestDestroyWindow(); } return FReply::Handled(); })]
+            + SHorizontalBox::Slot().AutoWidth()
+            [SNew(SButton).Text(LOCTEXT("SnapPreviewApply", "Apply Snap"))
+                .IsEnabled_Lambda([State]() { return !State->Changes.IsEmpty(); })
+                .OnClicked_Lambda([WeakOwner, WeakWindow, WeakViewport, State, Refresh, bSegmentTarget]()
+                {
+                    Refresh(); // A modeless dialog must not commit stale target positions.
+                    TSharedPtr<FStrandSplineAssetEditor> Owner = WeakOwner.Pin();
+                    USplineDataAsset* Source = Owner.IsValid() ? Owner->Asset.Get() : nullptr;
+                    if (!Source || State->Changes.IsEmpty()) { return FReply::Handled(); }
+                    Owner->EndViewportPointDrag();
+                    const FScopedTransaction Transaction(bSegmentTarget
+                        ? LOCTEXT("SnapCurvePreviewUndo", "Snap Strand Anchors to Other Curve Segments")
+                        : LOCTEXT("SnapAnchorPreviewUndo", "Snap Strand Anchors to Other Anchors"));
+                    Source->Modify();
+                    for (const TPair<int32, FVector>& Change : State->Changes)
+                    { if (Source->Points.IsValidIndex(Change.Key)) { Source->Points[Change.Key].LocalPosition = Change.Value; } }
+                    Owner->PrecisionSnapToleranceCm = State->Tolerance;
+                    GConfig->SetDouble(TEXT("StrandSplineEditor"), TEXT("PrecisionSnapToleranceCm"),
+                        State->Tolerance, GEditorPerProjectIni);
+                    GConfig->Flush(false, GEditorPerProjectIni);
+                    Source->PostEditChange();
+                    Source->MarkPackageDirty();
+                    Owner->RebuildNativePreview();
+                    if (Owner->DetailsView.IsValid()) { Owner->DetailsView->ForceRefresh(); }
+                    if (TSharedPtr<SStrandSplineViewport> Viewport = WeakViewport.Pin()) { Viewport->SetSnapPreviewSegments({}); }
+                    if (TSharedPtr<SWindow> Window = WeakWindow.Pin()) { Window->RequestDestroyWindow(); }
+                    return FReply::Handled();
+                })]]]);
+    Refresh();
+    FSlateApplication::Get().AddWindow(Dialog);
     return FReply::Handled();
 }
 
@@ -3191,6 +3412,7 @@ namespace
 
 void FStrandSplineAssetEditor::OpenCurveCleanupDialog()
 {
+    if (TSharedPtr<SWindow> Snap = ActiveSnapWindow.Pin()) { Snap->RequestDestroyWindow(); }
     USplineDataAsset* Current = Asset.Get();
     if (!Current || !NativePreview.IsValid() || Current->Points.Num() < 3) { return; }
     if (TSharedPtr<SWindow> Flatten = ActiveFlattenWindow.Pin()) { Flatten->RequestDestroyWindow(); }
@@ -3581,25 +3803,13 @@ TSharedRef<SWidget> FStrandSplineAssetEditor::MakeSplineToolsMenu()
                     }
                 }));
             Sub.AddSubMenu(LOCTEXT("SnapToGeometry", "Snap to Existing Spline Geometry"),
-                LOCTEXT("SnapToGeometryTip", "Snap selected anchors to other anchors or non-adjacent evaluated spline segments. Targets are resolved before edits; keeps tangents and roll unchanged."),
+                LOCTEXT("SnapToGeometryTip", "Preview target positions before applying a snap to other anchors or non-adjacent curve segments; tangents and roll stay unchanged."),
                 FNewMenuDelegate::CreateLambda([this](FMenuBuilder& Snap)
                 {
-                    Snap.AddWidget(SNew(SNumericEntryBox<double>)
-                        .Value_Lambda([this]() { return TOptional<double>(PrecisionSnapToleranceCm); })
-                        .MinValue(0.001).MaxValue(100000.0).AllowSpin(false)
-                        .OnValueCommitted_Lambda([this](double Value, ETextCommit::Type)
-                        {
-                            if (!FMath::IsFinite(Value)) { return; }
-                            PrecisionSnapToleranceCm = FMath::Clamp(Value, 0.001, 100000.0);
-                            GConfig->SetDouble(TEXT("StrandSplineEditor"), TEXT("PrecisionSnapToleranceCm"),
-                                PrecisionSnapToleranceCm, GEditorPerProjectIni);
-                            GConfig->Flush(false, GEditorPerProjectIni);
-                        }),
-                        LOCTEXT("SnapToleranceLabel", "Max snap distance (cm)"), true);
-                    Snap.AddMenuEntry(LOCTEXT("SnapToOtherAnchor", "Nearest Unselected Anchor"),
+                    Snap.AddMenuEntry(LOCTEXT("SnapToOtherAnchor", "Preview Snap to Unselected Anchor..."),
                         LOCTEXT("SnapToOtherAnchorTip", "Snap selected anchor positions to the nearest unselected anchor within range; no change if none qualifies."),
                         FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this]() { SnapSelectionToOtherGeometry(false); })));
-                    Snap.AddMenuEntry(LOCTEXT("SnapToOtherSegment", "Nearest Unselected Curve Segment"),
+                    Snap.AddMenuEntry(LOCTEXT("SnapToOtherSegment", "Preview Snap to Curve Segment..."),
                         LOCTEXT("SnapToOtherSegmentTip", "Snap to evaluated curve geometry, excluding segments adjoining selected anchors. Does not alter point rotation or tangent vectors."),
                         FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this]() { SnapSelectionToOtherGeometry(true); })));
                 }));

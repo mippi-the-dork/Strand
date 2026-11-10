@@ -1,5 +1,3 @@
-﻿// Copyright Mippithedork 2026, Inc. All Rights Reserved.
-
 #include "StrandPlacement.h"
 #include "StrandSplineActor.h"
 #include "StrandMultiSplineActor.h"

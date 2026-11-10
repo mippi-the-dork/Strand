@@ -1,5 +1,3 @@
-﻿// Copyright Mippithedork 2026, Inc. All Rights Reserved.
-
 #pragma once
 
 #include "CoreMinimal.h"
@@ -35,6 +33,8 @@ public:
     void FrameSelectedPoint();
     /** Non-destructive cleanup preview sampled in spline-local space. */
     void SetCleanupPreviewPolyline(const TArray<FVector>& Points);
+    /** World-independent asset-local source/target indicators for non-destructive snap preview. */
+    void SetSnapPreviewSegments(const TArray<TPair<FVector, FVector>>& Segments);
     void SetSoftSelectionWeights(const TArray<double>& Weights);
     void SetShowControlPoints(bool bShow);
     bool GetShowControlPoints() const;

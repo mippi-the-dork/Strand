@@ -1,5 +1,3 @@
-﻿// Copyright Mippithedork 2026, Inc. All Rights Reserved.
-
 #include "StrandCameraSpaceMath.h"
 #include "StrandSoftSelectionVisuals.h"
 #include <limits>

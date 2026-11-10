@@ -1,5 +1,3 @@
-﻿// Copyright Mippithedork 2026, Inc. All Rights Reserved.
-
 #include "StrandMultiSplineActor.h"
 #include "Engine/World.h"
 #include "Components/SplineComponent.h"

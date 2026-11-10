@@ -1,5 +1,3 @@
-﻿// Copyright Mippithedork 2026, Inc. All Rights Reserved.
-
 #include "StrandPCGLibrary.h"
 #include "SplineDataAsset.h"
 #include "Data/PCGSplineData.h"

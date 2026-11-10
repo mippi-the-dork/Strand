@@ -1,5 +1,3 @@
-﻿// Copyright Mippithedork 2026, Inc. All Rights Reserved.
-
 #pragma once
 
 #include "CoreMinimal.h"
@@ -106,4 +104,50 @@ namespace StrandPrecision
         }
         return OutSegment != INDEX_NONE;
     }
+    /** Snap a live primary anchor against unselected anchors, without changing spline data.
+      * This is a pointer-driven placement helper: the supplied source is the current
+      * (already dragged) position and the unchanged non-selected points are targets. */
+    inline bool FindLiveAnchorTarget(const TArray<FSplinePointData>& Points,
+        const TArray<int32>& Selection, const FVector& SourcePosition, double Tolerance,
+        FVector& OutTarget, int32& OutTargetIndex)
+    {
+        OutTargetIndex = INDEX_NONE;
+        if (Selection.IsEmpty() || SourcePosition.ContainsNaN() || !FMath::IsFinite(Tolerance) ||
+            Tolerance <= 0.0) { return false; }
+        double ClosestSquared = Tolerance * Tolerance;
+        for (int32 I = 0; I < Points.Num(); ++I)
+        {
+            if (Selection.Contains(I) || Points[I].LocalPosition.ContainsNaN()) { continue; }
+            const double DistanceSquared = FVector::DistSquared(SourcePosition, Points[I].LocalPosition);
+            if (DistanceSquared < ClosestSquared)
+            {
+                ClosestSquared = DistanceSquared;
+                OutTarget = Points[I].LocalPosition;
+                OutTargetIndex = I;
+            }
+        }
+        return OutTargetIndex != INDEX_NONE;
+    }
+
+    /** Resolve snap candidates against an unchanged source. UI previews and Apply use the same plan. */
+    inline void BuildSnapPlan(const TArray<FSplinePointData>& Points, const USplineComponent* Spline,
+        const TArray<int32>& Selection, bool bSegments, double MaxDistance,
+        TArray<TPair<int32, FVector>>& OutChanges)
+    {
+        OutChanges.Reset();
+        if (!FMath::IsFinite(MaxDistance) || MaxDistance <= 0.0 ||
+            (bSegments && !IsValid(Spline))) { return; }
+        for (int32 Index : Selection)
+        {
+            if (!Points.IsValidIndex(Index)) { continue; }
+            FVector Target = FVector::ZeroVector;
+            int32 Found = INDEX_NONE;
+            const bool bFound = bSegments
+                ? FindNearestOtherSegment(Spline, Selection, Index, MaxDistance, Target, Found)
+                : FindNearestOtherAnchor(Points, Selection, Index, MaxDistance, Target, Found);
+            if (bFound && !Points[Index].LocalPosition.Equals(Target, 0.000001))
+            { OutChanges.Emplace(Index, Target); }
+        }
+    }
+
 }

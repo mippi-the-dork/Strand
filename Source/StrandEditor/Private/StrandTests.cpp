@@ -1,5 +1,3 @@
-﻿// Copyright Mippithedork 2026, Inc. All Rights Reserved.
-
 #include "StrandProjectSettings.h"
 #include "Misc/FileHelper.h"
 #include "HAL/FileManager.h"
