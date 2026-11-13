@@ -89,7 +89,7 @@ public:
     void SetOnToolShortcut(TFunction<void(int32)> InCallback);
     void SetOnDeleteShortcut(TFunction<void()> InCallback);
     void SetPenPlane(int32 LockedAxis);
-    void SetPenCustomPlane(bool bEnabled, const FVector& Origin, const FVector& Normal);
+    void SetPenCustomPlane(bool bEnabled, const FVector& Origin, const FVector& Normal, const FVector& PreferredAxis);
     void SetPenSnap(double Step);
     void SetPenCallbacks(TFunction<bool(const FStrandPenHit&)> OnDown,
         TFunction<void(const FVector&)> OnDrag, TFunction<void()> OnUp,

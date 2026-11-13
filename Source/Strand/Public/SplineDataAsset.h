@@ -57,10 +57,10 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Strand|Placement")
     EStrandCoordinateMode DefaultCoordinateMode = EStrandCoordinateMode::Relative;
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Strand|Placement", meta=(EditCondition="DefaultCoordinateMode == EStrandCoordinateMode::Relative"))
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Strand|Placement", meta=(EditCondition="DefaultCoordinateMode == EStrandCoordinateMode::Relative", EditConditionHides))
     EStrandAnchorMode DefaultAnchorMode = EStrandAnchorMode::PointCenter;
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Strand|Placement", meta=(ClampMin="0", EditCondition="DefaultCoordinateMode == EStrandCoordinateMode::Relative && DefaultAnchorMode == EStrandAnchorMode::PointIndex"))
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Strand|Placement", meta=(ClampMin="0", EditCondition="DefaultCoordinateMode == EStrandCoordinateMode::Relative && DefaultAnchorMode == EStrandAnchorMode::PointIndex", EditConditionHides))
     int32 DefaultAnchorPointIndex = 0;
 
 #if WITH_EDITORONLY_DATA
@@ -96,6 +96,10 @@ public:
     double ImportSampleSeconds = 0.0;
 #endif
 
+#if WITH_EDITOR
+    /** Mode-specific import options are not editable for unrelated source formats. */
+    virtual bool CanEditChange(const FProperty* InProperty) const override;
+#endif
 #if WITH_EDITOR && WITH_EDITORONLY_DATA
     virtual void PostInitProperties() override;
 #endif

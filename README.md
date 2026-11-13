@@ -215,6 +215,10 @@ SVG import stores a 2D shape in Unreal's XY plane. The default **Mirror SVG X on
 
 Use **Tools > Strand: Import Alembic Curves...** for explicit spline import. The code reads supported Alembic `ICurves` representations, including linear and selected smooth, Bézier, and NURBS families. Source curve identity is recorded for per-curve reimport. Blender-authored Bézier Alembic curves have been tested in the earlier development workflow; dense linear sampling from other exporters can still produce unnecessarily large point arrays.
 
+**Alembic source-coordinate fidelity (0.6.46):** Strand preserves each curve's authored positions rather than subtracting its first control point. Nested Alembic `IXform` transforms are applied before source-unit and Y-up conversions, including non-inherited transform branches. Imported Alembic assets default to **Absolute** placement; SVG imports retain Relative / Center of Points for convenient drag-and-drop. Absolute means *the source positions relative to the target spline component*, **not** automatically placing that component at the DCC application's world origin. Source unit/axis conventions still matter. Reimport retains the asset's existing placement preference; manually switch legacy imported assets from Relative to Absolute if exact component-space alignment is intended. Be aware that native Strand assets store point geometry, not the entire original Alembic transform graph or animation.
+
+**Mode-specific details:** On spline actors/components, Center of Spline Points is editable only in Relative placement; Anchor Point Index is editable only in Relative + Point Index mode. Asset default placement fields are hidden when their mode is inactive. On imported assets, SVG-only import options are disabled for Alembic sources, and Alembic-only options are disabled for SVG sources; their stored values remain intact for future use.
+
 Content Browser import of `.abc` can offer **Strand Spline Importer**, **Unreal Alembic Importer**, or Cancel, allowing mesh/Geometry Cache workflows to remain with Unreal's importer. Source units, Y-up-to-Z-up conversion, and sample time are exposed as Alembic import options where applicable. Alembic has no universal length unit; check the source application's convention. Strand does not register an FBX spline importer.
 
 ### Export interchange files
@@ -298,3 +302,9 @@ These editing operations do not replace Unreal's own viewport transform widgets.
 In the Strand Spline Asset Editor, enable **Edit Plane → Snap to Other Anchors While Moving**. The neighboring **Snap During Drag: Target Priority** submenu selects anchor targets, eligible evaluated curve segments, or both. During a Move gesture, the magenta target indicator previews where the primary selected anchor will land. The final group offset is committed on mouse release as part of one Undo operation. Hold **Ctrl** to temporarily suppress snapping; snapping is also disabled while soft selection is active. The saved distance tolerance is set in **More → Selected Points → Snap to Existing Spline Geometry**. These targets belong to the currently edited spline asset; they do not represent level-world surface snapping.
 
 The selected anchor's soft-selection marker can be enlarged from **Editor Preferences → Plugins → Strand Editor → Selection Visualization**.
+
+
+### Anchor-relative working planes (0.6.45 development)
+In the Strand Spline Editor use **Edit Plane → Anchor Local XY/XZ/YZ Plane** with a selected primary anchor. The plane uses that anchor's evaluated spline tangent frame, captured once when selected, rather than an absolute world plane or the viewport camera. A purple grid shows the working plane. To refresh its frame, select the command again; **Free 3D** removes the constraint. These options do not change geometry until a subsequent edit.
+
+**Known:** the native translation gizmo currently displays its third handle even when the plane constrains out its movement; the movement constraint itself is enforced.

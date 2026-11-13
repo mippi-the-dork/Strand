@@ -29,7 +29,7 @@ namespace
         double Time = 0.0;
     };
 
-    FVector Convert(const Imath::V3f& V, const FReadSettings& Settings)
+    FVector Convert(const Imath::V3d& V, const FReadSettings& Settings)
     {
         const double S = Settings.Scale;
         // Alembic is unitless. Default assumes 1 source unit = 1 cm.
@@ -50,11 +50,10 @@ namespace
         if (P.Num() < 2) { return; }
         Curve.bClosedLoop = bClosed && P.Num() > 2;
         Curve.Points.Reserve(P.Num());
-        const FVector Offset = P[0];
         for (int32 I = 0; I < P.Num(); ++I)
         {
             FSplinePointData& Pt = Curve.Points.AddDefaulted_GetRef();
-            Pt.LocalPosition = P[I] - Offset;
+            Pt.LocalPosition = P[I];
             Pt.PointType = bLinear ? ESplinePointType::Linear : ESplinePointType::CurveCustomTangent;
         }
         if (bLinear) { return; }
@@ -80,10 +79,9 @@ namespace
         if (Anchors < 2) { return false; }
         Curve.bClosedLoop = bPeriodicShape;
         Curve.Points.SetNum(Anchors);
-        const FVector Origin = CV[0];
         for (int32 I = 0; I < Anchors; ++I)
         {
-            Curve.Points[I].LocalPosition = CV[I * 3] - Origin;
+            Curve.Points[I].LocalPosition = CV[I * 3];
             Curve.Points[I].PointType = ESplinePointType::CurveCustomTangent;
         }
         for (int32 S = 0; S < Segments; ++S)
@@ -260,7 +258,8 @@ namespace
     }
 
     bool ParseSchema(const G::ICurves& Curves, const FString& ObjectName,
-                     const FReadSettings& Settings, TArray<FSplineImportedCurve>& Out)
+                     const FReadSettings& Settings, const Imath::M44d& ObjectToSource,
+                     TArray<FSplineImportedCurve>& Out)
     {
         G::ICurvesSchema::Sample Sample;
         const Abc::ISampleSelector Selector(Settings.Time);
@@ -288,7 +287,14 @@ namespace
             }
             TArray<FVector> CV;
             CV.Reserve(N);
-            for (int32 I = 0; I < N; ++I) { CV.Add(Convert((*Positions)[Offset+I], Settings)); }
+            for (int32 I = 0; I < N; ++I)
+            {
+                const Imath::V3f& P = (*Positions)[Offset + I];
+                const Imath::V3d SourcePosition(P.x, P.y, P.z);
+                Imath::V3d Transformed;
+                ObjectToSource.multVecMatrix(SourcePosition, Transformed);
+                CV.Add(Convert(Transformed, Settings));
+            }
             FSplineImportedCurve Curve;
             Curve.Name = ObjectName + FString::Printf(TEXT("_%04d"), int32(CurveIndex));
             Curve.SourceId = ObjectName + FString::Printf(TEXT("#%d"), int32(CurveIndex));
@@ -390,17 +396,40 @@ namespace
         return !Out.IsEmpty();
     }
 
+    // Alembic ICurves positions are local to their parent IXform chain. Apply
+    // the hierarchy before changing axes or source units; retain the original
+    // origin rather than subtracting an arbitrary first control point.
     void Walk(const Abc::IObject& Object, const FReadSettings& Settings,
-              TArray<FSplineImportedCurve>& Out)
+              const Imath::M44d& ParentToSource, TArray<FSplineImportedCurve>& Out)
     {
         if (!Object.valid() || Out.Num() >= MaxCurves) { return; }
+        Imath::M44d ObjectToSource = ParentToSource;
+        if (G::IXform::matches(Object.getHeader()))
+        {
+            try
+            {
+                const G::IXform Xform(Object, G::kWrapExisting);
+                G::XformSample Sample;
+                Xform.getSchema().get(Sample, Abc::ISampleSelector(Settings.Time));
+                // Imath uses row vectors; local transforms precede parent transforms.
+                ObjectToSource = Sample.getMatrix() *
+                    (Sample.getInheritsXforms() ? ParentToSource : Imath::M44d());
+            }
+            catch (const std::exception& E)
+            {
+                UE_LOG(LogStrandAlembic, Warning,
+                    TEXT("Skipping Alembic transform subtree %s: %s"),
+                    UTF8_TO_TCHAR(Object.getFullName().c_str()), UTF8_TO_TCHAR(E.what()));
+                return; // Never import curves in the wrong coordinate space.
+            }
+        }
         if (G::ICurves::matches(Object.getHeader()))
         {
             try
             {
                 const G::ICurves Curves(Object, G::kWrapExisting);
                 const FString Name = UTF8_TO_TCHAR(Object.getFullName().c_str());
-                ParseSchema(Curves, Name, Settings, Out);
+                ParseSchema(Curves, Name, Settings, ObjectToSource, Out);
             }
             catch (const std::exception& E)
             {
@@ -409,7 +438,7 @@ namespace
         }
         for (size_t I = 0; I < Object.getNumChildren() && Out.Num() < MaxCurves; ++I)
         {
-            Walk(Object.getChild(I), Settings, Out);
+            Walk(Object.getChild(I), Settings, ObjectToSource, Out);
         }
     }
 }
@@ -438,7 +467,7 @@ bool SplineAssetImport::LoadAlembicCurves(const FString& Filename,
         const FTCHARToUTF8 Path(*Filename);
         const Abc::IArchive Archive = Factory.getArchive(Path.Get());
         if (!Archive.valid()) { return false; }
-        Walk(Archive.getTop(), Settings, Curves);
+        Walk(Archive.getTop(), Settings, Imath::M44d(), Curves);
     }
     catch (const std::exception& E)
     {

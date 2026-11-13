@@ -21,11 +21,14 @@ USplineDataAsset* SplineAssetImport::CommitCurves(UObject* Parent, FName Request
     const FString Format = FPaths::GetExtension(SourceFile).ToLower();
     auto RecordSource = [&](USplineDataAsset* Asset, const FSplineImportedCurve& Curve, int32 Index)
     {
-        // Imported source coordinates often have a large DCC canvas offset.
-        // Keep the ORIGINAL positions in the asset, but default viewport placement
-        // to the curve centroid so dropping it places visible spline points near the cursor.
-        Asset->DefaultCoordinateMode = EStrandCoordinateMode::Relative;
-        Asset->DefaultAnchorMode = EStrandAnchorMode::PointCenter;
+        // Geometry is always stored in its source coordinate frame. Alembic
+        // defaults to Absolute to preserve DCC positioning; SVG keeps convenient
+        // centered drop placement. These defaults never modify stored points.
+        const bool bAlembic = Format == TEXT("abc");
+        Asset->DefaultCoordinateMode = bAlembic
+            ? EStrandCoordinateMode::Absolute : EStrandCoordinateMode::Relative;
+        Asset->DefaultAnchorMode = bAlembic
+            ? EStrandAnchorMode::PointIndex : EStrandAnchorMode::PointCenter;
         Asset->DefaultAnchorPointIndex = 0;
         Asset->SourceImportFormat = Format;
         Asset->SourceCurveId = Curve.SourceId.IsEmpty()

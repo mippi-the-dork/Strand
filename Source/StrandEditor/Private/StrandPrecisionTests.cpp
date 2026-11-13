@@ -211,3 +211,61 @@ bool FStrandSurfaceProjectionKernelTest::RunTest(const FString& Parameters)
     return true;
 }
 #endif
+
+#if WITH_DEV_AUTOMATION_TESTS
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStrandAnchorLocalPlaneTest,
+    "Strand.Editor.Authoring.Precision.AnchorLocalPlaneFrames",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FStrandAnchorLocalPlaneTest::RunTest(const FString& Parameters)
+{
+    const FQuat Rotation(FVector(1, 2, 3).GetSafeNormal(), FMath::DegreesToRadians(47.0));
+    for (int32 Locked = 0; Locked < 3; ++Locked)
+    {
+        FVector Normal, Preferred, U, V, N;
+        TestTrue(TEXT("Anchor frame captured"), StrandPrecisionProjection::MakeAnchorLocalPlane(
+            Rotation, Locked, Normal, Preferred));
+        TestTrue(TEXT("Frame normal follows local axis"), Normal.Equals(
+            Locked == 0 ? Rotation.GetAxisX() : Locked == 1 ? Rotation.GetAxisY() : Rotation.GetAxisZ(), 1.e-5));
+        TestTrue(TEXT("Captured frame is valid"), StrandPrecisionProjection::MakePlaneFrame(
+            Normal, Preferred, U, V, N));
+        TestTrue(TEXT("Preferred axis stays in captured plane"), U.Equals(Preferred, 1.e-5));
+        const FVector Drag = FVector(5, 7, 11);
+        const FVector InPlane = StrandCameraSpace::ProjectDelta(Drag, Normal);
+        TestTrue(TEXT("Local drag respects plane"), FMath::Abs(FVector::DotProduct(InPlane, Normal)) < 1.e-5);
+    }
+    FVector N, Axis;
+    TestFalse(TEXT("Invalid local axis rejected"), StrandPrecisionProjection::MakeAnchorLocalPlane(
+        FQuat::Identity, 3, N, Axis));
+    TestFalse(TEXT("Invalid quaternion rejected"), StrandPrecisionProjection::MakeAnchorLocalPlane(
+        FQuat(0,0,0,0), 2, N, Axis));
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStrandMeshSurfacePlanTest,
+    "Strand.Editor.Authoring.Precision.MeshSurfacePreviewPlan",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FStrandMeshSurfacePlanTest::RunTest(const FString& Parameters)
+{
+    using namespace StrandPrecisionProjection;
+    TArray<FSurfaceTriangle> Triangles;
+    Triangles.Add({FVector(0,0,0), FVector(100,0,0), FVector(0,100,0)});
+    Triangles.Add({FVector(0,0,20), FVector(100,0,20), FVector(0,100,20)});
+    const TArray<FVector> Sources{FVector(25,25,100), FVector(500,500,100), FVector(25,25,100)};
+    TArray<FSurfaceProjectionCandidate> Plan;
+    BuildSurfacePreviewPlan(Sources, {0,1,2,0,999}, Triangles, FVector(0,0,-1), 200.0, 5.0, Plan);
+    TestEqual(TEXT("Only selected hits included, duplicates excluded"), Plan.Num(), 2);
+    if (Plan.Num() == 2)
+    {
+        TestEqual(TEXT("Nearest face wins even when later in list"), Plan[0].TriangleIndex, 1);
+        TestTrue(TEXT("Nearest hit is at z=20"), Plan[0].Hit.Equals(FVector(25,25,20)));
+        TestTrue(TEXT("Clearance follows winding"), Plan[0].PositionWithClearance.Equals(FVector(25,25,25)));
+        TestEqual(TEXT("Second unique selected source"), Plan[1].SourceIndex, 2);
+    }
+    TestTrue(TEXT("Preview leaves source geometry untouched"), Sources[0].Equals(FVector(25,25,100)));
+    BuildSurfacePreviewPlan(Sources, {0}, Triangles, FVector::ZeroVector, 200.0, 0, Plan);
+    TestEqual(TEXT("Invalid ray yields empty plan"), Plan.Num(), 0);
+    BuildSurfacePreviewPlan(Sources, {0}, Triangles, FVector(0,0,-1), 5.0, 0, Plan);
+    TestEqual(TEXT("Out of range yields empty plan"), Plan.Num(), 0);
+    return true;
+}
+#endif

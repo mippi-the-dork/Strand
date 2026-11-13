@@ -2,6 +2,7 @@
 #include "StrandEditorPreferences.h"
 #include "StrandCameraSpaceMath.h"
 #include "StrandPrecisionOperations.h"
+#include "StrandPrecisionProjection.h"
 #include "StrandPerspectiveFlatten.h"
 #include "StrandSplineViewport.h"
 #include "SplineDataAsset.h"
@@ -833,8 +834,8 @@ TSharedRef<SDockTab> FStrandSplineAssetEditor::SpawnPreviewTab(const FSpawnTabAr
         PreviewWidget->SetPenSnap(PenSnapStep);
         PreviewWidget->SetPenPlane(EditPlane == EStrandEditPlane::XY ? 2 :
             EditPlane == EStrandEditPlane::XZ ? 1 : EditPlane == EStrandEditPlane::YZ ? 0 : -1);
-        PreviewWidget->SetPenCustomPlane(EditPlane == EStrandEditPlane::ThreePointPlane,
-            CustomPlaneOrigin, CustomPlaneNormal);
+        PreviewWidget->SetPenCustomPlane(IsCapturedPlane(),
+            CustomPlaneOrigin, CustomPlaneNormal, CustomPlaneAxisU);
     }
     return Tab;
 }
@@ -1444,7 +1445,7 @@ void FStrandSplineAssetEditor::UpdateInteractiveSnapPreview()
         else if (EditPlane == EStrandEditPlane::XZ) { Normal = FVector::YAxisVector; }
         else if (EditPlane == EStrandEditPlane::YZ) { Normal = FVector::XAxisVector; }
         else if (EditPlane == EStrandEditPlane::CameraPlane) { Normal = LockedCameraPlaneNormal; }
-        else if (EditPlane == EStrandEditPlane::ThreePointPlane) { Normal = CustomPlaneNormal; }
+        else if (IsCapturedPlane()) { Normal = CustomPlaneNormal; }
         if (!Normal.IsNearlyZero() &&
             FMath::Abs(FVector::DotProduct(Correction, Normal.GetSafeNormal())) > 0.01)
         { bFound = false; }
@@ -1504,7 +1505,7 @@ void FStrandSplineAssetEditor::ApplyViewportPointDrag(const FVector& LocalDelta)
     const int32 LockedAxis = EditPlane == EStrandEditPlane::XY ? 2 : EditPlane == EStrandEditPlane::XZ ? 1 : EditPlane == EStrandEditPlane::YZ ? 0 : -1;
     if (LockedAxis >= 0) { Constrained[LockedAxis] = 0.0; }
     if (EditPlane == EStrandEditPlane::CameraPlane) { Constrained = StrandCameraSpace::ProjectDelta(Constrained, LockedCameraPlaneNormal); }
-    if (EditPlane == EStrandEditPlane::ThreePointPlane) { Constrained = StrandCameraSpace::ProjectDelta(Constrained, CustomPlaneNormal); }
+    if (IsCapturedPlane()) { Constrained = StrandCameraSpace::ProjectDelta(Constrained, CustomPlaneNormal); }
     if (Constrained.IsNearlyZero()) { return; }
     bool bMoved = false;
     if (SoftSelectionMode == 0)
@@ -2715,6 +2716,9 @@ FText FStrandSplineAssetEditor::GetEditPlaneLabel() const
     case EStrandEditPlane::YZ: return LOCTEXT("EditYZLabel", "Edit: YZ");
     case EStrandEditPlane::CameraPlane: return LOCTEXT("EditCameraLabel", "Edit: Camera");
     case EStrandEditPlane::ThreePointPlane: return LOCTEXT("Edit3PointLabel", "Edit: 3-Point");
+    case EStrandEditPlane::AnchorLocalXY: return LOCTEXT("EditAnchorXYLabel", "Edit: Anchor XY");
+    case EStrandEditPlane::AnchorLocalXZ: return LOCTEXT("EditAnchorXZLabel", "Edit: Anchor XZ");
+    case EStrandEditPlane::AnchorLocalYZ: return LOCTEXT("EditAnchorYZLabel", "Edit: Anchor YZ");
     default: return LOCTEXT("Edit3DLabel", "Edit: 3D");
     }
 }
@@ -2732,8 +2736,8 @@ void FStrandSplineAssetEditor::SetEditPlane(EStrandEditPlane NewPlane)
         PreviewWidget->SetCameraAlignedEditing(NewPlane == EStrandEditPlane::CameraPlane);
         PreviewWidget->SetPenPlane(NewPlane == EStrandEditPlane::XY ? 2 :
             NewPlane == EStrandEditPlane::XZ ? 1 : NewPlane == EStrandEditPlane::YZ ? 0 : -1);
-        PreviewWidget->SetPenCustomPlane(NewPlane == EStrandEditPlane::ThreePointPlane,
-            CustomPlaneOrigin, CustomPlaneNormal);
+        PreviewWidget->SetPenCustomPlane((NewPlane == EStrandEditPlane::ThreePointPlane || NewPlane == EStrandEditPlane::AnchorLocalXY || NewPlane == EStrandEditPlane::AnchorLocalXZ || NewPlane == EStrandEditPlane::AnchorLocalYZ),
+            CustomPlaneOrigin, CustomPlaneNormal, CustomPlaneAxisU);
     }
     // A working plane never changes the camera projection. View and edit constraints
     // are independent; framing and view selection are explicit user operations.
@@ -2755,6 +2759,21 @@ TSharedRef<SWidget> FStrandSplineAssetEditor::MakeEditPlaneMenu()
     Entry(EStrandEditPlane::YZ, LOCTEXT("EditYZ", "World YZ Plane"), LOCTEXT("EditYZHelp", "Edit only Y/Z; leave existing X coordinates untouched."));
     Entry(EStrandEditPlane::CameraPlane, LOCTEXT("EditCameraPlane", "Camera-Aligned 2D Editing"),
         LOCTEXT("EditCameraPlaneHelp", "Keep perspective camera navigation. Each new drag captures the current camera-aligned plane; original depth is preserved. This does not flatten the spline."));
+    // Local planes use the primary anchor's evaluated spline tangent frame,
+    // not the world axes or current viewport camera. Selection changes do not
+    // silently recapture the plane.
+    Menu.AddMenuSeparator();
+    auto AnchorPlaneEntry = [this, &Menu](EStrandEditPlane Plane, const FText& Label)
+    {
+        Menu.AddMenuEntry(Label, LOCTEXT("AnchorPlaneHelp", "Capture the primary anchor's evaluated local spline frame. Fixed until recaptured; camera orbit and curve edits will not rotate the working plane."),
+            FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this, Plane]() { CaptureAnchorLocalPlane(Plane); }),
+                FCanExecuteAction::CreateLambda([this]() { return HasSelectedPoint() && NativePreview.IsValid(); }),
+                FIsActionChecked::CreateLambda([this, Plane]() { return EditPlane == Plane; })),
+            NAME_None, EUserInterfaceActionType::RadioButton);
+    };
+    AnchorPlaneEntry(EStrandEditPlane::AnchorLocalXY, LOCTEXT("AnchorPlaneXY", "Anchor Local XY Plane"));
+    AnchorPlaneEntry(EStrandEditPlane::AnchorLocalXZ, LOCTEXT("AnchorPlaneXZ", "Anchor Local XZ Plane"));
+    AnchorPlaneEntry(EStrandEditPlane::AnchorLocalYZ, LOCTEXT("AnchorPlaneYZ", "Anchor Local YZ Plane"));
     Menu.AddMenuEntry(LOCTEXT("CaptureThreePointPlane", "Working Plane from 3 Selected Anchors"),
         LOCTEXT("CaptureThreePointPlaneTip", "Select exactly three non-collinear anchors. Capture their plane for constrained movement. No geometry changes; remains fixed while orbiting the camera."),
         FSlateIcon(), FUIAction(FExecuteAction::CreateSP(this, &FStrandSplineAssetEditor::SetPlaneFromThreeSelectedAnchors),
@@ -2844,7 +2863,7 @@ void FStrandSplineAssetEditor::ApplyViewportTangentDrag(int32 Handle, const FVec
     if (LockedAxis >= 0) { Constrained[LockedAxis] = 0.0; }
     if (EditPlane == EStrandEditPlane::CameraPlane && PreviewWidget.IsValid())
     { Constrained = StrandCameraSpace::ProjectDelta(Constrained, PreviewWidget->GetCameraForward()); }
-    if (EditPlane == EStrandEditPlane::ThreePointPlane)
+    if (IsCapturedPlane())
     { Constrained = StrandCameraSpace::ProjectDelta(Constrained, CustomPlaneNormal); }
     if (Constrained.IsNearlyZero()) { return; }
     if (!ActivePointDragTransaction) { BeginViewportPointDrag(); }
@@ -3118,6 +3137,36 @@ FReply FStrandSplineAssetEditor::SnapSelectionToOtherGeometry(bool bSegmentTarge
     return FReply::Handled();
 }
 
+bool FStrandSplineAssetEditor::IsCapturedPlane() const
+{
+    return EditPlane == EStrandEditPlane::ThreePointPlane ||
+        EditPlane == EStrandEditPlane::AnchorLocalXY ||
+        EditPlane == EStrandEditPlane::AnchorLocalXZ ||
+        EditPlane == EStrandEditPlane::AnchorLocalYZ;
+}
+
+void FStrandSplineAssetEditor::CaptureAnchorLocalPlane(EStrandEditPlane Plane)
+{
+    if (Plane != EStrandEditPlane::AnchorLocalXY &&
+        Plane != EStrandEditPlane::AnchorLocalXZ &&
+        Plane != EStrandEditPlane::AnchorLocalYZ) { return; }
+    if (!NativePreview.IsValid() || !HasSelectedPoint()) { return; }
+    // A captured anchor frame is fixed until explicitly recaptured. It must not
+    // change as the curve is edited or the user's camera moves.
+    const FQuat Frame = NativePreview->GetQuaternionAtSplinePoint(
+        SelectedPointIndex, ESplineCoordinateSpace::Local).GetNormalized();
+    FVector Normal, AxisU;
+    const int32 LockedLocalAxis = Plane == EStrandEditPlane::AnchorLocalXY ? 2 :
+        Plane == EStrandEditPlane::AnchorLocalXZ ? 1 : 0;
+    if (!StrandPrecisionProjection::MakeAnchorLocalPlane(Frame, LockedLocalAxis, Normal, AxisU)) { return; }
+    if (Normal.ContainsNaN() || AxisU.ContainsNaN() || Normal.IsNearlyZero() || AxisU.IsNearlyZero()) { return; }
+    CustomPlaneOrigin = NativePreview->GetLocationAtSplinePoint(
+        SelectedPointIndex, ESplineCoordinateSpace::Local);
+    CustomPlaneNormal = Normal;
+    CustomPlaneAxisU = AxisU;
+    SetEditPlane(Plane);
+}
+
 void FStrandSplineAssetEditor::SetPlaneFromThreeSelectedAnchors()
 {
     USplineDataAsset* Current = Asset.Get();
@@ -3126,6 +3175,11 @@ void FStrandSplineAssetEditor::SetPlaneFromThreeSelectedAnchors()
     if (!StrandPrecision::PlaneFromThreePoints(Current->Points, GetSelectedIndices(), Origin, Normal)) { return; }
     CustomPlaneOrigin = Origin;
     CustomPlaneNormal = Normal;
+    // The first selected edge gives the plane a stable, artist-authored X direction.
+    const TArray<int32> Selected = GetSelectedIndices();
+    CustomPlaneAxisU = Selected.Num() == 3 ?
+        (Current->Points[Selected[1]].LocalPosition - Current->Points[Selected[0]].LocalPosition).GetSafeNormal() :
+        FVector::XAxisVector;
     SetEditPlane(EStrandEditPlane::ThreePointPlane);
 }
 

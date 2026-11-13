@@ -27,7 +27,10 @@ enum class EStrandEditPlane : uint8
     XZ,
     YZ,
     CameraPlane,
-    ThreePointPlane
+    ThreePointPlane,
+    AnchorLocalXY,
+    AnchorLocalXZ,
+    AnchorLocalYZ
 };
 
 class FStrandSplineAssetEditor final : public FAssetEditorToolkit, public FSelfRegisteringEditorUndoClient
@@ -75,6 +78,9 @@ private:
     FVector LockedCameraPlaneNormal = FVector::XAxisVector;
     FVector CustomPlaneOrigin = FVector::ZeroVector;
     FVector CustomPlaneNormal = FVector::ZAxisVector;
+    FVector CustomPlaneAxisU = FVector::XAxisVector;
+    bool IsCapturedPlane() const;
+    void CaptureAnchorLocalPlane(EStrandEditPlane Plane);
     double PrecisionSnapToleranceCm = 100.0;
     bool bInteractiveAnchorSnap = false; // Opt-in, saved per editor user. Works with Move only.
     int32 InteractiveSnapTargetMode = 0; // 0 other anchors, 1 other curves, 2 nearest of both.

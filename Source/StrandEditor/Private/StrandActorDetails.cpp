@@ -156,6 +156,18 @@ void FStrandActorDetails::CustomizeDetails(IDetailLayoutBuilder& Builder)
     .ValueContent()
     [SNew(SCheckBox)
         .ToolTipText(LOCTEXT("CenterTip", "Checked: center anchor; unchecked: point-index anchor. Editing applies to all linked splines."))
+        .IsEnabled_Lambda([Splines]()
+        {
+            bool bAny = false;
+            for (const auto& Weak : Splines)
+            {
+                const auto* Data = UStrandSplineUserData::Get(Weak.Get());
+                if (!Data || !Data->AssignedSplineAsset) { continue; }
+                bAny = true;
+                if (Data->CoordinateMode != EStrandCoordinateMode::Relative) { return false; }
+            }
+            return bAny;
+        })
         .IsChecked_Lambda([Splines]()
         {
             TOptional<EStrandAnchorMode> Anchor;
@@ -188,6 +200,19 @@ void FStrandActorDetails::CustomizeDetails(IDetailLayoutBuilder& Builder)
     .NameContent()[SNew(STextBlock).Text(LOCTEXT("IndexLabel", "Anchor Point Index"))]
     .ValueContent()
     [SNew(SNumericEntryBox<int32>).MinValue(0)
+        .IsEnabled_Lambda([Splines]()
+        {
+            bool bAny = false;
+            for (const auto& Weak : Splines)
+            {
+                const auto* Data = UStrandSplineUserData::Get(Weak.Get());
+                if (!Data || !Data->AssignedSplineAsset) { continue; }
+                bAny = true;
+                if (Data->CoordinateMode != EStrandCoordinateMode::Relative ||
+                    Data->AnchorMode != EStrandAnchorMode::PointIndex) { return false; }
+            }
+            return bAny;
+        })
         .Value_Lambda([Splines]() -> TOptional<int32>
         {
             TOptional<int32> Index;

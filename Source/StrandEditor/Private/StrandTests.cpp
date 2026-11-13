@@ -997,6 +997,116 @@ bool FStrandBlenderNurbsMissingKnotsTest::RunTest(const FString& Parameters)
 #include "Misc/Paths.h"
 #include "Misc/FileHelper.h"
 
+// Verify source offsets and ancestor IXform translation independently of
+// Strand's own exporter (which intentionally writes baked positions).
+THIRD_PARTY_INCLUDES_START
+#include <Alembic/AbcGeom/All.h>
+#include <Alembic/AbcCoreOgawa/All.h>
+THIRD_PARTY_INCLUDES_END
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStrandAlembicOriginHierarchyTest,
+    "Strand.Editor.Import.AlembicHierarchyAndOrigin",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FStrandAlembicOriginHierarchyTest::RunTest(const FString& Parameters)
+{
+    namespace Abc = Alembic::Abc;
+    namespace G = Alembic::AbcGeom;
+    const FString Directory = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("Strand"), TEXT("ImportTests"));
+    IFileManager::Get().MakeDirectory(*Directory, true);
+    const FString Filename = FPaths::Combine(Directory, TEXT("Strand_OffsetHierarchy.abc"));
+    try
+    {
+        const FTCHARToUTF8 Path(*Filename);
+        {
+            Abc::OArchive Archive(Alembic::AbcCoreOgawa::WriteArchive(), Path.Get());
+            G::OXform Parent(Abc::OObject(Archive, Abc::kTop), "Parent");
+            G::XformSample ParentSample;
+            ParentSample.setTranslation(Imath::V3d(100, 200, 300));
+            Parent.getSchema().set(ParentSample);
+            G::OXform Child(Parent, "Child");
+            G::XformSample ChildSample;
+            ChildSample.setTranslation(Imath::V3d(10, 20, 30));
+            Child.getSchema().set(ChildSample);
+            G::OCurves Curve(Child, "OffsetCurve");
+            const Imath::V3f Positions[] = {Imath::V3f(1, 2, 3), Imath::V3f(11, 2, 3)};
+            const int32 NumVertices = 2;
+            Curve.getSchema().set(G::OCurvesSchema::Sample(
+                Abc::P3fArraySample(Positions, 2), Abc::Int32ArraySample(&NumVertices, 1),
+                G::kLinear, G::kNonPeriodic));
+        }
+    }
+    catch (const std::exception& E)
+    {
+        AddError(FString::Printf(TEXT("Could not write hierarchy fixture: %s"), UTF8_TO_TCHAR(E.what())));
+        return false;
+    }
+    TArray<FSplineImportedCurve> Imported;
+    const bool bLoaded = SplineAssetImport::LoadAlembicCurves(Filename, nullptr, Imported);
+    TestTrue(TEXT("Read nested Alembic curve"), bLoaded);
+    if (bLoaded && TestEqual(TEXT("Exactly one curve"), Imported.Num(), 1) &&
+        TestEqual(TEXT("Both source points"), Imported[0].Points.Num(), 2))
+    {
+        // Alembic X,Y,Z -> Strand X,Z,Y with default Y-up conversion.
+        TestTrue(TEXT("First point retains source origin and both parent translations"),
+            Imported[0].Points[0].LocalPosition.Equals(FVector(111, 333, 222), 0.001));
+        TestTrue(TEXT("Second point retains source offset"),
+            Imported[0].Points[1].LocalPosition.Equals(FVector(121, 333, 222), 0.001));
+        USplineDataAsset* Asset = NewObject<USplineDataAsset>(GetTransientPackage());
+        Asset->Points = Imported[0].Points;
+        USplineComponent* Absolute = NewObject<USplineComponent>(GetTransientPackage());
+        Asset->ApplyToSplineComponentWithPlacement(Absolute,
+            EStrandCoordinateMode::Absolute, EStrandAnchorMode::PointCenter, 0);
+        TestTrue(TEXT("Absolute ignores an irrelevant anchor mode"),
+            Absolute->GetLocationAtSplinePoint(0, ESplineCoordinateSpace::Local)
+                .Equals(FVector(111, 333, 222), 0.001));
+        USplineComponent* Relative = NewObject<USplineComponent>(GetTransientPackage());
+        Asset->ApplyToSplineComponentWithPlacement(Relative,
+            EStrandCoordinateMode::Relative, EStrandAnchorMode::PointCenter, 0);
+        TestTrue(TEXT("Relative recentering only affects placement"),
+            Relative->GetLocationAtSplinePoint(0, ESplineCoordinateSpace::Local)
+                .Equals(FVector(-5, 0, 0), 0.001));
+        TestTrue(TEXT("Relative placement does not mutate authored source coordinates"),
+            Asset->Points[0].LocalPosition.Equals(FVector(111, 333, 222), 0.001));
+    }
+    IFileManager::Get().Delete(*Filename);
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStrandSourceModePropertyTest,
+    "Strand.Editor.Import.ModeSpecificProperties",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FStrandSourceModePropertyTest::RunTest(const FString& Parameters)
+{
+    USplineDataAsset* Asset = NewObject<USplineDataAsset>(GetTransientPackage());
+    const FProperty* Svg = FindFProperty<FProperty>(USplineDataAsset::StaticClass(),
+        GET_MEMBER_NAME_CHECKED(USplineDataAsset, bMirrorSvgXOnImport));
+    const FProperty* Abc = FindFProperty<FProperty>(USplineDataAsset::StaticClass(),
+        GET_MEMBER_NAME_CHECKED(USplineDataAsset, SourceUnitsToCentimeters));
+    const FProperty* Anchor = FindFProperty<FProperty>(USplineDataAsset::StaticClass(),
+        GET_MEMBER_NAME_CHECKED(USplineDataAsset, DefaultAnchorMode));
+    const FProperty* Index = FindFProperty<FProperty>(USplineDataAsset::StaticClass(),
+        GET_MEMBER_NAME_CHECKED(USplineDataAsset, DefaultAnchorPointIndex));
+    if (!TestNotNull(TEXT("SVG setting reflected"), Svg) ||
+        !TestNotNull(TEXT("Alembic setting reflected"), Abc) ||
+        !TestNotNull(TEXT("Anchor mode reflected"), Anchor) ||
+        !TestNotNull(TEXT("Point index reflected"), Index)) { return false; }
+    Asset->SourceImportFormat = TEXT("abc");
+    TestTrue(TEXT("Alembic settings editable for Alembic assets"), Asset->CanEditChange(Abc));
+    TestFalse(TEXT("SVG settings disabled on Alembic assets"), Asset->CanEditChange(Svg));
+    Asset->SourceImportFormat = TEXT("svg");
+    TestTrue(TEXT("SVG settings editable for SVG assets"), Asset->CanEditChange(Svg));
+    TestFalse(TEXT("Alembic settings disabled on SVG assets"), Asset->CanEditChange(Abc));
+    TestTrue(TEXT("Relative-only anchor property declared"),
+        Anchor->GetMetaData(TEXT("EditCondition")).Contains(TEXT("Relative")));
+    TestTrue(TEXT("Index requires Relative + PointIndex"),
+        Index->GetMetaData(TEXT("EditCondition")).Contains(TEXT("PointIndex")));
+    TestTrue(TEXT("Anchor field hidden when inactive"), Anchor->HasMetaData(TEXT("EditConditionHides")));
+    TestTrue(TEXT("Index field hidden when inactive"), Index->HasMetaData(TEXT("EditConditionHides")));
+    return true;
+}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStrandSplineAuthoringExportTest,
     "Strand.Editor.Export.SvgAndAlembicRoundTrip",
     EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
@@ -1005,15 +1115,15 @@ bool FStrandSplineAuthoringExportTest::RunTest(const FString& Parameters)
 {
     USplineDataAsset* Asset = NewObject<USplineDataAsset>(GetTransientPackage());
     FSplinePointData A, B, C;
-    A.LocalPosition = FVector::ZeroVector;
+    A.LocalPosition = FVector(500, 250, 0);
     A.LeaveTangent = FVector(100, 40, 0);
     A.ArriveTangent = FVector(100, 0, 0);
     A.PointType = ESplinePointType::CurveCustomTangent;
-    B.LocalPosition = FVector(200, 100, 0);
+    B.LocalPosition = FVector(700, 350, 0);
     B.ArriveTangent = FVector(90, 50, 0);
     B.LeaveTangent = FVector(90, 50, 0);
     B.PointType = ESplinePointType::CurveCustomTangent;
-    C.LocalPosition = FVector(300, -20, 0);
+    C.LocalPosition = FVector(800, 230, 0);
     C.ArriveTangent = FVector(40, -120, 0);
     C.PointType = ESplinePointType::CurveCustomTangent;
     Asset->Points = {A, B, C};
@@ -1049,6 +1159,8 @@ bool FStrandSplineAuthoringExportTest::RunTest(const FString& Parameters)
     TestTrue(TEXT("Alembic can be imported again"), SplineAssetImport::LoadAlembicCurves(AbcPath, nullptr, AbcCurves));
     if (TestTrue(TEXT("Alembic preserves the point count"), AbcCurves.Num() == 1 && AbcCurves[0].Points.Num() == 3))
     {
+        TestTrue(TEXT("Alembic preserves nonzero source coordinate origin"),
+            AbcCurves[0].Points[0].LocalPosition.Equals(Asset->Points[0].LocalPosition, 0.005));
         TestTrue(TEXT("Alembic preserves 3D local position orientation"),
             AbcCurves[0].Points[1].LocalPosition.Equals(Asset->Points[1].LocalPosition, 0.005));
         TestTrue(TEXT("Alembic preserves cubic leave tangent"),

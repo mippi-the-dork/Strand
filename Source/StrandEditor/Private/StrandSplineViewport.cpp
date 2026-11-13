@@ -294,11 +294,12 @@ public:
         bWidgetFrameFrozen = false;
         Invalidate();
     }
-    void SetPenCustomPlane(bool bEnabled, const FVector& Origin, const FVector& Normal)
+    void SetPenCustomPlane(bool bEnabled, const FVector& Origin, const FVector& Normal, const FVector& PreferredAxis)
     {
         bPenCustomPlane = bEnabled && !Origin.ContainsNaN() && !Normal.ContainsNaN() && !Normal.IsNearlyZero();
         PenCustomOrigin = Origin;
         PenCustomNormal = Normal.GetSafeNormal();
+        PenCustomAxisU = PreferredAxis.GetSafeNormal();
         bWidgetFrameFrozen = false;
         Invalidate();
     }
@@ -652,7 +653,8 @@ public:
             FVector Normal = bPenCustomPlane ? PenCustomNormal :
                 LockedAxis == 0 ? FVector::XAxisVector :
                 LockedAxis == 1 ? FVector::YAxisVector : FVector::ZAxisVector;
-            FVector Preferred = LockedAxis == 0 ? FVector::YAxisVector : FVector::XAxisVector;
+            FVector Preferred = bPenCustomPlane ? PenCustomAxisU :
+                LockedAxis == 0 ? FVector::YAxisVector : FVector::XAxisVector;
             FVector U, V, N;
             if (StrandPrecisionProjection::MakePlaneFrame(Normal, Preferred, U, V, N))
             {
@@ -2028,6 +2030,7 @@ private:
     bool bFrameSplineWhenReady = false;
     int32 LockedAxis = -1;
     bool bPenCustomPlane = false;
+    FVector PenCustomAxisU = FVector::XAxisVector;
     FVector PenCustomOrigin = FVector::ZeroVector;
     FVector PenCustomNormal = FVector::ZAxisVector;
     int32 PenMouseX = 0;
@@ -2280,9 +2283,9 @@ void SStrandSplineViewport::SetPenMode(bool bEnabled)
 {
     if (StrandViewportClient.IsValid()) { StrandViewportClient->SetPenMode(bEnabled); }
 }
-void SStrandSplineViewport::SetPenCustomPlane(bool bEnabled, const FVector& Origin, const FVector& Normal)
+void SStrandSplineViewport::SetPenCustomPlane(bool bEnabled, const FVector& Origin, const FVector& Normal, const FVector& PreferredAxis)
 {
-    if (StrandViewportClient.IsValid()) { StrandViewportClient->SetPenCustomPlane(bEnabled, Origin, Normal); }
+    if (StrandViewportClient.IsValid()) { StrandViewportClient->SetPenCustomPlane(bEnabled, Origin, Normal, PreferredAxis); }
 }
 
 void SStrandSplineViewport::SetPenPlane(int32 LockedAxis)

@@ -3,6 +3,27 @@
 #include "EditorFramework/AssetImportData.h"
 #endif
 
+#if WITH_EDITOR
+bool USplineDataAsset::CanEditChange(const FProperty* InProperty) const
+{
+    if (!Super::CanEditChange(InProperty) || !InProperty) { return false; }
+#if WITH_EDITORONLY_DATA
+    const FName Name = InProperty->GetFName();
+    if (Name == GET_MEMBER_NAME_CHECKED(USplineDataAsset, bMirrorSvgXOnImport))
+    {
+        return SourceImportFormat.Equals(TEXT("svg"), ESearchCase::IgnoreCase);
+    }
+    if (Name == GET_MEMBER_NAME_CHECKED(USplineDataAsset, SourceUnitsToCentimeters) ||
+        Name == GET_MEMBER_NAME_CHECKED(USplineDataAsset, bAlembicYUp) ||
+        Name == GET_MEMBER_NAME_CHECKED(USplineDataAsset, ImportSampleSeconds))
+    {
+        return SourceImportFormat.Equals(TEXT("abc"), ESearchCase::IgnoreCase);
+    }
+#endif
+    return true;
+}
+#endif
+
 FSplinePoint FSplinePointData::ToSplinePoint(int32 Index) const
 {
     return FSplinePoint(static_cast<float>(Index), LocalPosition, ArriveTangent, LeaveTangent,
