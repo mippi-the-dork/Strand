@@ -36,6 +36,22 @@ public:
      *  Does not change spline/actor scale or spline coordinates. */
     UPROPERTY(EditAnywhere, Category="Strand|Viewport", meta=(ClampMin="0.25", ClampMax="4.00", UIMin="0.25", UIMax="3.00", DisplayName="Billboard Size"))
     float StrandBillboardSize = 1.0f;
+
+    /** Explicit scene actor used by the level-only surface projection command.
+     *  Never used to project curves in the standalone asset preview scene. */
+    UPROPERTY(EditInstanceOnly, Category="Strand|Surface Projection", meta=(DisplayName="Surface Target"))
+    TObjectPtr<AActor> StrandProjectionTarget = nullptr;
+
+    /** World-space projection direction; defaults to downward world Z. */
+    UPROPERTY(EditInstanceOnly, Category="Strand|Surface Projection", meta=(DisplayName="Projection Direction"))
+    FVector StrandProjectionDirection = FVector(0, 0, -1);
+
+    UPROPERTY(EditInstanceOnly, Category="Strand|Surface Projection", meta=(ClampMin="1.0", UIMin="10", UIMax="100000", DisplayName="Max Trace Distance (cm)"))
+    float StrandProjectionMaxDistance = 10000.0f;
+
+    /** Signed offset along the collision hit normal. */
+    UPROPERTY(EditInstanceOnly, Category="Strand|Surface Projection", meta=(UIMin="-100", UIMax="100", DisplayName="Surface Clearance (cm)"))
+    float StrandProjectionClearance = 0.0f;
 #endif
 
 #if WITH_EDITOR

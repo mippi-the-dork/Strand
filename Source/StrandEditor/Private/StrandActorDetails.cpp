@@ -72,6 +72,75 @@ void FStrandActorDetails::CustomizeDetails(IDetailLayoutBuilder& Builder)
         }
     }
 
+    // Keep Strand-native actors at parity with arbitrary actors containing native
+    // USplineComponents. These controls operate on a named component, never an
+    // ambiguous "first spline". Both the single and multi actor use this path.
+    if (Actors.Num() == 1)
+    {
+        IDetailCategoryBuilder& Links = Builder.EditCategory(TEXT("Strand Asset Links"),
+            LOCTEXT("LinksCategory", "Strand Asset Links"), ECategoryPriority::Important);
+        for (const TWeakObjectPtr<USplineComponent>& Weak : Splines)
+        {
+            const FString ComponentName = Weak.IsValid() ? Weak->GetName() : TEXT("Missing Spline");
+            const FText Name = FText::FromString(ComponentName);
+            Links.AddCustomRow(FText::FromString(ComponentName + TEXT(" Asset Commands")))
+            .WholeRowContent()
+            [SNew(SHorizontalBox)
+                + SHorizontalBox::Slot().AutoWidth().Padding(2)
+                [SNew(SButton).Text(LOCTEXT("ApplyOne", "Apply Asset"))
+                    .ToolTipText(FText::Format(LOCTEXT("ApplyOneTip", "Replace the native spline '{0}' with its linked asset. Does not update the shared asset."), Name))
+                    .IsEnabled_Lambda([Weak]() { return IsValid(UStrandSplineUserData::GetAssignedAsset(Weak.Get())); })
+                    .OnClicked_Lambda([Weak]() { SplineEditorCommands::ResetComponent(Weak.Get()); return FReply::Handled(); })]
+                + SHorizontalBox::Slot().AutoWidth().Padding(2)
+                [SNew(SButton).Text(LOCTEXT("UpdateOne", "Update Asset"))
+                    .ToolTipText(FText::Format(LOCTEXT("UpdateOneTip", "Save the edited native spline '{0}' back into its linked shared Strand asset after confirmation. Other instances are not automatically updated."), Name))
+                    .IsEnabled_Lambda([Weak]() { return IsValid(UStrandSplineUserData::GetAssignedAsset(Weak.Get())); })
+                    .OnClicked_Lambda([Weak]() { SplineEditorCommands::UpdateComponentAsset(Weak.Get()); return FReply::Handled(); })]
+                + SHorizontalBox::Slot().AutoWidth().Padding(2)
+                [SNew(SButton).Text(LOCTEXT("SaveOne", "Save as New"))
+                    .ToolTipText(LOCTEXT("SaveOneTip", "Capture this native spline as a separate Strand asset."))
+                    .IsEnabled_Lambda([Weak]() { return Weak.IsValid(); })
+                    .OnClicked_Lambda([Weak]() { SplineEditorCommands::CaptureComponent(Weak); return FReply::Handled(); })]
+                + SHorizontalBox::Slot().AutoWidth().Padding(2)
+                [SNew(SButton).Text(LOCTEXT("CompareOne", "Compare"))
+                    .IsEnabled_Lambda([Weak]() { return IsValid(UStrandSplineUserData::GetAssignedAsset(Weak.Get())); })
+                    .OnClicked_Lambda([Weak]() { SplineEditorCommands::CompareComponent(Weak.Get()); return FReply::Handled(); })]
+            ];
+            // Actor-level projection is explicit. The target and its parameters
+            // live on the placed Strand actor and never in a standalone asset.
+            Links.AddCustomRow(FText::FromString(ComponentName + TEXT(" Surface Projection")))
+            .WholeRowContent()
+            [SNew(SButton).Text(FText::Format(LOCTEXT("ProjectOne", "Review Surface Projection: {0}"), Name))
+                .ToolTipText(LOCTEXT("ProjectTip", "Project this native spline's anchors onto the Surface Target assigned on the actor. First review hit/miss counts, then confirm or cancel. Uses collision on the explicit target actor; does not automatically update the linked Strand asset."))
+                .IsEnabled_Lambda([Weak, Actors]()
+                {
+                    const AStrandSplineActor* Owner = Actors[0].Get();
+                    return Weak.IsValid() && IsValid(Owner) && IsValid(Owner->StrandProjectionTarget.Get());
+                })
+                .OnClicked_Lambda([Weak, Actors]()
+                {
+                    const AStrandSplineActor* Owner = Actors[0].Get();
+                    if (IsValid(Owner))
+                    {
+                        SplineEditorCommands::ProjectComponentOntoActor(Weak.Get(),
+                            Owner->StrandProjectionTarget.Get(), Owner->StrandProjectionDirection,
+                            Owner->StrandProjectionMaxDistance, Owner->StrandProjectionClearance);
+                    }
+                    return FReply::Handled();
+                })];
+            Links.AddCustomRow(FText::FromString(ComponentName + TEXT(" Sync")))
+            .WholeRowContent()[SNew(STextBlock).Text_Lambda([Weak, ComponentName]() -> FText
+            {
+                const USplineComponent* Component = Weak.Get();
+                if (!IsValid(Component)) { return LOCTEXT("Missing", "Spline component unavailable"); }
+                const UStrandSplineUserData* Link = UStrandSplineUserData::Get(Component);
+                const FString State = !Link || !IsValid(Link->AssignedSplineAsset.Get())
+                    ? TEXT("Unlinked") : Link->IsInSync(Component) ? TEXT("In sync") : TEXT("Modified locally");
+                return FText::FromString(ComponentName + TEXT(": ") + State);
+            })];
+        }
+    }
+
     Category.AddCustomRow(LOCTEXT("Summary", "Strand Selection Summary"))
     .WholeRowContent()
     [SNew(STextBlock).Text_Lambda([Actors, Splines]() -> FText

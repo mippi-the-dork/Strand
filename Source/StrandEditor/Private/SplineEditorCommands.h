@@ -25,6 +25,8 @@ namespace SplineEditorCommands
         EStrandCoordinateMode Mode, EStrandAnchorMode AnchorMode, int32 AnchorPointIndex);
     void ResetComponent(USplineComponent* Spline);
     void UpdateComponentAsset(USplineComponent* Spline);
+    void ProjectComponentOntoActor(USplineComponent* Spline, AActor* Target,
+        const FVector& WorldDirection, float MaxDistance, float Clearance);
     void AssignAssetToComponent(TWeakObjectPtr<USplineComponent> Component, TWeakObjectPtr<USplineDataAsset> Asset);
 
     // Native, editor-only creation and assignment workflows.

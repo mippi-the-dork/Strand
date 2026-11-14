@@ -7,6 +7,7 @@
 #include "Components/SplineComponent.h"
 #include "StrandSplineUserData.h"
 #include "StrandSplineActor.h"
+#include "StrandMultiSplineActor.h"
 #include "StrandSplineMeshAdapter.h"
 #include "Components/SplineMeshComponent.h"
 #include "Components/BillboardComponent.h"
@@ -18,6 +19,65 @@
 #include "StrandSplineSelectionUtils.h"
 #include "StrandSplineFraming.h"
 #include <limits>
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStrandActorAssetUpdateParityTest,
+    "Strand.Editor.AssetLinks.NativeActorUpdateParity",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FStrandActorAssetUpdateParityTest::RunTest(const FString& Parameters)
+{
+    USplineDataAsset* Shared = NewObject<USplineDataAsset>(GetTransientPackage());
+    AStrandSplineActor* Single = NewObject<AStrandSplineActor>(GetTransientPackage());
+    AStrandMultiSplineActor* Multi = NewObject<AStrandMultiSplineActor>(GetTransientPackage());
+    TestNotNull(TEXT("Single spline exists"), Single->Spline.Get());
+    TestNotNull(TEXT("Multi spline root exists"), Multi->Spline.Get());
+    if (!Single->Spline || !Multi->Spline) { return false; }
+
+    USplineComponent* Author = Single->Spline;
+    Author->ClearSplinePoints(false);
+    Author->AddPoint(FSplinePoint(0, FVector(100,200,300)), false);
+    Author->AddPoint(FSplinePoint(1, FVector(200,300,400)), false);
+    Author->UpdateSpline();
+    Shared->SerializeFromSplineComponent(Author);
+    UStrandSplineUserData::AssignAsset(Author, Shared);
+    TestTrue(TEXT("Single actor starts in sync"), UStrandSplineUserData::Get(Author)->IsInSync(Author));
+
+    USplineComponent* Other = Multi->Spline;
+    UStrandSplineUserData::AssignAsset(Other, Shared);
+    Shared->ApplyToSplineComponentWithPlacement(Other,
+        EStrandCoordinateMode::Absolute, EStrandAnchorMode::PointCenter, 0);
+    TestTrue(TEXT("Multi actor root starts in sync"), UStrandSplineUserData::Get(Other)->IsInSync(Other));
+
+    Author->SetLocationAtSplinePoint(1, FVector(490,500,510), ESplineCoordinateSpace::Local);
+    TestFalse(TEXT("Native edit becomes modified"), UStrandSplineUserData::Get(Author)->IsInSync(Author));
+    TestTrue(TEXT("Other native component stays synced before update"),
+        UStrandSplineUserData::Get(Other)->IsInSync(Other));
+
+    const UStrandSplineUserData* Link = UStrandSplineUserData::Get(Author);
+    Shared->SerializeFromSplineComponentWithPlacement(Author,
+        Link->CoordinateMode, Link->AnchorMode, Link->AnchorPointIndex);
+    TestTrue(TEXT("Capture returns authored source to in-sync"), Link->IsInSync(Author));
+    TestFalse(TEXT("Other linked actor intentionally becomes stale"),
+        UStrandSplineUserData::Get(Other)->IsInSync(Other));
+    Shared->ApplyToSplineComponentWithPlacement(Other,
+        EStrandCoordinateMode::Absolute, EStrandAnchorMode::PointCenter, 0);
+    TestTrue(TEXT("Apply restores secondary native actor parity"),
+        UStrandSplineUserData::Get(Other)->IsInSync(Other));
+
+    Multi->AddSplineComponent();
+    TArray<USplineComponent*> Components;
+    Multi->GetComponents<USplineComponent>(Components);
+    TestTrue(TEXT("Multi spline actor exposes multiple native components"), Components.Num() >= 2);
+    for (USplineComponent* Component : Components)
+    {
+        if (Component != Other)
+        {
+            TestNull(TEXT("Additional spline has no implicit asset link"),
+                UStrandSplineUserData::GetAssignedAsset(Component));
+        }
+    }
+    return true;
+}
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSplineAssetRoundTripTest,
     "Strand.Data.RoundTripPointData", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)

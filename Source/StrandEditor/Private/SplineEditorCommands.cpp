@@ -7,6 +7,8 @@
 #include "StrandSplineRefresh.h"
 #include "EngineUtils.h"
 #include "Components/SplineComponent.h"
+#include "Components/PrimitiveComponent.h"
+#include "Engine/World.h"
 #include "LandscapeSplinesComponent.h"
 #include "LandscapeSplineControlPoint.h"
 #include "GameFramework/Actor.h"
@@ -26,6 +28,8 @@
 #include "Framework/Application/SlateApplication.h"
 #include "Misc/Paths.h"
 #include "Widgets/SWindow.h"
+#include "Framework/Notifications/NotificationManager.h"
+#include "Widgets/Notifications/SNotificationList.h"
 #include "Widgets/SBoxPanel.h"
 #include "Widgets/Layout/SBox.h"
 #include "Widgets/Text/STextBlock.h"
@@ -520,6 +524,77 @@ void SplineEditorCommands::ResetComponent(USplineComponent* Spline)
     ApplyLinked(Asset, Spline);
 }
 
+// This deliberately operates on a placed native spline instance and an EXPLICIT
+// actor target. Asset-editor preview worlds are never searched for scene geometry.
+// Reviewing the hit count is non-destructive; only confirmation mutates geometry.
+void SplineEditorCommands::ProjectComponentOntoActor(USplineComponent* Spline, AActor* Target,
+    const FVector& WorldDirection, float MaxDistance, float Clearance)
+{
+    if (!IsValid(Spline) || !IsValid(Target) || !IsValid(Spline->GetOwner()) ||
+        Target == Spline->GetOwner() || !FMath::IsFinite(MaxDistance) || MaxDistance <= 0.0f ||
+        !FMath::IsFinite(Clearance) || WorldDirection.ContainsNaN() || WorldDirection.IsNearlyZero())
+    {
+        Message(TEXT("Choose a different valid surface target actor, a nonzero world direction, and a positive trace distance."));
+        return;
+    }
+    TArray<UPrimitiveComponent*> Candidates;
+    Target->GetComponents<UPrimitiveComponent>(Candidates);
+    if (Candidates.IsEmpty())
+    {
+        Message(TEXT("The chosen actor has no traceable primitive components."));
+        return;
+    }
+    const FVector Direction = WorldDirection.GetSafeNormal();
+    const FTransform SplineTransform = Spline->GetComponentTransform();
+    struct FProjectedAnchor { int32 Index; FVector NewLocalPosition; };
+    TArray<FProjectedAnchor> Plan;
+    const int32 Count = Spline->GetNumberOfSplinePoints();
+    for (int32 Index = 0; Index < Count; ++Index)
+    {
+        const FVector Origin = Spline->GetLocationAtSplinePoint(Index, ESplineCoordinateSpace::World);
+        const FVector End = Origin + Direction * MaxDistance;
+        double BestDistance = TNumericLimits<double>::Max();
+        FVector BestPosition = FVector::ZeroVector;
+        bool bFound = false;
+        for (UPrimitiveComponent* Component : Candidates)
+        {
+            if (!IsValid(Component) || !Component->IsRegistered()) { continue; }
+            FHitResult Hit;
+            const FCollisionQueryParams Params(SCENE_QUERY_STAT(StrandSurfaceProjection), true);
+            if (Component->LineTraceComponent(Hit, Origin, End, Params) && Hit.bBlockingHit &&
+                Hit.Distance < BestDistance && !Hit.ImpactNormal.IsNearlyZero())
+            {
+                BestDistance = Hit.Distance;
+                BestPosition = Hit.ImpactPoint + Hit.ImpactNormal.GetSafeNormal() * Clearance;
+                bFound = true;
+            }
+        }
+        if (bFound)
+        {
+            Plan.Add({Index, SplineTransform.InverseTransformPosition(BestPosition)});
+        }
+    }
+    if (Plan.IsEmpty())
+    {
+        Message(TEXT("No spline points intersect the target actor's traceable collision. Check target collision, trace direction and maximum distance."));
+        return;
+    }
+    const FString Prompt = FString::Printf(TEXT("Project %d of %d spline anchors onto '%s'?\n\n%d missed points will remain unchanged.\nClearance: %.2f cm along hit normals.\n\nThis edits the placed native spline only. The linked Strand asset is NOT changed; use Update Asset separately to save your result.\n\nApply projection?"),
+        Plan.Num(), Count, *Target->GetActorLabel(), Count - Plan.Num(), Clearance);
+    if (!Confirm(FText::FromString(Prompt))) { return; }
+    const FScopedTransaction Transaction(LOCTEXT("ProjectSurfaceTransaction", "Project Strand Spline to Surface"));
+    if (AActor* Owner = Spline->GetOwner()) { Owner->Modify(); }
+    Spline->Modify();
+    for (const FProjectedAnchor& Edit : Plan)
+    {
+        Spline->SetLocationAtSplinePoint(Edit.Index, Edit.NewLocalPosition,
+            ESplineCoordinateSpace::Local, false);
+    }
+    Spline->UpdateSpline();
+    Spline->MarkPackageDirty();
+    StrandSplineRefresh::NotifySplineChanged(Spline);
+}
+
 void SplineEditorCommands::UpdateComponentAsset(USplineComponent* Spline)
 {
     USplineDataAsset* Asset = UStrandSplineUserData::GetAssignedAsset(Spline);
@@ -576,7 +651,12 @@ void SplineEditorCommands::UpdateComponentAsset(USplineComponent* Spline)
             Placement->CoordinateMode, Placement->AnchorMode, Placement->AnchorPointIndex);
     }
     else { Asset->SerializeFromSplineComponent(Spline); }
-    SaveAsset(Asset);
+    if (SaveAsset(Asset))
+    {
+        const FNotificationInfo Notice(FText::Format(
+            LOCTEXT("UpdateSucceeded", "Updated Strand asset: {0}"), FText::FromString(Asset->GetName())));
+        FSlateNotificationManager::Get().AddNotification(Notice);
+    }
 }
 
 void SplineEditorCommands::AssignAssetToComponent(TWeakObjectPtr<USplineComponent> WeakComponent,
