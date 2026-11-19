@@ -8,6 +8,24 @@ class USplineComponent;
 enum class EStrandCoordinateMode : uint8;
 enum class EStrandAnchorMode : uint8;
 
+enum class EStrandProjectionTargetScope : uint8;
+enum class EStrandProjectionRayMode : uint8;
+
+struct FStrandProjectionOptions
+{
+    EStrandProjectionTargetScope TargetScope;
+    EStrandProjectionRayMode RayMode;
+    TWeakObjectPtr<AActor> Target;
+    TArray<TWeakObjectPtr<AActor>> Targets;
+    FVector WorldDirection = FVector(0, 0, -1);
+    float MaxDistance = 10000.0f;
+    float Clearance = 0.0f;
+    float Strength = 1.0f;
+    int32 FirstAnchor = 0;
+    int32 LastAnchor = -1;
+    bool bAlignNormals = false;
+};
+
 namespace SplineEditorCommands
 {
     TArray<AActor*> SelectedActors();
@@ -25,8 +43,7 @@ namespace SplineEditorCommands
         EStrandCoordinateMode Mode, EStrandAnchorMode AnchorMode, int32 AnchorPointIndex);
     void ResetComponent(USplineComponent* Spline);
     void UpdateComponentAsset(USplineComponent* Spline);
-    void ProjectComponentOntoActor(USplineComponent* Spline, AActor* Target,
-        const FVector& WorldDirection, float MaxDistance, float Clearance);
+    void ProjectComponentOntoScene(USplineComponent* Spline, const FStrandProjectionOptions& Options);
     void AssignAssetToComponent(TWeakObjectPtr<USplineComponent> Component, TWeakObjectPtr<USplineDataAsset> Asset);
 
     // Native, editor-only creation and assignment workflows.

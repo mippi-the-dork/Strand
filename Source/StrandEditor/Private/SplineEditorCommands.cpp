@@ -1,10 +1,15 @@
 #include "SplineEditorCommands.h"
+#include "StrandSplineActor.h"
+#include "Editor/EditorEngine.h"
+#include "LevelEditorViewport.h"
 #include "SplineDataAsset.h"
 #include "StrandSplineUserData.h"
 #include "SplineDataAssetFactory.h"
 #include "SplineLandscapeAdapter.h"
 #include "StrandPlacement.h"
 #include "StrandSplineRefresh.h"
+#include "StrandSurfaceProjectionMath.h"
+#include "StrandSurfaceTargetTrace.h"
 #include "EngineUtils.h"
 #include "Components/SplineComponent.h"
 #include "Components/PrimitiveComponent.h"
@@ -524,75 +529,308 @@ void SplineEditorCommands::ResetComponent(USplineComponent* Spline)
     ApplyLinked(Asset, Spline);
 }
 
-// This deliberately operates on a placed native spline instance and an EXPLICIT
-// actor target. Asset-editor preview worlds are never searched for scene geometry.
-// Reviewing the hit count is non-destructive; only confirmation mutates geometry.
-void SplineEditorCommands::ProjectComponentOntoActor(USplineComponent* Spline, AActor* Target,
-    const FVector& WorldDirection, float MaxDistance, float Clearance)
+// Operates on an explicit level target. This preview is a transient spline component
+// owned by the source actor: no asset, level package, or transaction is modified until Apply.
+void SplineEditorCommands::ProjectComponentOntoScene(USplineComponent* Spline,
+    const FStrandProjectionOptions& Options)
 {
-    if (!IsValid(Spline) || !IsValid(Target) || !IsValid(Spline->GetOwner()) ||
-        Target == Spline->GetOwner() || !FMath::IsFinite(MaxDistance) || MaxDistance <= 0.0f ||
-        !FMath::IsFinite(Clearance) || WorldDirection.ContainsNaN() || WorldDirection.IsNearlyZero())
+    const bool bAllScene = Options.TargetScope == EStrandProjectionTargetScope::EntireLevel;
+    TArray<AActor*> AllowedActors;
+    if (Options.TargetScope == EStrandProjectionTargetScope::SingleActor)
     {
-        Message(TEXT("Choose a different valid surface target actor, a nonzero world direction, and a positive trace distance."));
-        return;
+        if (Options.Target.IsValid()) { AllowedActors.Add(Options.Target.Get()); }
     }
-    TArray<UPrimitiveComponent*> Candidates;
-    Target->GetComponents<UPrimitiveComponent>(Candidates);
-    if (Candidates.IsEmpty())
+    else if (Options.TargetScope == EStrandProjectionTargetScope::ActorSet)
     {
-        Message(TEXT("The chosen actor has no traceable primitive components."));
-        return;
-    }
-    const FVector Direction = WorldDirection.GetSafeNormal();
-    const FTransform SplineTransform = Spline->GetComponentTransform();
-    struct FProjectedAnchor { int32 Index; FVector NewLocalPosition; };
-    TArray<FProjectedAnchor> Plan;
-    const int32 Count = Spline->GetNumberOfSplinePoints();
-    for (int32 Index = 0; Index < Count; ++Index)
-    {
-        const FVector Origin = Spline->GetLocationAtSplinePoint(Index, ESplineCoordinateSpace::World);
-        const FVector End = Origin + Direction * MaxDistance;
-        double BestDistance = TNumericLimits<double>::Max();
-        FVector BestPosition = FVector::ZeroVector;
-        bool bFound = false;
-        for (UPrimitiveComponent* Component : Candidates)
+        for (const TWeakObjectPtr<AActor>& Actor : Options.Targets)
         {
-            if (!IsValid(Component) || !Component->IsRegistered()) { continue; }
-            FHitResult Hit;
-            const FCollisionQueryParams Params(SCENE_QUERY_STAT(StrandSurfaceProjection), true);
-            if (Component->LineTraceComponent(Hit, Origin, End, Params) && Hit.bBlockingHit &&
-                Hit.Distance < BestDistance && !Hit.ImpactNormal.IsNearlyZero())
+            if (Actor.IsValid()) { AllowedActors.AddUnique(Actor.Get()); }
+        }
+    }
+    if (!IsValid(Spline) || !IsValid(Spline->GetOwner()) ||
+        (!bAllScene && AllowedActors.IsEmpty()) ||
+        !FMath::IsFinite(Options.MaxDistance) || Options.MaxDistance <= 0.0f ||
+        !FMath::IsFinite(Options.Clearance) || !FMath::IsFinite(Options.Strength) ||
+        Options.Strength < 0.0f || Options.Strength > 1.0f)
+    {
+        Message(TEXT("Choose a valid source, target scope, distance and strength between 0 and 1."));
+        return;
+    }
+    for (AActor* Candidate : AllowedActors)
+    {
+        if (Candidate == Spline->GetOwner())
+        {
+            Message(TEXT("The source actor cannot be included as a surface target."));
+            return;
+        }
+    }
+    const bool bCamera = Options.RayMode != EStrandProjectionRayMode::WorldDirection;
+    FVector CameraLocation = FVector::ZeroVector;
+    FRotator CameraRotation = FRotator::ZeroRotator;
+    if (bCamera)
+    {
+        // UEditorEngine has no GetLevelViewportCameraInfo API in UE 5.8.
+        // Read the actual perspective level viewport client rather than the
+        // Strand asset preview camera, which has no level collision context.
+        const FLevelEditorViewportClient* CameraViewport = nullptr;
+        if (GEditor)
+        {
+            for (FLevelEditorViewportClient* Client : GEditor->GetLevelViewportClients())
             {
-                BestDistance = Hit.Distance;
-                BestPosition = Hit.ImpactPoint + Hit.ImpactNormal.GetSafeNormal() * Clearance;
-                bFound = true;
+                if (Client && Client->Viewport && Client->IsPerspective() &&
+                    Client->GetWorld() == Spline->GetWorld())
+                {
+                    CameraViewport = Client;
+                    break;
+                }
             }
         }
+        if (!CameraViewport)
+        {
+            Message(TEXT("Camera projection requires a perspective Level Editor viewport for the source spline's world."));
+            return;
+        }
+        CameraLocation = CameraViewport->GetViewLocation();
+        CameraRotation = CameraViewport->GetViewRotation();
+    }
+    const FVector WorldDirection = bCamera ? CameraRotation.Vector() : Options.WorldDirection;
+    const float MaxDistance = Options.MaxDistance;
+    const float Clearance = Options.Clearance;
+    const float Strength = Options.Strength;
+    const int32 FirstAnchor = Options.FirstAnchor;
+    const int32 LastAnchor = Options.LastAnchor;
+    const bool bAlignNormals = Options.bAlignNormals;
+    if (WorldDirection.ContainsNaN() || WorldDirection.IsNearlyZero())
+    {
+        Message(TEXT("Projection direction must be nonzero and finite."));
+        return;
+    }
+    const int32 Count = Spline->GetNumberOfSplinePoints();
+    const int32 First = FMath::Max(0, FirstAnchor);
+    const int32 Last = LastAnchor < 0 ? Count - 1 : FMath::Min(Count - 1, LastAnchor);
+    if (First > Last)
+    {
+        Message(TEXT("The projection anchor range is empty. Check First/Last Anchor Index."));
+        return;
+    }
+    UWorld* World = Spline->GetWorld();
+    if (!IsValid(World))
+    {
+        Message(TEXT("Projection requires an active level world."));
+        return;
+    }
+    int32 RegisteredPrimitives = 0;
+    int32 QueryEnabledPrimitives = 0;
+    FBox TargetBounds(ForceInit);
+    for (AActor* Actor : AllowedActors)
+    {
+        TArray<UPrimitiveComponent*> Components;
+        Actor->GetComponents<UPrimitiveComponent>(Components);
+        for (UPrimitiveComponent* Component : Components)
+        {
+            if (!IsValid(Component) || !Component->IsRegistered()) { continue; }
+            ++RegisteredPrimitives;
+            if (Component->K2_IsQueryCollisionEnabled()) { ++QueryEnabledPrimitives; }
+        }
+        TargetBounds += Actor->GetComponentsBoundingBox(true);
+    }
+    int32 RaysCrossingBounds = 0;
+    FVector FirstMissOrigin = FVector::ZeroVector;
+    bool bHasMiss = false;
+
+    struct FProjectedAnchor
+    {
+        int32 Index;
+        FVector OldLocalPosition;
+        FVector NewLocalPosition;
+        FVector LocalNormal;
+    };
+    TArray<FProjectedAnchor> Plan;
+    const FVector Direction = WorldDirection.GetSafeNormal();
+    const FTransform SourceTransform = Spline->GetComponentTransform();
+    for (int32 Index = First; Index <= Last; ++Index)
+    {
+        if (!StrandSurfaceProjectionMath::IsAnchorEligible(Index, Count, FirstAnchor, LastAnchor)) { continue; }
+        const FVector Origin = Spline->GetLocationAtSplinePoint(Index, ESplineCoordinateSpace::World);
+        FVector Start, End;
+        const bool bRayValid = StrandSurfaceProjectionMath::MakeProjectionRay(
+            Origin, CameraLocation, Direction,
+            Options.RayMode == EStrandProjectionRayMode::CameraProjection,
+            MaxDistance, Start, End);
+        if (bRayValid && !bAllScene &&
+            StrandSurfaceTargetTrace::RayIntersectsBounds(TargetBounds, Start, End))
+        {
+            ++RaysCrossingBounds;
+        }
+        FHitResult BestHit;
+        const bool bFound = bRayValid && StrandSurfaceTargetTrace::FindSceneHit(
+            World, Spline->GetOwner(), AllowedActors, bAllScene, Start, End, BestHit);
+        if (!bFound && !bHasMiss)
+        {
+            bHasMiss = true;
+            FirstMissOrigin = Origin;
+        }
+        const FVector BestNormal = bFound ? BestHit.ImpactNormal.GetSafeNormal() : FVector::UpVector;
+        const FVector BestPosition = bFound
+            ? BestHit.ImpactPoint + BestNormal * Clearance : FVector::ZeroVector;
         if (bFound)
         {
-            Plan.Add({Index, SplineTransform.InverseTransformPosition(BestPosition)});
+            const FVector OriginalLocal = Spline->GetLocationAtSplinePoint(Index, ESplineCoordinateSpace::Local);
+            // Blend in world space so Strength behaves consistently with rotated or
+            // nonuniformly scaled spline owners.
+            const FVector BlendedLocal = StrandSurfaceProjectionMath::BlendWorldHitToLocal(
+                SourceTransform, Origin, BestPosition, Strength);
+            const FVector LocalNormal = StrandSurfaceProjectionMath::WorldNormalToLocal(SourceTransform, BestNormal);
+            Plan.Add({Index, OriginalLocal, BlendedLocal, LocalNormal});
         }
     }
     if (Plan.IsEmpty())
     {
-        Message(TEXT("No spline points intersect the target actor's traceable collision. Check target collision, trace direction and maximum distance."));
+        const FVector Center = TargetBounds.IsValid ? TargetBounds.GetCenter() : FVector::ZeroVector;
+        const FVector Extent = TargetBounds.IsValid ? TargetBounds.GetExtent() : FVector::ZeroVector;
+        const FString Detail = FString::Printf(
+            TEXT("No anchors hit the configured scene collision.\n\n")
+            TEXT("Target: %s\nTarget bounds center: %s\nTarget bounds extent: %s\n")
+            TEXT("Registered primitives: %d  |  Query-collision enabled: %d\n")
+            TEXT("Anchor rays crossing target bounds: %d / %d\n")
+            TEXT("First missed anchor position: %s\nDirection: %s  |  Max distance: %.1f cm\n\n")
+            TEXT("Bounds crossings apply only to explicit targets. For all-scene traces, verify there is query-enabled world geometry in front of each ray. ")
+            TEXT("If bounds crossings are positive but hits are zero, check target geometry, collision enabled for Query, and whether the ray starts inside the surface."),
+            bAllScene ? TEXT("All Scene Collision") : *FString::JoinBy(AllowedActors, TEXT(", "), [](const AActor* A) { return A->GetActorLabel(); }),
+            *Center.ToCompactString(), *Extent.ToCompactString(),
+            RegisteredPrimitives, QueryEnabledPrimitives, RaysCrossingBounds, Last - First + 1,
+            *(bHasMiss ? FirstMissOrigin : FVector::ZeroVector).ToCompactString(),
+            *Direction.ToCompactString(), MaxDistance);
+        UE_LOG(LogTemp, Warning, TEXT("Strand Surface Projection: %s"), *Detail);
+        Message(Detail);
         return;
     }
-    const FString Prompt = FString::Printf(TEXT("Project %d of %d spline anchors onto '%s'?\n\n%d missed points will remain unchanged.\nClearance: %.2f cm along hit normals.\n\nThis edits the placed native spline only. The linked Strand asset is NOT changed; use Update Asset separately to save your result.\n\nApply projection?"),
-        Plan.Num(), Count, *Target->GetActorLabel(), Count - Plan.Num(), Clearance);
-    if (!Confirm(FText::FromString(Prompt))) { return; }
-    const FScopedTransaction Transaction(LOCTEXT("ProjectSurfaceTransaction", "Project Strand Spline to Surface"));
-    if (AActor* Owner = Spline->GetOwner()) { Owner->Modify(); }
-    Spline->Modify();
-    for (const FProjectedAnchor& Edit : Plan)
+
+    // A ghost spline is intentionally NOT AddInstanceComponent'd: it is transient,
+    // unrecorded, non-colliding, and does not become another editable actor spline.
+    AActor* Owner = Spline->GetOwner();
+    USplineComponent* Ghost = NewObject<USplineComponent>(Owner, NAME_None, RF_Transient);
+    Ghost->SetMobility(EComponentMobility::Movable);
+    Ghost->SetupAttachment(Owner->GetRootComponent());
+    Ghost->RegisterComponentWithWorld(Owner->GetWorld());
+    Ghost->SetWorldTransform(SourceTransform);
+    Ghost->ClearSplinePoints(false);
+    for (int32 Index = 0; Index < Count; ++Index)
     {
-        Spline->SetLocationAtSplinePoint(Edit.Index, Edit.NewLocalPosition,
-            ESplineCoordinateSpace::Local, false);
+        FSplinePoint Point = Spline->GetSplinePointAt(Index, ESplineCoordinateSpace::Local);
+        for (const FProjectedAnchor& Edit : Plan)
+        {
+            if (Edit.Index == Index) { Point.Position = Edit.NewLocalPosition; break; }
+        }
+        Ghost->AddPoint(Point, false);
     }
-    Spline->UpdateSpline();
-    Spline->MarkPackageDirty();
-    StrandSplineRefresh::NotifySplineChanged(Spline);
+    Ghost->SetClosedLoop(Spline->IsClosedLoop(), false);
+    Ghost->UpdateSpline();
+    Ghost->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+    Ghost->SetHiddenInGame(true);
+    Ghost->SetUnselectedSplineSegmentColor(FLinearColor(0.75f, 0.24f, 1.0f, 0.65f));
+    Ghost->SetSelectedSplineSegmentColor(FLinearColor(0.75f, 0.24f, 1.0f, 0.65f));
+    Ghost->SetDrawDebug(true);
+
+    const TWeakObjectPtr<USplineComponent> WeakSource(Spline);
+    const TWeakObjectPtr<USplineComponent> WeakGhost(Ghost);
+    TArray<TWeakObjectPtr<AActor>> WeakTargets;
+    TArray<FTransform> TargetTransforms;
+    for (AActor* A : AllowedActors)
+    {
+        WeakTargets.Add(A);
+        TargetTransforms.Add(A->GetActorTransform());
+    }
+    const TWeakObjectPtr<AActor> WeakOwner(Owner);
+    const FTransform PreviewTransform = SourceTransform;
+
+    const int32 Misses = Last - First + 1 - Plan.Num();
+    const FString Summary = FString::Printf(
+        TEXT("Surface: %s  |  Hit: %d  |  Miss: %d  |  Range: %d-%d\n")
+        TEXT("Strength: %.0f%%  |  Clearance: %.2f cm  |  Align Up: %s\n\n")
+        TEXT("Purple: projected preview. The original spline and linked asset are untouched.\n")
+        TEXT("Apply modifies this placed spline only; use Update Asset to save to a shared Strand asset."),
+        bAllScene ? TEXT("All Scene Collision") : *FString::JoinBy(AllowedActors, TEXT(", "), [](const AActor* A) { return A->GetActorLabel(); }),
+        Plan.Num(), Misses, First, Last,
+        Strength * 100.0f, Clearance, bAlignNormals ? TEXT("Yes") : TEXT("No"));
+    TSharedRef<SWindow> Window = SNew(SWindow)
+        .Title(LOCTEXT("ProjectionWindowTitle", "Strand Surface Projection Preview"))
+        .ClientSize(FVector2D(530, 210))
+        .SupportsMaximize(false).SupportsMinimize(false);
+    const TWeakPtr<SWindow> WeakWindow = Window;
+    Window->SetOnWindowClosed(FOnWindowClosed::CreateLambda([WeakGhost](const TSharedRef<SWindow>&)
+    {
+        if (USplineComponent* Component = WeakGhost.Get()) { Component->DestroyComponent(); }
+    }));
+    Window->SetContent(
+        SNew(SBox).Padding(16)
+        [
+            SNew(SVerticalBox)
+            + SVerticalBox::Slot().FillHeight(1).Padding(0, 0, 0, 12)
+            [SNew(STextBlock).Text(FText::FromString(Summary)).AutoWrapText(true)]
+            + SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Right)
+            [
+                SNew(SHorizontalBox)
+                + SHorizontalBox::Slot().AutoWidth().Padding(3)
+                [SNew(SButton).Text(LOCTEXT("ProjectionCancel", "Cancel"))
+                    .OnClicked_Lambda([WeakWindow]()
+                    {
+                        if (const TSharedPtr<SWindow> Preview = WeakWindow.Pin()) { Preview->RequestDestroyWindow(); }
+                        return FReply::Handled();
+                    })]
+                + SHorizontalBox::Slot().AutoWidth().Padding(3)
+                [SNew(SButton).Text(LOCTEXT("ProjectionApply", "Apply Projection"))
+                    .OnClicked_Lambda([WeakWindow, WeakSource, WeakTargets, TargetTransforms, WeakOwner, PreviewTransform, Plan, Count, bAlignNormals]()
+                    {
+                        USplineComponent* Source = WeakSource.Get();
+                        bool bTargetsChanged = false;
+                        for (int32 TargetIndex = 0; TargetIndex < WeakTargets.Num(); ++TargetIndex)
+                        {
+                            if (!WeakTargets[TargetIndex].IsValid() ||
+                                !WeakTargets[TargetIndex]->GetActorTransform().Equals(TargetTransforms[TargetIndex]))
+                            { bTargetsChanged = true; break; }
+                        }
+                        if (!IsValid(Source) || !WeakOwner.IsValid() || bTargetsChanged ||
+                            Source->GetNumberOfSplinePoints() != Count ||
+                            !Source->GetComponentTransform().Equals(PreviewTransform))
+                        {
+                            Message(TEXT("The source or target changed during preview. Review the projection again."));
+                            if (const TSharedPtr<SWindow> Preview = WeakWindow.Pin()) { Preview->RequestDestroyWindow(); }
+                            return FReply::Handled();
+                        }
+                        for (const FProjectedAnchor& Edit : Plan)
+                        {
+                            if (!Source->GetLocationAtSplinePoint(Edit.Index, ESplineCoordinateSpace::Local)
+                                .Equals(Edit.OldLocalPosition, 0.001))
+                            {
+                                Message(TEXT("Spline anchors changed during preview. Review again before applying."));
+                                if (const TSharedPtr<SWindow> Preview = WeakWindow.Pin()) { Preview->RequestDestroyWindow(); }
+                                return FReply::Handled();
+                            }
+                        }
+                        const FScopedTransaction Transaction(LOCTEXT("ProjectSurfaceTransaction", "Project Strand Spline to Surface"));
+                        if (AActor* SourceOwner = Source->GetOwner()) { SourceOwner->Modify(); }
+                        Source->Modify();
+                        for (const FProjectedAnchor& Edit : Plan)
+                        {
+                            Source->SetLocationAtSplinePoint(Edit.Index, Edit.NewLocalPosition,
+                                ESplineCoordinateSpace::Local, false);
+                            if (bAlignNormals)
+                            {
+                                Source->SetUpVectorAtSplinePoint(Edit.Index, Edit.LocalNormal,
+                                    ESplineCoordinateSpace::Local, false);
+                            }
+                        }
+                        Source->UpdateSpline();
+                        Source->MarkPackageDirty();
+                        StrandSplineRefresh::NotifySplineChanged(Source);
+                        if (const TSharedPtr<SWindow> Preview = WeakWindow.Pin()) { Preview->RequestDestroyWindow(); }
+                        return FReply::Handled();
+                    })]
+            ]
+        ]);
+    // Nonmodal: the artist can inspect the ghost in the Level viewport before Apply.
+    FSlateApplication::Get().AddWindow(Window);
 }
 
 void SplineEditorCommands::UpdateComponentAsset(USplineComponent* Spline)
@@ -647,7 +885,7 @@ void SplineEditorCommands::UpdateComponentAsset(USplineComponent* Spline)
     const UStrandSplineUserData* Placement = UStrandSplineUserData::Get(Spline);
     if (Placement)
     {
-        Asset->SerializeFromSplineComponentWithPlacement(Spline,
+        Asset->UpdateFromSplineComponentWithPlacement(Spline,
             Placement->CoordinateMode, Placement->AnchorMode, Placement->AnchorPointIndex);
     }
     else { Asset->SerializeFromSplineComponent(Spline); }

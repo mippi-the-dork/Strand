@@ -1,6 +1,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "StrandProjectSettings.h"
 #include "Components/SplineComponent.h"
 #include "Engine/DataAsset.h"
 #include "StrandSplinePlacement.h"
@@ -83,6 +84,15 @@ public:
     UPROPERTY(EditAnywhere, Category="Strand|Import", meta=(DisplayName="Mirror SVG X on Import"))
     bool bMirrorSvgXOnImport = true;
 
+    /** Which source SVG canvas point is treated as the curve origin. Independent of future project-default changes. */
+    UPROPERTY(EditAnywhere, Category="Strand|Import", meta=(DisplayName="SVG Canvas Origin"))
+    EStrandSvgCanvasOrigin SvgImportCanvasOrigin = EStrandSvgCanvasOrigin::TopLeft;
+
+    /** Uniform scale in centimeters per SVG user unit, applied to points and Bezier tangents on import/reimport.
+     * This is not an instance placement scale. Reimport always starts from source geometry. */
+    UPROPERTY(EditAnywhere, Category="Strand|Import", meta=(DisplayName="SVG Import Scale", ClampMin="0.000001", UIMin="0.01", UIMax="100"))
+    float SvgImportScale = 1.0f;
+
     /** Source coordinate units to Unreal centimeters; Alembic does not standardize units. */
     UPROPERTY(EditAnywhere, Category="Strand|Import", meta=(ClampMin="0.000001"))
     float SourceUnitsToCentimeters = 1.0f;
@@ -128,6 +138,13 @@ public:
     /** Reverse placement transform before saving modified native points back into the shared asset. */
     UFUNCTION(BlueprintCallable, Category="Strand|Placement")
     void SerializeFromSplineComponentWithPlacement(const USplineComponent* SourceComponent,
+        EStrandCoordinateMode CoordinateMode, EStrandAnchorMode AnchorMode, int32 AnchorPointIndex);
+
+    /** Capture native edits and reconcile a moving Relative anchor without changing world-space spline geometry.
+     *  Unlike SerializeFromSplineComponentWithPlacement, this also updates the SOURCE component's
+     *  origin when the chosen placement anchor moves. Use this for the editor Update Asset action. */
+    UFUNCTION(BlueprintCallable, Category="Strand|Placement")
+    void UpdateFromSplineComponentWithPlacement(USplineComponent* SourceComponent,
         EStrandCoordinateMode CoordinateMode, EStrandAnchorMode AnchorMode, int32 AnchorPointIndex);
 
     UFUNCTION(BlueprintPure, Category="Strand")

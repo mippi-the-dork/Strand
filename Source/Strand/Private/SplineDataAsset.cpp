@@ -9,7 +9,9 @@ bool USplineDataAsset::CanEditChange(const FProperty* InProperty) const
     if (!Super::CanEditChange(InProperty) || !InProperty) { return false; }
 #if WITH_EDITORONLY_DATA
     const FName Name = InProperty->GetFName();
-    if (Name == GET_MEMBER_NAME_CHECKED(USplineDataAsset, bMirrorSvgXOnImport))
+    if ((Name == GET_MEMBER_NAME_CHECKED(USplineDataAsset, bMirrorSvgXOnImport) ||
+        Name == GET_MEMBER_NAME_CHECKED(USplineDataAsset, SvgImportScale) ||
+        Name == GET_MEMBER_NAME_CHECKED(USplineDataAsset, SvgImportCanvasOrigin)))
     {
         return SourceImportFormat.Equals(TEXT("svg"), ESearchCase::IgnoreCase);
     }
@@ -38,13 +40,15 @@ void USplineDataAsset::SerializeFromSplineComponent(const USplineComponent* Sour
     Points.Reset(Count);
     for (int32 I = 0; I < Count; ++I)
     {
-        // GetSplinePointAt returns the raw per-point data, unlike derived spline tangents.
+        // Use native spline-point data for positions/tangents, but read the authored
+        // rotation key separately: GetSplinePointAt may return an evaluated frame.
         const FSplinePoint Point = SourceComponent->GetSplinePointAt(I, ESplineCoordinateSpace::Local);
         FSplinePointData Data;
         Data.LocalPosition = Point.Position;
         Data.ArriveTangent = Point.ArriveTangent;
         Data.LeaveTangent = Point.LeaveTangent;
-        Data.LocalRotation = Point.Rotation;
+        Data.LocalRotation = SourceComponent->SplineCurves.Rotation.Points.IsValidIndex(I)
+            ? SourceComponent->SplineCurves.Rotation.Points[I].OutVal.Rotator() : Point.Rotation;
         Data.LocalScale = Point.Scale;
         Data.PointType = SourceComponent->GetSplinePointType(I);
         Data.HandleMode = (Data.PointType.GetValue() == ESplinePointType::Curve ||
@@ -148,7 +152,8 @@ bool USplineDataAsset::MatchesSplineComponentWithPlacement(const USplineComponen
         if (!Current.Position.Equals(Saved.LocalPosition - Offset, Tolerance) ||
             !Current.ArriveTangent.Equals(Saved.ArriveTangent, Tolerance) ||
             !Current.LeaveTangent.Equals(Saved.LeaveTangent, Tolerance) ||
-            !Current.Rotation.Equals(Saved.LocalRotation, Tolerance) ||
+            !(Component->SplineCurves.Rotation.Points.IsValidIndex(Index) &&
+              Component->SplineCurves.Rotation.Points[Index].OutVal.Rotator().Equals(Saved.LocalRotation, Tolerance)) ||
             !Current.Scale.Equals(Saved.LocalScale, Tolerance) ||
             Component->GetSplinePointType(Index) != Saved.PointType.GetValue()) { return false; }
     }
@@ -167,6 +172,39 @@ void USplineDataAsset::SerializeFromSplineComponentWithPlacement(const USplineCo
     for (FSplinePointData& Point : Points) { Point.LocalPosition += Offset; }
 }
 
+void USplineDataAsset::UpdateFromSplineComponentWithPlacement(USplineComponent* Source,
+    EStrandCoordinateMode Mode, EStrandAnchorMode AnchorMode, int32 AnchorIndex)
+{
+    if (!IsValid(Source)) { return; }
+
+    // Capture against the OLD placement anchor. Recomputing a PointCenter anchor
+    // after an asymmetric edit otherwise makes the just-updated source "Modified".
+    const FVector OldAnchor = Mode == EStrandCoordinateMode::Relative
+        ? GetPlacementAnchor(AnchorMode, AnchorIndex) : FVector::ZeroVector;
+    SerializeFromSplineComponentWithPlacement(Source, Mode, AnchorMode, AnchorIndex);
+    if (Mode != EStrandCoordinateMode::Relative || Points.IsEmpty()) { return; }
+
+    const FVector NewAnchor = GetPlacementAnchor(AnchorMode, AnchorIndex);
+    const FVector LocalDelta = OldAnchor - NewAnchor;
+    if (LocalDelta.IsNearlyZero(1.e-6)) { return; }
+
+    // The newly captured asset is recentered by its NEW anchor when applied.
+    // Express the component in that frame but compensate its transform so the
+    // authored curve does not jump in the level. TransformVector deliberately
+    // includes rotation and nonuniform scale (but excludes translation).
+    Source->Modify();
+    const FVector CompensatingTranslation = -Source->GetRelativeTransform().TransformVector(LocalDelta);
+    for (int32 Index = 0; Index < Source->GetNumberOfSplinePoints(); ++Index)
+    {
+        Source->SetLocationAtSplinePoint(Index,
+            Source->GetLocationAtSplinePoint(Index, ESplineCoordinateSpace::Local) + LocalDelta,
+            ESplineCoordinateSpace::Local, false);
+    }
+    Source->UpdateSpline();
+    Source->SetRelativeLocation(Source->GetRelativeLocation() + CompensatingTranslation);
+    Source->MarkPackageDirty();
+}
+
 bool USplineDataAsset::MatchesSplineComponent(const USplineComponent* Component, float Tolerance) const
 {
     if (!IsValid(Component) || Component->GetNumberOfSplinePoints() != Points.Num() ||
@@ -181,7 +219,8 @@ bool USplineDataAsset::MatchesSplineComponent(const USplineComponent* Component,
         if (!P.Position.Equals(Q.LocalPosition, Tolerance) ||
             !P.ArriveTangent.Equals(Q.ArriveTangent, Tolerance) ||
             !P.LeaveTangent.Equals(Q.LeaveTangent, Tolerance) ||
-            !P.Rotation.Equals(Q.LocalRotation, Tolerance) ||
+            !(Component->SplineCurves.Rotation.Points.IsValidIndex(I) &&
+              Component->SplineCurves.Rotation.Points[I].OutVal.Rotator().Equals(Q.LocalRotation, Tolerance)) ||
             !P.Scale.Equals(Q.LocalScale, Tolerance) || Component->GetSplinePointType(I) != Q.PointType.GetValue())
         {
             return false;

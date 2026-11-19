@@ -8,6 +8,8 @@
 #include "SplineDataAsset.h"
 #include "SplineDataAssetFactory.h"
 #include "SplineEditorCommands.h"
+#include "StrandSplineActor.h"
+#include "StrandSplineUserData.h"
 #include "StrandSplineExport.h"
 #include "StrandSplineEditOperations.h"
 #include "StrandSplineOrientationOperations.h"
@@ -240,6 +242,8 @@ void FStrandSplineAssetEditor::Init(USplineDataAsset* InAsset, const TSharedPtr<
                 const FName Name = PropertyAndParent.Property.GetFName();
                 if (Current->SourceImportFormat.IsEmpty() &&
                     (Name == GET_MEMBER_NAME_CHECKED(USplineDataAsset, bMirrorSvgXOnImport) ||
+                     Name == GET_MEMBER_NAME_CHECKED(USplineDataAsset, SvgImportScale) ||
+                     Name == GET_MEMBER_NAME_CHECKED(USplineDataAsset, SvgImportCanvasOrigin) ||
                      Name == GET_MEMBER_NAME_CHECKED(USplineDataAsset, SourceUnitsToCentimeters) ||
                      Name == GET_MEMBER_NAME_CHECKED(USplineDataAsset, bAlembicYUp) ||
                      Name == GET_MEMBER_NAME_CHECKED(USplineDataAsset, ImportSampleSeconds) ||
@@ -249,7 +253,10 @@ void FStrandSplineAssetEditor::Init(USplineDataAsset* InAsset, const TSharedPtr<
                 {
                     return false;
                 }
-                if (Current->SourceImportFormat == TEXT("abc") && Name == GET_MEMBER_NAME_CHECKED(USplineDataAsset, bMirrorSvgXOnImport))
+                if (Current->SourceImportFormat == TEXT("abc") &&
+                    (Name == GET_MEMBER_NAME_CHECKED(USplineDataAsset, bMirrorSvgXOnImport) ||
+                     Name == GET_MEMBER_NAME_CHECKED(USplineDataAsset, SvgImportScale) ||
+                     Name == GET_MEMBER_NAME_CHECKED(USplineDataAsset, SvgImportCanvasOrigin)))
                 {
                     return false;
                 }
@@ -378,6 +385,52 @@ TSharedRef<SWidget> FStrandSplineAssetEditor::BuildAssetActionToolbar()
                         FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this]() { SelectUsers(); })));
                     Menu.AddMenuEntry(LOCTEXT("InspectUsage", "Inspect Usage"), LOCTEXT("InspectUsageTip", "Inspect actors using this asset."),
                         FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this]() { InspectUsage(); })));
+                    Menu.AddMenuSeparator();
+                    Menu.AddMenuEntry(LOCTEXT("ProjectionSelectedInstance", "Surface Projection: Selected Level Instance..."),
+                        LOCTEXT("ProjectionSelectedInstanceHelp", "Review projection using a selected Strand Spline Actor or Multi-Spline Actor linked to this asset. The level actor supplies its target, scope, camera mode, and conform settings. This changes the level instance only, not the open asset."),
+                        FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this]()
+                        {
+                            USplineDataAsset* Active = Asset.Get();
+                            TArray<USplineComponent*> Eligible;
+                            TArray<AStrandSplineActor*> Owners;
+                            for (AActor* Candidate : SplineEditorCommands::SelectedActors())
+                            {
+                                AStrandSplineActor* Owner = Cast<AStrandSplineActor>(Candidate);
+                                if (!IsValid(Owner)) { continue; }
+                                TArray<USplineComponent*> Components;
+                                Owner->GetComponents<USplineComponent>(Components);
+                                for (USplineComponent* Component : Components)
+                                {
+                                    if (UStrandSplineUserData::GetAssignedAsset(Component) == Active)
+                                    {
+                                        Eligible.Add(Component);
+                                        Owners.Add(Owner);
+                                    }
+                                }
+                            }
+                            if (Eligible.Num() != 1)
+                            {
+                                FMessageDialog::Open(EAppMsgType::Ok, FText::FromString(FString::Printf(
+                                    TEXT("Select exactly one placed Strand spline instance linked to '%s' in the Level Editor (found %d). Then use this command again. The standalone asset preview has no level collision world."),
+                                    IsValid(Active) ? *Active->GetName() : TEXT("Unknown"), Eligible.Num())));
+                                return;
+                            }
+                            const AStrandSplineActor* Owner = Owners[0];
+                            FStrandProjectionOptions Options;
+                            Options.TargetScope = Owner->StrandProjectionTargetScope;
+                            Options.RayMode = Owner->StrandProjectionRayMode;
+                            Options.Target = Owner->StrandProjectionTarget;
+                            for (AActor* Target : Owner->StrandProjectionTargets) { Options.Targets.Add(Target); }
+                            Options.WorldDirection = Owner->StrandProjectionDirection;
+                            Options.MaxDistance = Owner->StrandProjectionMaxDistance;
+                            Options.Clearance = Owner->StrandProjectionClearance;
+                            Options.Strength = Owner->StrandProjectionStrength;
+                            Options.FirstAnchor = Owner->StrandProjectionFirstAnchor;
+                            Options.LastAnchor = Owner->StrandProjectionLastAnchor;
+                            Options.bAlignNormals = Owner->bStrandProjectionAlignNormals;
+                            SplineEditorCommands::ProjectComponentOntoScene(Eligible[0], Options);
+                        })));
+
                     return Menu.MakeWidget();
                 })
                 .ButtonContent()[ActionContent(TEXT("Strand.Actors"), LOCTEXT("ActorsButton", "Actors"))]];

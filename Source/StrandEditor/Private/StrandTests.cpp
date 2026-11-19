@@ -1,4 +1,8 @@
 #include "StrandProjectSettings.h"
+#include "SplineImportHelpers.h"
+#include "Misc/Paths.h"
+#include "Misc/FileHelper.h"
+#include "HAL/FileManager.h"
 #include "Misc/FileHelper.h"
 #include "HAL/FileManager.h"
 #if WITH_DEV_AUTOMATION_TESTS
@@ -35,34 +39,110 @@ bool FStrandActorAssetUpdateParityTest::RunTest(const FString& Parameters)
 
     USplineComponent* Author = Single->Spline;
     Author->ClearSplinePoints(false);
-    Author->AddPoint(FSplinePoint(0, FVector(100,200,300)), false);
-    Author->AddPoint(FSplinePoint(1, FVector(200,300,400)), false);
+    Author->AddPoint(FSplinePoint(0, FVector(100, 200, 300)), false);
+    Author->AddPoint(FSplinePoint(1, FVector(200, 300, 400)), false);
     Author->UpdateSpline();
     Shared->SerializeFromSplineComponent(Author);
+    // The normal default is Relative / Center of Points. Linking an asset alone
+    // MUST NOT move native spline points; Apply Asset is the separate placement step.
     UStrandSplineUserData::AssignAsset(Author, Shared);
-    TestTrue(TEXT("Single actor starts in sync"), UStrandSplineUserData::Get(Author)->IsInSync(Author));
+    UStrandSplineUserData* AuthorLink = UStrandSplineUserData::Get(Author);
+    TestNotNull(TEXT("Single actor stores its Strand link"), AuthorLink);
+    if (!AuthorLink) { return false; }
+    TestEqual(TEXT("Linking preserves authored spline coordinates"),
+        Author->GetLocationAtSplinePoint(0, ESplineCoordinateSpace::Local), FVector(100, 200, 300));
+    TestFalse(TEXT("Link-only does not claim relative geometry is already synced"),
+        AuthorLink->IsInSync(Author));
+    Shared->ApplyToSplineComponentWithPlacement(Author,
+        AuthorLink->CoordinateMode, AuthorLink->AnchorMode, AuthorLink->AnchorPointIndex);
+    TestTrue(TEXT("Single actor is in sync after Apply Asset"), AuthorLink->IsInSync(Author));
 
     USplineComponent* Other = Multi->Spline;
     UStrandSplineUserData::AssignAsset(Other, Shared);
+    UStrandSplineUserData* OtherLink = UStrandSplineUserData::Get(Other);
+    TestNotNull(TEXT("Multi spline root stores its Strand link"), OtherLink);
+    if (!OtherLink) { return false; }
     Shared->ApplyToSplineComponentWithPlacement(Other,
-        EStrandCoordinateMode::Absolute, EStrandAnchorMode::PointCenter, 0);
-    TestTrue(TEXT("Multi actor root starts in sync"), UStrandSplineUserData::Get(Other)->IsInSync(Other));
+        OtherLink->CoordinateMode, OtherLink->AnchorMode, OtherLink->AnchorPointIndex);
+    TestTrue(TEXT("Multi actor root is in sync after Apply Asset"), OtherLink->IsInSync(Other));
 
-    Author->SetLocationAtSplinePoint(1, FVector(490,500,510), ESplineCoordinateSpace::Local);
-    TestFalse(TEXT("Native edit becomes modified"), UStrandSplineUserData::Get(Author)->IsInSync(Author));
-    TestTrue(TEXT("Other native component stays synced before update"),
-        UStrandSplineUserData::Get(Other)->IsInSync(Other));
+    Author->SetLocationAtSplinePoint(1, FVector(490, 500, 510), ESplineCoordinateSpace::Local);
+    TestFalse(TEXT("Native edit becomes modified"), AuthorLink->IsInSync(Author));
+    TestTrue(TEXT("Other native component stays synced before update"), OtherLink->IsInSync(Other));
 
-    const UStrandSplineUserData* Link = UStrandSplineUserData::Get(Author);
-    Shared->SerializeFromSplineComponentWithPlacement(Author,
-        Link->CoordinateMode, Link->AnchorMode, Link->AnchorPointIndex);
-    TestTrue(TEXT("Capture returns authored source to in-sync"), Link->IsInSync(Author));
-    TestFalse(TEXT("Other linked actor intentionally becomes stale"),
-        UStrandSplineUserData::Get(Other)->IsInSync(Other));
+    // A relative PointCenter anchor moves when only one point is edited. Ensure
+    // Update Asset reconciles both frames without moving the curve in the level.
+    const FTransform BeforeUpdateTransform = Author->GetRelativeTransform();
+    TArray<FVector> BeforeUpdateWorldPositions;
+    for (int32 Index = 0; Index < Author->GetNumberOfSplinePoints(); ++Index)
+    {
+        BeforeUpdateWorldPositions.Add(BeforeUpdateTransform.TransformPosition(
+            Author->GetLocationAtSplinePoint(Index, ESplineCoordinateSpace::Local)));
+    }
+    Shared->UpdateFromSplineComponentWithPlacement(Author,
+        AuthorLink->CoordinateMode, AuthorLink->AnchorMode, AuthorLink->AnchorPointIndex);
+    TestTrue(TEXT("Update Asset returns authored source to in-sync"), AuthorLink->IsInSync(Author));
+    for (int32 Index = 0; Index < BeforeUpdateWorldPositions.Num(); ++Index)
+    {
+        TestTrue(*FString::Printf(TEXT("Relative Update Asset preserves world point %d"), Index),
+            Author->GetRelativeTransform().TransformPosition(
+                Author->GetLocationAtSplinePoint(Index, ESplineCoordinateSpace::Local))
+                .Equals(BeforeUpdateWorldPositions[Index], 0.001));
+    }
+    TestFalse(TEXT("Other linked actor becomes stale after asset update"), OtherLink->IsInSync(Other));
     Shared->ApplyToSplineComponentWithPlacement(Other,
-        EStrandCoordinateMode::Absolute, EStrandAnchorMode::PointCenter, 0);
-    TestTrue(TEXT("Apply restores secondary native actor parity"),
-        UStrandSplineUserData::Get(Other)->IsInSync(Other));
+        OtherLink->CoordinateMode, OtherLink->AnchorMode, OtherLink->AnchorPointIndex);
+    TestTrue(TEXT("Apply Asset restores secondary actor parity"), OtherLink->IsInSync(Other));
+
+    // Absolute placement is an independent mode: it must preserve original point
+    // positions, and its Update Asset workflow must capture precisely those values.
+    USplineDataAsset* Absolute = NewObject<USplineDataAsset>(GetTransientPackage());
+    Absolute->DefaultCoordinateMode = EStrandCoordinateMode::Absolute;
+    Absolute->SerializeFromSplineComponent(Author);
+    USplineComponent* AbsoluteComponent = NewObject<USplineComponent>(GetTransientPackage());
+    UStrandSplineUserData::AssignAsset(AbsoluteComponent, Absolute);
+    UStrandSplineUserData* AbsoluteLink = UStrandSplineUserData::Get(AbsoluteComponent);
+    TestNotNull(TEXT("Absolute linked spline metadata exists"), AbsoluteLink);
+    if (!AbsoluteLink) { return false; }
+    Absolute->ApplyToSplineComponentWithPlacement(AbsoluteComponent,
+        AbsoluteLink->CoordinateMode, AbsoluteLink->AnchorMode, AbsoluteLink->AnchorPointIndex);
+    TestTrue(TEXT("Absolute Apply Asset is in sync"), AbsoluteLink->IsInSync(AbsoluteComponent));
+    TestTrue(TEXT("Absolute placement retains source point position"),
+        AbsoluteComponent->GetLocationAtSplinePoint(0, ESplineCoordinateSpace::Local).Equals(
+            Author->GetLocationAtSplinePoint(0, ESplineCoordinateSpace::Local), 0.001));
+    AbsoluteComponent->SetLocationAtSplinePoint(0, FVector(111, 222, 333), ESplineCoordinateSpace::Local);
+    TestFalse(TEXT("Absolute edit is detected"), AbsoluteLink->IsInSync(AbsoluteComponent));
+    Absolute->UpdateFromSplineComponentWithPlacement(AbsoluteComponent,
+        AbsoluteLink->CoordinateMode, AbsoluteLink->AnchorMode, AbsoluteLink->AnchorPointIndex);
+    TestTrue(TEXT("Absolute Update Asset restores parity"), AbsoluteLink->IsInSync(AbsoluteComponent));
+    TestTrue(TEXT("Absolute Update Asset captures exact point position"),
+        Absolute->Points[0].LocalPosition.Equals(FVector(111, 222, 333), 0.001));
+
+    // Editing the anchor point itself must not introduce a hidden local-space
+    // shift even in PointIndex mode.
+    USplineDataAsset* PointIndexed = NewObject<USplineDataAsset>(GetTransientPackage());
+    PointIndexed->DefaultCoordinateMode = EStrandCoordinateMode::Relative;
+    PointIndexed->DefaultAnchorMode = EStrandAnchorMode::PointIndex;
+    PointIndexed->DefaultAnchorPointIndex = 0;
+    PointIndexed->SerializeFromSplineComponent(Author);
+    USplineComponent* IndexedComponent = NewObject<USplineComponent>(GetTransientPackage());
+    IndexedComponent->SetRelativeLocation(FVector(80, 90, 110));
+    IndexedComponent->SetRelativeRotation(FRotator(0, 25, 0));
+    IndexedComponent->SetRelativeScale3D(FVector(2, 3, 1));
+    UStrandSplineUserData::AssignAsset(IndexedComponent, PointIndexed);
+    UStrandSplineUserData* IndexedLink = UStrandSplineUserData::Get(IndexedComponent);
+    PointIndexed->ApplyToSplineComponentWithPlacement(IndexedComponent,
+        EStrandCoordinateMode::Relative, EStrandAnchorMode::PointIndex, 0);
+    IndexedComponent->SetLocationAtSplinePoint(0, FVector(15, 20, 25), ESplineCoordinateSpace::Local);
+    const FVector WorldAnchorBefore = IndexedComponent->GetRelativeTransform().TransformPosition(
+        IndexedComponent->GetLocationAtSplinePoint(0, ESplineCoordinateSpace::Local));
+    PointIndexed->UpdateFromSplineComponentWithPlacement(IndexedComponent,
+        EStrandCoordinateMode::Relative, EStrandAnchorMode::PointIndex, 0);
+    TestTrue(TEXT("PointIndex Update Asset returns to in-sync"), IndexedLink->IsInSync(IndexedComponent));
+    TestTrue(TEXT("PointIndex Update Asset preserves edited anchor world location"),
+        IndexedComponent->GetRelativeTransform().TransformPosition(
+            IndexedComponent->GetLocationAtSplinePoint(0, ESplineCoordinateSpace::Local))
+            .Equals(WorldAnchorBefore, 0.001));
 
     Multi->AddSplineComponent();
     TArray<USplineComponent*> Components;
@@ -643,7 +723,8 @@ bool FStrandIllustratorLogoTest::RunTest(const FString& Parameters)
                 const bool bPosition = Actual.Position.Equals(Wanted.LocalPosition, 0.001);
                 const bool bArrive = Actual.ArriveTangent.Equals(Wanted.ArriveTangent, 0.001);
                 const bool bLeave = Actual.LeaveTangent.Equals(Wanted.LeaveTangent, 0.001);
-                const bool bRotation = Actual.Rotation.Equals(Wanted.LocalRotation, 0.001);
+                const bool bRotation = Component->SplineCurves.Rotation.Points.IsValidIndex(PointIndex) &&
+                    Component->SplineCurves.Rotation.Points[PointIndex].OutVal.Rotator().Equals(Wanted.LocalRotation, 0.001);
                 const bool bScale = Actual.Scale.Equals(Wanted.LocalScale, 0.001);
                 const bool bType = Component->GetSplinePointType(PointIndex) == Wanted.PointType.GetValue();
                 if (!(bPosition && bArrive && bLeave && bRotation && bScale && bType))
@@ -983,7 +1064,7 @@ bool FStrandMultiAssetDropEligibilityTest::RunTest(const FString& Parameters)
 {
     USplineDataAsset* A = NewObject<USplineDataAsset>(GetTransientPackage());
     USplineDataAsset* B = NewObject<USplineDataAsset>(GetTransientPackage());
-    UObject* Unrelated = NewObject<UObject>(GetTransientPackage());
+    UObject* Unrelated = NewObject<USplineComponent>(GetTransientPackage());
 
     TArray<UObject*> Assets;
     Assets.Add(A);
@@ -1133,6 +1214,81 @@ bool FStrandAlembicOriginHierarchyTest::RunTest(const FString& Parameters)
     return true;
 }
 
+// SVG scale is an import/reimport option, not a cumulative asset-edit transform.
+// Loading the SAME source twice at the same scale must always give identical geometry.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStrandSvgImportScaleTest,
+    "Strand.Editor.Import.SvgImportScaleAndReimport",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FStrandSvgImportScaleTest::RunTest(const FString& Parameters)
+{
+    const FString Path = FPaths::ProjectSavedDir() / TEXT("Automation/StrandSvgScaleFixture.svg");
+    IFileManager::Get().MakeDirectory(*FPaths::GetPath(Path), true);
+    const FString Source = TEXT(R"SVG(<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 100">
+        <path id="curveA" d="M 10 20 C 30 30 50 40 70 60"/>
+        <path id="curveB" d="M 80 40 L 130 80"/>
+    </svg>)SVG");
+    if (!TestTrue(TEXT("Write SVG fixture"), FFileHelper::SaveStringToFile(Source, *Path)))
+    {
+        return false;
+    }
+    TArray<FSplineImportedCurve> Unit, Double, Reimported, Invalid;
+    const bool bUnit = SplineAssetImport::LoadSvgCurves(Path, Unit, true, 1.0);
+    const bool bDouble = SplineAssetImport::LoadSvgCurves(Path, Double, true, 2.0);
+    const bool bAgain = SplineAssetImport::LoadSvgCurves(Path, Reimported, true, 2.0);
+    const bool bRejectZero = SplineAssetImport::LoadSvgCurves(Path, Invalid, true, 0.0);
+    TArray<FSplineImportedCurve> TopLeft, Centered, CenteredAgain;
+    const bool bTop = SplineAssetImport::LoadSvgCurves(Path, TopLeft, true, 2.0,
+        EStrandSvgCanvasOrigin::TopLeft);
+    const bool bCenter = SplineAssetImport::LoadSvgCurves(Path, Centered, true, 2.0,
+        EStrandSvgCanvasOrigin::Center);
+    const bool bCenterAgain = SplineAssetImport::LoadSvgCurves(Path, CenteredAgain, true, 2.0,
+        EStrandSvgCanvasOrigin::Center);
+    IFileManager::Get().Delete(*Path);
+    TestTrue(TEXT("Explicit origin loads"), bTop && bCenter && bCenterAgain);
+    if (bTop && bCenter && bCenterAgain && TopLeft.Num() == 2 && Centered.Num() == 2 && CenteredAgain.Num() == 2)
+    {
+        for (int32 CurveIndex = 0; CurveIndex < 2; ++CurveIndex)
+        {
+            TestTrue(TEXT("Canvas origin shifts all contours consistently"),
+                (Centered[CurveIndex].Points[0].LocalPosition - TopLeft[CurveIndex].Points[0].LocalPosition)
+                .Equals(FVector(200.0, 100.0, 0.0), 0.0001));
+            TestTrue(TEXT("Explicit origin deterministic on repeated source import"),
+                Centered[CurveIndex].Points[0].LocalPosition.Equals(
+                    CenteredAgain[CurveIndex].Points[0].LocalPosition, 0.0001));
+        }
+    }
+    if (!TestTrue(TEXT("Unit SVG import succeeds"), bUnit) ||
+        !TestTrue(TEXT("Scaled SVG import succeeds"), bDouble) ||
+        !TestTrue(TEXT("Scaled SVG reimport succeeds"), bAgain)) { return false; }
+    TestFalse(TEXT("Reject zero import scale"), bRejectZero);
+    TestEqual(TEXT("Independent SVG contours preserved"), Double.Num(), 2);
+    if (Unit.Num() != 2 || Double.Num() != 2 || Reimported.Num() != 2) { return false; }
+    for (int32 CurveIndex = 0; CurveIndex < Unit.Num(); ++CurveIndex)
+    {
+        const FSplineImportedCurve& A = Unit[CurveIndex];
+        const FSplineImportedCurve& B = Double[CurveIndex];
+        const FSplineImportedCurve& C = Reimported[CurveIndex];
+        TestEqual(TEXT("Source identity preserved"), A.SourceId, B.SourceId);
+        TestEqual(TEXT("Point counts preserved"), A.Points.Num(), B.Points.Num());
+        if (A.Points.Num() != B.Points.Num() || B.Points.Num() != C.Points.Num()) { return false; }
+        for (int32 I = 0; I < A.Points.Num(); ++I)
+        {
+            TestTrue(TEXT("Position scales uniformly"),
+                B.Points[I].LocalPosition.Equals(A.Points[I].LocalPosition * 2.0, 0.0001));
+            TestTrue(TEXT("Arrive tangent scales uniformly"),
+                B.Points[I].ArriveTangent.Equals(A.Points[I].ArriveTangent * 2.0, 0.0001));
+            TestTrue(TEXT("Leave tangent scales uniformly"),
+                B.Points[I].LeaveTangent.Equals(A.Points[I].LeaveTangent * 2.0, 0.0001));
+            TestTrue(TEXT("Reimport does not compound position scale"),
+                C.Points[I].LocalPosition.Equals(B.Points[I].LocalPosition, 0.0001));
+            TestTrue(TEXT("Reimport does not compound tangent scale"),
+                C.Points[I].LeaveTangent.Equals(B.Points[I].LeaveTangent, 0.0001));
+        }
+    }
+    return true;
+}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStrandSourceModePropertyTest,
     "Strand.Editor.Import.ModeSpecificProperties",
     EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
@@ -1142,6 +1298,10 @@ bool FStrandSourceModePropertyTest::RunTest(const FString& Parameters)
     USplineDataAsset* Asset = NewObject<USplineDataAsset>(GetTransientPackage());
     const FProperty* Svg = FindFProperty<FProperty>(USplineDataAsset::StaticClass(),
         GET_MEMBER_NAME_CHECKED(USplineDataAsset, bMirrorSvgXOnImport));
+    const FProperty* SvgOrigin = FindFProperty<FProperty>(USplineDataAsset::StaticClass(),
+        GET_MEMBER_NAME_CHECKED(USplineDataAsset, SvgImportCanvasOrigin));
+    const FProperty* SvgScale = FindFProperty<FProperty>(USplineDataAsset::StaticClass(),
+        GET_MEMBER_NAME_CHECKED(USplineDataAsset, SvgImportScale));
     const FProperty* Abc = FindFProperty<FProperty>(USplineDataAsset::StaticClass(),
         GET_MEMBER_NAME_CHECKED(USplineDataAsset, SourceUnitsToCentimeters));
     const FProperty* Anchor = FindFProperty<FProperty>(USplineDataAsset::StaticClass(),
@@ -1149,14 +1309,20 @@ bool FStrandSourceModePropertyTest::RunTest(const FString& Parameters)
     const FProperty* Index = FindFProperty<FProperty>(USplineDataAsset::StaticClass(),
         GET_MEMBER_NAME_CHECKED(USplineDataAsset, DefaultAnchorPointIndex));
     if (!TestNotNull(TEXT("SVG setting reflected"), Svg) ||
+        !TestNotNull(TEXT("SVG canvas origin reflected"), SvgOrigin) ||
+        !TestNotNull(TEXT("SVG scale reflected"), SvgScale) ||
         !TestNotNull(TEXT("Alembic setting reflected"), Abc) ||
         !TestNotNull(TEXT("Anchor mode reflected"), Anchor) ||
         !TestNotNull(TEXT("Point index reflected"), Index)) { return false; }
     Asset->SourceImportFormat = TEXT("abc");
     TestTrue(TEXT("Alembic settings editable for Alembic assets"), Asset->CanEditChange(Abc));
     TestFalse(TEXT("SVG settings disabled on Alembic assets"), Asset->CanEditChange(Svg));
+    TestFalse(TEXT("SVG scale disabled on Alembic assets"), Asset->CanEditChange(SvgScale));
+    TestFalse(TEXT("SVG origin disabled on Alembic assets"), Asset->CanEditChange(SvgOrigin));
     Asset->SourceImportFormat = TEXT("svg");
     TestTrue(TEXT("SVG settings editable for SVG assets"), Asset->CanEditChange(Svg));
+    TestTrue(TEXT("SVG scale editable for SVG assets"), Asset->CanEditChange(SvgScale));
+    TestTrue(TEXT("SVG origin editable for SVG assets"), Asset->CanEditChange(SvgOrigin));
     TestFalse(TEXT("Alembic settings disabled on SVG assets"), Asset->CanEditChange(Abc));
     TestTrue(TEXT("Relative-only anchor property declared"),
         Anchor->GetMetaData(TEXT("EditCondition")).Contains(TEXT("Relative")));

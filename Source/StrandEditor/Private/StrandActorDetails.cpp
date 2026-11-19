@@ -111,20 +111,30 @@ void FStrandActorDetails::CustomizeDetails(IDetailLayoutBuilder& Builder)
             Links.AddCustomRow(FText::FromString(ComponentName + TEXT(" Surface Projection")))
             .WholeRowContent()
             [SNew(SButton).Text(FText::Format(LOCTEXT("ProjectOne", "Review Surface Projection: {0}"), Name))
-                .ToolTipText(LOCTEXT("ProjectTip", "Project this native spline's anchors onto the Surface Target assigned on the actor. First review hit/miss counts, then confirm or cancel. Uses collision on the explicit target actor; does not automatically update the linked Strand asset."))
+                .ToolTipText(LOCTEXT("ProjectTip", "Project this native spline's anchors onto the Surface Target assigned on the actor. First review hit/miss counts, then confirm or cancel. Uses the configured target scope and ray mode; does not automatically update the linked Strand asset."))
                 .IsEnabled_Lambda([Weak, Actors]()
                 {
                     const AStrandSplineActor* Owner = Actors[0].Get();
-                    return Weak.IsValid() && IsValid(Owner) && IsValid(Owner->StrandProjectionTarget.Get());
+                    return Weak.IsValid() && IsValid(Owner);
                 })
                 .OnClicked_Lambda([Weak, Actors]()
                 {
                     const AStrandSplineActor* Owner = Actors[0].Get();
                     if (IsValid(Owner))
                     {
-                        SplineEditorCommands::ProjectComponentOntoActor(Weak.Get(),
-                            Owner->StrandProjectionTarget.Get(), Owner->StrandProjectionDirection,
-                            Owner->StrandProjectionMaxDistance, Owner->StrandProjectionClearance);
+                        FStrandProjectionOptions Options;
+                        Options.TargetScope = Owner->StrandProjectionTargetScope;
+                        Options.RayMode = Owner->StrandProjectionRayMode;
+                        Options.Target = Owner->StrandProjectionTarget;
+                        for (AActor* Candidate : Owner->StrandProjectionTargets) { Options.Targets.Add(Candidate); }
+                        Options.WorldDirection = Owner->StrandProjectionDirection;
+                        Options.MaxDistance = Owner->StrandProjectionMaxDistance;
+                        Options.Clearance = Owner->StrandProjectionClearance;
+                        Options.Strength = Owner->StrandProjectionStrength;
+                        Options.FirstAnchor = Owner->StrandProjectionFirstAnchor;
+                        Options.LastAnchor = Owner->StrandProjectionLastAnchor;
+                        Options.bAlignNormals = Owner->bStrandProjectionAlignNormals;
+                        SplineEditorCommands::ProjectComponentOntoScene(Weak.Get(), Options);
                     }
                     return FReply::Handled();
                 })];

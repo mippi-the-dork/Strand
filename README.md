@@ -308,3 +308,14 @@ The selected anchor's soft-selection marker can be enlarged from **Editor Prefer
 In the Strand Spline Editor use **Edit Plane → Anchor Local XY/XZ/YZ Plane** with a selected primary anchor. The plane uses that anchor's evaluated spline tangent frame, captured once when selected, rather than an absolute world plane or the viewport camera. A purple grid shows the working plane. To refresh its frame, select the command again; **Free 3D** removes the constraint. These options do not change geometry until a subsequent edit.
 
 **Known:** the native translation gizmo currently displays its third handle even when the plane constrains out its movement; the movement constraint itself is enforced.
+
+
+### Scene surface projection (0.6.49 development)
+Placed Strand splines can project onto one target actor, a specified set of target actors, or all query-enabled scene collision. Choose world vector, parallel Level Editor camera direction, or perspective camera rays. The nonmodal purple ghost previews changes before Apply; only the level instance is modified. A linked instance can be projected from the Strand Asset Editor via Actors > Surface Projection: Selected Level Instance.
+
+
+### SVG import scale and stable source options (v0.6.50)
+
+On a Strand Spline asset imported from SVG, open **Source & Import** to adjust **SVG Import Scale** (centimeters per SVG user unit), **SVG Canvas Origin**, and **Mirror SVG X on Import**. The default scale is **1.0**; increasing it to **2.0** doubles imported point positions and Bézier tangent lengths, preserving the curve shape. Use the asset toolbar **Reimport** command to apply these options from the original SVG. Reimport explicitly confirms replacement of saved asset points. Changing scale or canvas-origin settings does **not** instantly modify points or linked level instances. After reimport, explicitly Apply Asset to any level instances you wish to update.
+
+**Project Settings > Plugins > Strand > SVG Import** provides defaults for *new* imports: **Default SVG Import Scale** and **SVG Canvas Origin**. Every newly imported SVG asset captures its own scale and canvas origin. Later project-default changes do not move existing SVGs when reimported. Reimport always parses the original source file (it does not multiply the asset's already-scaled points), so repeating it cannot compound scaling. The settings for Alembic imports remain separate and unchanged.

@@ -1,3 +1,4 @@
+#include "StrandSurfaceTargetTrace.h"
 #include "StrandPrecisionOperations.h"
 #include "StrandPrecisionProjection.h"
 #include "StrandCameraSpaceMath.h"
@@ -266,6 +267,30 @@ bool FStrandMeshSurfacePlanTest::RunTest(const FString& Parameters)
     TestEqual(TEXT("Invalid ray yields empty plan"), Plan.Num(), 0);
     BuildSurfacePreviewPlan(Sources, {0}, Triangles, FVector(0,0,-1), 5.0, 0, Plan);
     TestEqual(TEXT("Out of range yields empty plan"), Plan.Num(), 0);
+    return true;
+}
+#endif
+
+#if WITH_DEV_AUTOMATION_TESTS
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStrandProjectionTargetRayBoundsTest,
+    "Strand.Editor.SurfaceProjection.TargetRayBoundsDiagnostics",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FStrandProjectionTargetRayBoundsTest::RunTest(const FString& Parameters)
+{
+    const FBox SurfaceBounds(FVector(-100.0, -100.0, -100.0), FVector(100.0, 100.0, 100.0));
+    TestTrue(TEXT("Downward ray through target bounds"),
+        StrandSurfaceTargetTrace::RayIntersectsBounds(SurfaceBounds,
+            FVector(0, 0, 1000), FVector(0, 0, -1000)));
+    TestFalse(TEXT("Ray offset horizontally outside target bounds"),
+        StrandSurfaceTargetTrace::RayIntersectsBounds(SurfaceBounds,
+            FVector(500, 0, 1000), FVector(500, 0, -1000)));
+    TestFalse(TEXT("Wrong direction points away from target"),
+        StrandSurfaceTargetTrace::RayIntersectsBounds(SurfaceBounds,
+            FVector(0, 0, 1000), FVector(0, 0, 2000)));
+    TestTrue(TEXT("Ray originating inside target can cross bounds"),
+        StrandSurfaceTargetTrace::RayIntersectsBounds(SurfaceBounds,
+            FVector(0, 0, 0), FVector(0, 0, -1000)));
     return true;
 }
 #endif

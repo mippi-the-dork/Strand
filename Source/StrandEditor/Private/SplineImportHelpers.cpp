@@ -5,6 +5,7 @@
 #include "Misc/PackageName.h"
 #include "Misc/Paths.h"
 #include "EditorFramework/AssetImportData.h"
+#include "StrandProjectSettings.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogSplineImport, Log, All);
 
@@ -30,6 +31,12 @@ USplineDataAsset* SplineAssetImport::CommitCurves(UObject* Parent, FName Request
         Asset->DefaultAnchorMode = bAlembic
             ? EStrandAnchorMode::PointIndex : EStrandAnchorMode::PointCenter;
         Asset->DefaultAnchorPointIndex = 0;
+        if (Format == TEXT("svg"))
+        {
+            Asset->SvgImportScale = FMath::Max(1.e-6f,
+                GetDefault<UStrandProjectSettings>()->DefaultSvgImportScale);
+            Asset->SvgImportCanvasOrigin = GetDefault<UStrandProjectSettings>()->SvgCanvasOrigin;
+        }
         Asset->SourceImportFormat = Format;
         Asset->SourceCurveId = Curve.SourceId.IsEmpty()
             ? Curve.Name + FString::Printf(TEXT("#%d"), Index)

@@ -651,8 +651,31 @@ namespace
 
 }
 
+bool SplineAssetImport::ScaleSvgCurves(TArray<FSplineImportedCurve>& Curves, double Scale)
+{
+    // Never bake invalid scale or apply it twice to a previously imported asset.
+    if (!FMath::IsFinite(Scale) || Scale <= 0.0) { return false; }
+    for (FSplineImportedCurve& Curve : Curves)
+    {
+        for (FSplinePointData& Point : Curve.Points)
+        {
+            Point.LocalPosition *= Scale;
+            Point.ArriveTangent *= Scale;
+            Point.LeaveTangent *= Scale;
+        }
+    }
+    return true;
+}
+
 bool SplineAssetImport::LoadSvgCurves(const FString& Filename, TArray<FSplineImportedCurve>& Curves,
-    bool bMirrorX)
+    bool bMirrorX, double ImportScale)
+{
+    return LoadSvgCurves(Filename, Curves, bMirrorX, ImportScale,
+        GetDefault<UStrandProjectSettings>()->SvgCanvasOrigin);
+}
+
+bool SplineAssetImport::LoadSvgCurves(const FString& Filename, TArray<FSplineImportedCurve>& Curves,
+    bool bMirrorX, double ImportScale, EStrandSvgCanvasOrigin CanvasOrigin)
 {
     if (IFileManager::Get().FileSize(*Filename) > 20 * 1024 * 1024)
     {
@@ -700,7 +723,7 @@ bool SplineAssetImport::LoadSvgCurves(const FString& Filename, TArray<FSplineImp
     }
     if (Width > 0.0 && Height > 0.0)
     {
-        const EStrandSvgCanvasOrigin Origin = GetDefault<UStrandProjectSettings>()->SvgCanvasOrigin;
+        const EStrandSvgCanvasOrigin Origin = CanvasOrigin;
         const double FX = (Origin == EStrandSvgCanvasOrigin::TopRight || Origin == EStrandSvgCanvasOrigin::BottomRight)
             ? 1.0 : (Origin == EStrandSvgCanvasOrigin::Center ? 0.5 : 0.0);
         const double FY = (Origin == EStrandSvgCanvasOrigin::BottomLeft || Origin == EStrandSvgCanvasOrigin::BottomRight)
@@ -718,6 +741,12 @@ bool SplineAssetImport::LoadSvgCurves(const FString& Filename, TArray<FSplineImp
     else
     {
         UE_LOG(LogSplineSvg, Warning, TEXT("SVG has no usable canvas bounds; Strand canvas origin remains the SVG coordinate origin: %s"), *Filename);
+    }
+    if (!SplineAssetImport::ScaleSvgCurves(Curves, ImportScale))
+    {
+        UE_LOG(LogSplineSvg, Warning, TEXT("Invalid SVG import scale %g for %s"), ImportScale, *Filename);
+        Curves.Reset();
+        return false;
     }
     int32 ClosedCount = 0;
     for (const FSplineImportedCurve& Curve : Curves)
@@ -756,6 +785,9 @@ UObject* USplineSvgFactory::FactoryCreateFile(UClass* InClass, UObject* InParent
 {
     bOutOperationCanceled = false;
     TArray<FSplineImportedCurve> Curves;
-    if (!SplineAssetImport::LoadSvgCurves(Filename, Curves)) { return nullptr; }
+    const double Scale = FMath::Max(1.e-6, static_cast<double>(
+        GetDefault<UStrandProjectSettings>()->DefaultSvgImportScale));
+    if (!SplineAssetImport::LoadSvgCurves(Filename, Curves, true, Scale,
+        GetDefault<UStrandProjectSettings>()->SvgCanvasOrigin)) { return nullptr; }
     return SplineAssetImport::CommitCurves(InParent, InName, Flags, Curves, Filename);
 }
