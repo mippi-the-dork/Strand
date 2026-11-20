@@ -2338,6 +2338,45 @@ bool FStrandGroupEditingTest::RunTest(const FString& Parameters)
         Points[0].LocalPosition.Equals(Unchanged[0].LocalPosition));
     return true;
 }
+// Exact diagnostic for failures in the asset <-> native authoring contract.
+// Avoid evaluated GetSplinePointAt data: use stored native curve keys.
+static FString StrandDescribeFirstStoredPointMismatch(const USplineDataAsset* Asset, const USplineComponent* Native)
+{
+    if (!Asset || !Native) { return TEXT("Null asset or native component"); }
+    if (Asset->Points.Num() != Native->GetNumberOfSplinePoints())
+    {
+        return FString::Printf(TEXT("Point count asset=%d native=%d"), Asset->Points.Num(), Native->GetNumberOfSplinePoints());
+    }
+    if (Asset->bIsClosedLoop != Native->IsClosedLoop())
+    {
+        return FString::Printf(TEXT("Closed-loop asset=%d native=%d"), Asset->bIsClosedLoop, Native->IsClosedLoop());
+    }
+    for (int32 I = 0; I < Asset->Points.Num(); ++I)
+    {
+        const FSplinePointData& A = Asset->Points[I];
+        const auto& P = Native->SplineCurves.Position.Points[I];
+        const auto& R = Native->SplineCurves.Rotation.Points[I];
+        const auto& S = Native->SplineCurves.Scale.Points[I];
+        const FRotator NativeRotation = R.OutVal.Rotator();
+        const bool bCompareTangents = A.PointType.GetValue() != ESplinePointType::Linear;
+        if (!P.OutVal.Equals(A.LocalPosition, 0.001) ||
+            (bCompareTangents && !P.ArriveTangent.Equals(A.ArriveTangent, 0.001)) ||
+            (bCompareTangents && !P.LeaveTangent.Equals(A.LeaveTangent, 0.001)) ||
+            !NativeRotation.Equals(A.LocalRotation, 0.001) ||
+            !S.OutVal.Equals(A.LocalScale, 0.001) ||
+            Native->GetSplinePointType(I) != A.PointType.GetValue())
+        {
+            return FString::Printf(TEXT("Point %d: posDelta=%g arriveDelta=%g leaveDelta=%g rotDelta=%g scaleDelta=%g type asset=%d native=%d"),
+                I, (P.OutVal - A.LocalPosition).Size(), (P.ArriveTangent - A.ArriveTangent).Size(),
+                (P.LeaveTangent - A.LeaveTangent).Size(),
+                (FMath::Abs(NativeRotation.Pitch - A.LocalRotation.Pitch) + FMath::Abs(NativeRotation.Yaw - A.LocalRotation.Yaw) + FMath::Abs(NativeRotation.Roll - A.LocalRotation.Roll)),
+                (S.OutVal - A.LocalScale).Size(),
+                static_cast<int32>(A.PointType.GetValue()), static_cast<int32>(Native->GetSplinePointType(I)));
+        }
+    }
+    return TEXT("Raw point keys match; investigate tolerance or comparison contract");
+}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStrandSplinePrimitiveAuthoringTest,
     "Strand.Editor.Authoring.SplinePrimitiveAuthoring",
     EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
@@ -2359,7 +2398,11 @@ bool FStrandSplinePrimitiveAuthoringTest::RunTest(const FString& Parameters)
         Asset->ApplyToSplineComponent(Native);
         TestEqual(TEXT("Native spline anchor count"), Native->GetNumberOfSplinePoints(), Points.Num());
         TestEqual(TEXT("Native spline closure"), Native->IsClosedLoop(), bClosed);
-        TestTrue(TEXT("Primitive round-trip matches native component"), Asset->MatchesSplineComponent(Native, 0.001f));
+        if (!Asset->MatchesSplineComponent(Native, 0.001f))
+        {
+            AddError(FString::Printf(TEXT("Primitive kind %d: %s"), Kind,
+                *StrandDescribeFirstStoredPointMismatch(Asset, Native)));
+        }
         if (Kind == 0)
         {
             TestTrue(TEXT("Circle starts at +X"), Points[0].LocalPosition.Equals(FVector(100, 0, 0), 0.001));
@@ -2371,6 +2414,16 @@ bool FStrandSplinePrimitiveAuthoringTest::RunTest(const FString& Parameters)
         {
             TestTrue(TEXT("Rectangle uses linear interpolation"),
                 Points[0].PointType == ESplinePointType::Linear);
+            // Linear tangents are deliberately derived by native Unreal. A
+            // capture must not bake those values as authored Bezier handles.
+            USplineDataAsset* Captured = NewObject<USplineDataAsset>(GetTransientPackage());
+            Captured->SerializeFromSplineComponent(Native);
+            TestTrue(TEXT("Linear capture ignores native-derived tangents"),
+                Captured->Points.Num() == Points.Num() &&
+                Captured->Points[0].ArriveTangent.IsNearlyZero() &&
+                Captured->Points[0].LeaveTangent.IsNearlyZero());
+            TestTrue(TEXT("Captured linear shape round-trips through native spline"),
+                Captured->MatchesSplineComponent(Native, 0.001f));
             TestTrue(TEXT("Rectangle has expected perimeter"),
                 FMath::Abs(Native->GetSplineLength() - 700.0) < 0.01);
         }
@@ -2413,8 +2466,11 @@ bool FStrandInPlacePrimitiveReplacementTest::RunTest(const FString& Parameters)
         TestEqual(TEXT("Placement settings are preserved"), Current->DefaultAnchorPointIndex, 2);
         USplineComponent* Native = NewObject<USplineComponent>(GetTransientPackage());
         Current->ApplyToSplineComponent(Native);
-        TestTrue(TEXT("Replaced geometry retains native spline compatibility"),
-            Current->MatchesSplineComponent(Native, 0.001f));
+        if (!Current->MatchesSplineComponent(Native, 0.001f))
+        {
+            AddError(FString::Printf(TEXT("Replacement kind %d: %s"), Kind,
+                *StrandDescribeFirstStoredPointMismatch(Current, Native)));
+        }
     }
     const TArray<FSplinePointData> Saved = Current->Points;
     const bool bSavedLoop = Current->bIsClosedLoop;

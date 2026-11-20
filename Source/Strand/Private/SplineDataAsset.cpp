@@ -40,16 +40,24 @@ void USplineDataAsset::SerializeFromSplineComponent(const USplineComponent* Sour
     Points.Reset(Count);
     for (int32 I = 0; I < Count; ++I)
     {
-        // Use native spline-point data for positions/tangents, but read the authored
-        // rotation key separately: GetSplinePointAt may return an evaluated frame.
+        // Capture the authored spline keys, not their evaluated equivalents.
+        // In particular, evaluated tangents at Linear/Curve points are not
+        // necessarily the saved tangents and must not be written into an asset.
         const FSplinePoint Point = SourceComponent->GetSplinePointAt(I, ESplineCoordinateSpace::Local);
+        const auto& PositionKey = SourceComponent->SplineCurves.Position.Points[I];
         FSplinePointData Data;
-        Data.LocalPosition = Point.Position;
-        Data.ArriveTangent = Point.ArriveTangent;
-        Data.LeaveTangent = Point.LeaveTangent;
+        Data.LocalPosition = PositionKey.OutVal;
+        // Unreal regenerates the stored tangents for Linear spline keys in
+        // UpdateSpline. They are derivatives of the neighboring points, not
+        // authored Bezier handles. Preserve the semantic linear representation
+        // rather than importing these derived values as editable handles.
+        const bool bDerivedLinearTangents = SourceComponent->GetSplinePointType(I) == ESplinePointType::Linear;
+        Data.ArriveTangent = bDerivedLinearTangents ? FVector::ZeroVector : PositionKey.ArriveTangent;
+        Data.LeaveTangent = bDerivedLinearTangents ? FVector::ZeroVector : PositionKey.LeaveTangent;
         Data.LocalRotation = SourceComponent->SplineCurves.Rotation.Points.IsValidIndex(I)
             ? SourceComponent->SplineCurves.Rotation.Points[I].OutVal.Rotator() : Point.Rotation;
-        Data.LocalScale = Point.Scale;
+        Data.LocalScale = SourceComponent->SplineCurves.Scale.Points.IsValidIndex(I)
+            ? SourceComponent->SplineCurves.Scale.Points[I].OutVal : Point.Scale;
         Data.PointType = SourceComponent->GetSplinePointType(I);
         Data.HandleMode = (Data.PointType.GetValue() == ESplinePointType::Curve ||
             Data.PointType.GetValue() == ESplinePointType::CurveClamped)
@@ -147,14 +155,19 @@ bool USplineDataAsset::MatchesSplineComponentWithPlacement(const USplineComponen
         ? GetPlacementAnchor(AnchorMode, AnchorIndex) : FVector::ZeroVector;
     for (int32 Index = 0; Index < Points.Num(); ++Index)
     {
-        const FSplinePoint Current = Component->GetSplinePointAt(Index, ESplineCoordinateSpace::Local);
+        const auto& Current = Component->SplineCurves.Position.Points[Index];
         const FSplinePointData& Saved = Points[Index];
-        if (!Current.Position.Equals(Saved.LocalPosition - Offset, Tolerance) ||
-            !Current.ArriveTangent.Equals(Saved.ArriveTangent, Tolerance) ||
-            !Current.LeaveTangent.Equals(Saved.LeaveTangent, Tolerance) ||
+        // Linear keys have no independent editable handles: Unreal derives
+        // their raw position-curve tangents when UpdateSpline runs. Exact
+        // tangent parity is meaningful for the other interpolation types.
+        const bool bCompareTangents = Saved.PointType.GetValue() != ESplinePointType::Linear;
+        if (!Current.OutVal.Equals(Saved.LocalPosition - Offset, Tolerance) ||
+            (bCompareTangents && !Current.ArriveTangent.Equals(Saved.ArriveTangent, Tolerance)) ||
+            (bCompareTangents && !Current.LeaveTangent.Equals(Saved.LeaveTangent, Tolerance)) ||
             !(Component->SplineCurves.Rotation.Points.IsValidIndex(Index) &&
               Component->SplineCurves.Rotation.Points[Index].OutVal.Rotator().Equals(Saved.LocalRotation, Tolerance)) ||
-            !Current.Scale.Equals(Saved.LocalScale, Tolerance) ||
+            !(Component->SplineCurves.Scale.Points.IsValidIndex(Index) &&
+              Component->SplineCurves.Scale.Points[Index].OutVal.Equals(Saved.LocalScale, Tolerance)) ||
             Component->GetSplinePointType(Index) != Saved.PointType.GetValue()) { return false; }
     }
     return true;
@@ -214,14 +227,17 @@ bool USplineDataAsset::MatchesSplineComponent(const USplineComponent* Component,
     }
     for (int32 I = 0; I < Points.Num(); ++I)
     {
-        const FSplinePoint P = Component->GetSplinePointAt(I, ESplineCoordinateSpace::Local);
+        const auto& P = Component->SplineCurves.Position.Points[I];
         const FSplinePointData& Q = Points[I];
-        if (!P.Position.Equals(Q.LocalPosition, Tolerance) ||
-            !P.ArriveTangent.Equals(Q.ArriveTangent, Tolerance) ||
-            !P.LeaveTangent.Equals(Q.LeaveTangent, Tolerance) ||
+        const bool bCompareTangents = Q.PointType.GetValue() != ESplinePointType::Linear;
+        if (!P.OutVal.Equals(Q.LocalPosition, Tolerance) ||
+            (bCompareTangents && !P.ArriveTangent.Equals(Q.ArriveTangent, Tolerance)) ||
+            (bCompareTangents && !P.LeaveTangent.Equals(Q.LeaveTangent, Tolerance)) ||
             !(Component->SplineCurves.Rotation.Points.IsValidIndex(I) &&
               Component->SplineCurves.Rotation.Points[I].OutVal.Rotator().Equals(Q.LocalRotation, Tolerance)) ||
-            !P.Scale.Equals(Q.LocalScale, Tolerance) || Component->GetSplinePointType(I) != Q.PointType.GetValue())
+            !(Component->SplineCurves.Scale.Points.IsValidIndex(I) &&
+              Component->SplineCurves.Scale.Points[I].OutVal.Equals(Q.LocalScale, Tolerance)) ||
+            Component->GetSplinePointType(I) != Q.PointType.GetValue())
         {
             return false;
         }
