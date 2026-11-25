@@ -9,6 +9,7 @@
 #include "StrandPlacement.h"
 #include "StrandSplineRefresh.h"
 #include "StrandSurfaceProjectionMath.h"
+#include "StrandContinuousProjection.h"
 #include "StrandSurfaceTargetTrace.h"
 #include "EngineUtils.h"
 #include "Components/SplineComponent.h"
@@ -532,7 +533,7 @@ void SplineEditorCommands::ResetComponent(USplineComponent* Spline)
 // Operates on an explicit level target. This preview is a transient spline component
 // owned by the source actor: no asset, level package, or transaction is modified until Apply.
 void SplineEditorCommands::ProjectComponentOntoScene(USplineComponent* Spline,
-    const FStrandProjectionOptions& Options)
+    const FStrandProjectionOptions& Options, TFunction<void(USplineComponent*, const TArray<int32>&)> OnApplied, TSharedPtr<SWindow> ParentWindow)
 {
     const bool bAllScene = Options.TargetScope == EStrandProjectionTargetScope::EntireLevel;
     TArray<AActor*> AllowedActors;
@@ -606,6 +607,11 @@ void SplineEditorCommands::ProjectComponentOntoScene(USplineComponent* Spline,
         return;
     }
     const int32 Count = Spline->GetNumberOfSplinePoints();
+    if (Options.bUseAnchorWeights && Options.AnchorWeights.Num() != Count)
+    {
+        Message(TEXT("Selection snapshot is stale. Reopen Projection to capture current anchors."));
+        return;
+    }
     const int32 First = FMath::Max(0, FirstAnchor);
     const int32 Last = LastAnchor < 0 ? Count - 1 : FMath::Min(Count - 1, LastAnchor);
     if (First > Last)
@@ -644,6 +650,7 @@ void SplineEditorCommands::ProjectComponentOntoScene(USplineComponent* Spline,
         FVector OldLocalPosition;
         FVector NewLocalPosition;
         FVector LocalNormal;
+        double Influence;
     };
     TArray<FProjectedAnchor> Plan;
     const FVector Direction = WorldDirection.GetSafeNormal();
@@ -651,6 +658,9 @@ void SplineEditorCommands::ProjectComponentOntoScene(USplineComponent* Spline,
     for (int32 Index = First; Index <= Last; ++Index)
     {
         if (!StrandSurfaceProjectionMath::IsAnchorEligible(Index, Count, FirstAnchor, LastAnchor)) { continue; }
+        const double AnchorStrength = StrandSurfaceProjectionMath::EffectiveStrength(Strength,
+            Options.AnchorWeights, Options.bUseAnchorWeights, Index);
+        if (AnchorStrength <= KINDA_SMALL_NUMBER) { continue; }
         const FVector Origin = Spline->GetLocationAtSplinePoint(Index, ESplineCoordinateSpace::World);
         FVector Start, End;
         const bool bRayValid = StrandSurfaceProjectionMath::MakeProjectionRay(
@@ -679,9 +689,9 @@ void SplineEditorCommands::ProjectComponentOntoScene(USplineComponent* Spline,
             // Blend in world space so Strength behaves consistently with rotated or
             // nonuniformly scaled spline owners.
             const FVector BlendedLocal = StrandSurfaceProjectionMath::BlendWorldHitToLocal(
-                SourceTransform, Origin, BestPosition, Strength);
+                SourceTransform, Origin, BestPosition, AnchorStrength);
             const FVector LocalNormal = StrandSurfaceProjectionMath::WorldNormalToLocal(SourceTransform, BestNormal);
-            Plan.Add({Index, OriginalLocal, BlendedLocal, LocalNormal});
+            Plan.Add({Index, OriginalLocal, BlendedLocal, LocalNormal, AnchorStrength});
         }
     }
     if (Plan.IsEmpty())
@@ -706,6 +716,234 @@ void SplineEditorCommands::ProjectComponentOntoScene(USplineComponent* Spline,
         return;
     }
 
+    // Build a full projected point set. Original points retain their identity;
+    // generated points carry -1 so the Strand asset commit keeps the original
+    // Bezier handle policies, while new anchors receive the Free policy.
+    TArray<FSplinePoint> ResultPoints;
+    TArray<int32> OriginalIndices;
+    TArray<FVector> SampleNormals;
+    TArray<double> SampleNormalWeights;
+    ResultPoints.Reserve(Count + (Options.bContinuousConform ? Options.ConformMaxNewPoints : 0));
+    OriginalIndices.Reserve(ResultPoints.GetSlack());
+    SampleNormals.Reserve(ResultPoints.GetSlack());
+    SampleNormalWeights.Reserve(ResultPoints.GetSlack());
+
+    auto PositionAfterProjection = [&Plan, Spline](int32 Index) -> FVector
+    {
+        for (const FProjectedAnchor& Edit : Plan)
+        {
+            if (Edit.Index == Index) { return Edit.NewLocalPosition; }
+        }
+        return Spline->GetLocationAtSplinePoint(Index, ESplineCoordinateSpace::Local);
+    };
+    const int32 SegmentCount = Spline->IsClosedLoop() ? Count : Count - 1;
+    int32 GeneratedCount = 0;
+    int32 MissedSubsamples = 0;
+    bool bResolutionLimited = false;
+    const double CurveLength = Spline->GetSplineLength();
+    // Estimate the projected complexity of every span *before* spending the
+    // global point budget. The old length-only quota could over-refine flat
+    // terrain and starve short sections with high surface deviation.
+    TArray<double> SpanDemands;
+    SpanDemands.Init(0.0, SegmentCount);
+    TArray<int32> SpanBudgets;
+    if (Options.bContinuousConform)
+    {
+        for (int32 Segment = 0; Segment < SegmentCount; ++Segment)
+        {
+            const int32 Next = (Segment + 1) % Count;
+            if (!StrandSurfaceProjectionMath::IsAnchorEligible(Segment, Count, FirstAnchor, LastAnchor) ||
+                !StrandSurfaceProjectionMath::IsAnchorEligible(Next, Count, FirstAnchor, LastAnchor)) { continue; }
+            const double WeightA = StrandSurfaceProjectionMath::EffectiveStrength(Strength,
+                Options.AnchorWeights, Options.bUseAnchorWeights, Segment);
+            const double WeightB = StrandSurfaceProjectionMath::EffectiveStrength(Strength,
+                Options.AnchorWeights, Options.bUseAnchorWeights, Next);
+            if (WeightA <= KINDA_SMALL_NUMBER && WeightB <= KINDA_SMALL_NUMBER) { continue; }
+            const double DA = Spline->GetDistanceAlongSplineAtSplinePoint(Segment);
+            const double DB = Next == 0 ? CurveLength : Spline->GetDistanceAlongSplineAtSplinePoint(Next);
+            const double Length = FMath::Max(0.0, DB - DA) *
+                FMath::Max(UE_SMALL_NUMBER, SourceTransform.GetScale3D().GetAbsMax());
+            const auto Probe = [&](double T) -> FVector
+            {
+                const FVector Local = Spline->GetLocationAtSplineInputKey(
+                    static_cast<float>(Segment + T), ESplineCoordinateSpace::Local);
+                const FVector OriginalWorld = SourceTransform.TransformPosition(Local);
+                FVector Start, End;
+                FHitResult Hit;
+                if (StrandSurfaceProjectionMath::MakeProjectionRay(OriginalWorld,
+                    CameraLocation, Direction,
+                    Options.RayMode == EStrandProjectionRayMode::CameraProjection,
+                    MaxDistance, Start, End) &&
+                    StrandSurfaceTargetTrace::FindSceneHit(World, Spline->GetOwner(),
+                        AllowedActors, bAllScene, Start, End, Hit))
+                {
+                    const FVector TargetWorld = Hit.ImpactPoint + Hit.ImpactNormal.GetSafeNormal() * Clearance;
+                    return StrandSurfaceProjectionMath::BlendWorldHitToLocal(
+                        SourceTransform, OriginalWorld, TargetWorld,
+                        FMath::Lerp(WeightA, WeightB, T));
+                }
+                return Local;
+            };
+            SpanDemands[Segment] = StrandContinuousProjection::EstimateSpanDemand(
+                PositionAfterProjection(Segment), PositionAfterProjection(Next),
+                Length, Options.ConformMaxSpacing, Options.ConformTolerance,
+                Probe(0.25), Probe(0.5), Probe(0.75));
+        }
+    }
+    StrandContinuousProjection::AllocateSpanBudgets(
+        SpanDemands, Options.ConformMaxNewPoints, SpanBudgets);
+    int32 AvailableBudget = Options.ConformMaxNewPoints;
+    for (int32 Index = 0; Index < Count; ++Index)
+    {
+        FSplinePoint Point = Spline->GetSplinePointAt(Index, ESplineCoordinateSpace::Local);
+        Point.Position = PositionAfterProjection(Index);
+        ResultPoints.Add(Point);
+        OriginalIndices.Add(Index);
+        FVector AnchorNormal = FVector::ZeroVector;
+        double NormalWeight = 0.0;
+        for (const FProjectedAnchor& Edit : Plan)
+        {
+            if (Edit.Index == Index) { AnchorNormal = Edit.LocalNormal; NormalWeight = Edit.Influence; break; }
+        }
+        SampleNormals.Add(AnchorNormal);
+        SampleNormalWeights.Add(NormalWeight);
+        if (!Options.bContinuousConform || Index >= SegmentCount || Count < 2) { continue; }
+
+        const int32 Next = (Index + 1) % Count;
+        // Restrict subdivisions to complete eligible spans. A hard selection
+        // edge never creates unselected points, while neighboring soft weights
+        // still interpolate naturally across influenced spans.
+        if (!StrandSurfaceProjectionMath::IsAnchorEligible(Index, Count, FirstAnchor, LastAnchor) ||
+            !StrandSurfaceProjectionMath::IsAnchorEligible(Next, Count, FirstAnchor, LastAnchor)) { continue; }
+        const double WeightA = StrandSurfaceProjectionMath::EffectiveStrength(Strength,
+            Options.AnchorWeights, Options.bUseAnchorWeights, Index);
+        const double WeightB = StrandSurfaceProjectionMath::EffectiveStrength(Strength,
+            Options.AnchorWeights, Options.bUseAnchorWeights, Next);
+        if (WeightA <= KINDA_SMALL_NUMBER && WeightB <= KINDA_SMALL_NUMBER) { continue; }
+
+        const double DistanceA = Spline->GetDistanceAlongSplineAtSplinePoint(Index);
+        const double DistanceB = Next == 0 ? CurveLength : Spline->GetDistanceAlongSplineAtSplinePoint(Next);
+        // Native spline length is local-space; use the largest absolute world
+        // scale as a conservative spacing bound for nonuniformly scaled actors.
+        const double SegmentLength = FMath::Max(0.0, DistanceB - DistanceA) *
+            FMath::Max(UE_SMALL_NUMBER, SourceTransform.GetScale3D().GetAbsMax());
+        TArray<StrandContinuousProjection::FSample> Midpoints;
+        TMap<double, FVector> NormalAtSample;
+        const auto Evaluate = [&](double T) -> FVector
+        {
+            const FVector OriginalLocal = Spline->GetLocationAtSplineInputKey(
+                static_cast<float>(Index + T), ESplineCoordinateSpace::Local);
+            const FVector OriginalWorld = SourceTransform.TransformPosition(OriginalLocal);
+            FVector Start, End;
+            const bool bRayValid = StrandSurfaceProjectionMath::MakeProjectionRay(
+                OriginalWorld, CameraLocation, Direction,
+                Options.RayMode == EStrandProjectionRayMode::CameraProjection,
+                MaxDistance, Start, End);
+            FHitResult Hit;
+            if (bRayValid && StrandSurfaceTargetTrace::FindSceneHit(
+                World, Spline->GetOwner(), AllowedActors, bAllScene, Start, End, Hit))
+            {
+                const FVector TargetWorld = Hit.ImpactPoint + Hit.ImpactNormal.GetSafeNormal() * Clearance;
+                const double Weight = FMath::Lerp(WeightA, WeightB, T);
+                NormalAtSample.Add(T, StrandSurfaceProjectionMath::WorldNormalToLocal(
+                    SourceTransform, Hit.ImpactNormal));
+                return StrandSurfaceProjectionMath::BlendWorldHitToLocal(
+                    SourceTransform, OriginalWorld, TargetWorld, Weight);
+            }
+            ++MissedSubsamples;
+            return OriginalLocal;
+        };
+        // Complexity-aware quota. Unused allocations roll forward, but
+        // later high-error spans retain their reserved portion.
+        const int32 SpanAllowance = FMath::Min(AvailableBudget, SpanBudgets[Index]);
+        bool bSpanLimited = false;
+        if (!StrandContinuousProjection::BuildSegment(PositionAfterProjection(Index),
+            PositionAfterProjection(Next), SegmentLength, Options.ConformMaxSpacing,
+            Options.ConformTolerance, SpanAllowance, Evaluate, Midpoints, &bSpanLimited))
+        {
+            Message(TEXT("Continuous Conform could not evaluate a valid surface sample."));
+            return;
+        }
+        bResolutionLimited |= bSpanLimited;
+        AvailableBudget -= Midpoints.Num();
+        // Unused budget is redistributed to later spans, preferably those
+        // with greater projected error rather than those that happen to be long.
+        const int32 Unused = SpanAllowance - Midpoints.Num();
+        if (Unused > 0)
+        {
+            double FutureDemand = 0.0;
+            for (int32 Future = Index + 1; Future < SpanDemands.Num(); ++Future)
+            { FutureDemand += SpanDemands[Future]; }
+            if (FutureDemand > UE_SMALL_NUMBER)
+            {
+                TArray<double> FutureDemands = SpanDemands;
+                for (int32 Prior = 0; Prior <= Index; ++Prior) { FutureDemands[Prior] = 0.0; }
+                TArray<int32> Reallocated;
+                StrandContinuousProjection::AllocateSpanBudgets(FutureDemands, Unused, Reallocated);
+                for (int32 Future = Index + 1; Future < SpanBudgets.Num(); ++Future)
+                { SpanBudgets[Future] += Reallocated[Future]; }
+            }
+        }
+        const FSplinePoint NextPoint = Spline->GetSplinePointAt(Next, ESplineCoordinateSpace::Local);
+        for (const StrandContinuousProjection::FSample& Sample : Midpoints)
+        {
+            FSplinePoint Added = Point;
+            Added.Position = Sample.Position;
+            Added.Rotation = FQuat::Slerp(Point.Rotation.Quaternion(),
+                NextPoint.Rotation.Quaternion(), Sample.T).Rotator();
+            Added.Scale = FMath::Lerp(Point.Scale, NextPoint.Scale, Sample.T);
+            Added.ArriveTangent = FVector::ZeroVector;
+            Added.LeaveTangent = FVector::ZeroVector;
+            Added.Type = Options.bConformSmoothTangents
+                ? ESplinePointType::CurveCustomTangent : ESplinePointType::Linear;
+            ResultPoints.Add(Added);
+            OriginalIndices.Add(INDEX_NONE);
+            const FVector* Normal = NormalAtSample.Find(Sample.T);
+            SampleNormals.Add(Normal ? *Normal : FVector::ZeroVector);
+            SampleNormalWeights.Add(FMath::Lerp(WeightA, WeightB, Sample.T));
+            ++GeneratedCount;
+        }
+    }
+    // Reconstruct tangents only near inserted samples. Untouched original spans
+    // preserve their native interpolation and authored tangents exactly.
+    if (Options.bContinuousConform && GeneratedCount > 0)
+    {
+        const int32 Total = ResultPoints.Num();
+        for (int32 I = 0; I < Total; ++I)
+        {
+            const int32 Prev = (I + Total - 1) % Total;
+            const int32 Next = (I + 1) % Total;
+            if (!Spline->IsClosedLoop() && (I == 0 || I == Total - 1)) { continue; }
+            const bool bGenerated = OriginalIndices[I] == INDEX_NONE;
+            const bool bLeftConformed = OriginalIndices[Prev] == INDEX_NONE;
+            const bool bRightConformed = OriginalIndices[Next] == INDEX_NONE;
+            if (!bGenerated && !bLeftConformed && !bRightConformed) { continue; }
+            FSplinePoint& P = ResultPoints[I];
+            if (!Options.bConformSmoothTangents)
+            {
+                // Native spline interpolation type controls the outgoing
+                // segment. Only switch an original anchor to Linear when its
+                // outgoing edge actually contains generated samples.
+                if (bGenerated || bRightConformed) { P.Type = ESplinePointType::Linear; }
+                if (bGenerated)
+                {
+                    P.ArriveTangent = FVector::ZeroVector;
+                    P.LeaveTangent = FVector::ZeroVector;
+                }
+            }
+            else if (Options.bConformSmoothTangents)
+            {
+                const FVector Tangent = StrandContinuousProjection::TangentAt(
+                    ResultPoints[Prev].Position, P.Position, ResultPoints[Next].Position);
+                P.Type = ESplinePointType::CurveCustomTangent;
+                // When an original anchor borders an untouched span, retain
+                // the original handle on that side of the boundary.
+                if (bGenerated || bLeftConformed) { P.ArriveTangent = Tangent; }
+                if (bGenerated || bRightConformed) { P.LeaveTangent = Tangent; }
+            }
+        }
+    }
+
     // A ghost spline is intentionally NOT AddInstanceComponent'd: it is transient,
     // unrecorded, non-colliding, and does not become another editable actor spline.
     AActor* Owner = Spline->GetOwner();
@@ -715,23 +953,35 @@ void SplineEditorCommands::ProjectComponentOntoScene(USplineComponent* Spline,
     Ghost->RegisterComponentWithWorld(Owner->GetWorld());
     Ghost->SetWorldTransform(SourceTransform);
     Ghost->ClearSplinePoints(false);
-    for (int32 Index = 0; Index < Count; ++Index)
+    for (int32 Index = 0; Index < ResultPoints.Num(); ++Index)
     {
-        FSplinePoint Point = Spline->GetSplinePointAt(Index, ESplineCoordinateSpace::Local);
-        for (const FProjectedAnchor& Edit : Plan)
-        {
-            if (Edit.Index == Index) { Point.Position = Edit.NewLocalPosition; break; }
-        }
+        FSplinePoint Point = ResultPoints[Index];
+        Point.InputKey = static_cast<float>(Index);
         Ghost->AddPoint(Point, false);
     }
     Ghost->SetClosedLoop(Spline->IsClosedLoop(), false);
     Ghost->UpdateSpline();
+    if (bAlignNormals)
+    {
+        for (int32 I = 0; I < ResultPoints.Num(); ++I)
+        {
+            if (SampleNormals[I].IsNearlyZero() || SampleNormalWeights[I] <= KINDA_SMALL_NUMBER)
+            { continue; }
+            const FVector CurrentUp = Ghost->GetUpVectorAtSplinePoint(I, ESplineCoordinateSpace::Local);
+            const FVector BlendedUp = FMath::Lerp(CurrentUp, SampleNormals[I],
+                SampleNormalWeights[I]).GetSafeNormal();
+            Ghost->SetUpVectorAtSplinePoint(I, BlendedUp, ESplineCoordinateSpace::Local, false);
+        }
+        Ghost->UpdateSpline();
+    }
     Ghost->SetCollisionEnabled(ECollisionEnabled::NoCollision);
     Ghost->SetHiddenInGame(true);
     Ghost->SetUnselectedSplineSegmentColor(FLinearColor(0.75f, 0.24f, 1.0f, 0.65f));
     Ghost->SetSelectedSplineSegmentColor(FLinearColor(0.75f, 0.24f, 1.0f, 0.65f));
     Ghost->SetDrawDebug(true);
 
+    const TSharedRef<TFunction<void(USplineComponent*, const TArray<int32>&)>> OnAppliedHolder =
+        MakeShared<TFunction<void(USplineComponent*, const TArray<int32>&)>>(MoveTemp(OnApplied));
     const TWeakObjectPtr<USplineComponent> WeakSource(Spline);
     const TWeakObjectPtr<USplineComponent> WeakGhost(Ghost);
     TArray<TWeakObjectPtr<AActor>> WeakTargets;
@@ -744,17 +994,30 @@ void SplineEditorCommands::ProjectComponentOntoScene(USplineComponent* Spline,
     const TWeakObjectPtr<AActor> WeakOwner(Owner);
     const FTransform PreviewTransform = SourceTransform;
 
-    const int32 Misses = Last - First + 1 - Plan.Num();
+    int32 EligibleCount = 0;
+    for (int32 Index = First; Index <= Last; ++Index)
+    {
+        if (StrandSurfaceProjectionMath::EffectiveStrength(Strength, Options.AnchorWeights,
+            Options.bUseAnchorWeights, Index) > KINDA_SMALL_NUMBER)
+        { ++EligibleCount; }
+    }
+    const int32 Misses = FMath::Max(0, EligibleCount - Plan.Num());
     const FString Summary = FString::Printf(
         TEXT("Surface: %s  |  Hit: %d  |  Miss: %d  |  Range: %d-%d\n")
-        TEXT("Strength: %.0f%%  |  Clearance: %.2f cm  |  Align Up: %s\n\n")
+        TEXT("Strength: %.0f%%  |  Clearance: %.2f cm  |  Align Up: %s\n")
+        TEXT("Continuous: %s  |  Added anchors: %d  |  Missed samples: %d\n")
+        TEXT("Resolution: %s  |  Point budget: %d\n\n")
         TEXT("Purple: projected preview. The original spline and linked asset are untouched.\n")
-        TEXT("Apply modifies this placed spline only; use Update Asset to save to a shared Strand asset."),
+        TEXT("Apply writes to the active projection source; Cancel leaves it unchanged."),
         bAllScene ? TEXT("All Scene Collision") : *FString::JoinBy(AllowedActors, TEXT(", "), [](const AActor* A) { return A->GetActorLabel(); }),
         Plan.Num(), Misses, First, Last,
-        Strength * 100.0f, Clearance, bAlignNormals ? TEXT("Yes") : TEXT("No"));
+        Strength * 100.0f, Clearance, bAlignNormals ? TEXT("Yes") : TEXT("No"),
+        Options.bContinuousConform ? TEXT("Yes") : TEXT("No"), GeneratedCount, MissedSubsamples,
+        bResolutionLimited ? TEXT("Budget/depth limited (best effort)") : TEXT("Within requested tolerance"),
+        Options.ConformMaxNewPoints);
     TSharedRef<SWindow> Window = SNew(SWindow)
-        .Title(LOCTEXT("ProjectionWindowTitle", "Strand Surface Projection Preview"))
+        .Title(LOCTEXT("ProjectionWindowTitle", "Strand Projection Preview"))
+        .IsTopmostWindow(true)
         .ClientSize(FVector2D(530, 210))
         .SupportsMaximize(false).SupportsMinimize(false);
     const TWeakPtr<SWindow> WeakWindow = Window;
@@ -780,7 +1043,7 @@ void SplineEditorCommands::ProjectComponentOntoScene(USplineComponent* Spline,
                     })]
                 + SHorizontalBox::Slot().AutoWidth().Padding(3)
                 [SNew(SButton).Text(LOCTEXT("ProjectionApply", "Apply Projection"))
-                    .OnClicked_Lambda([WeakWindow, WeakSource, WeakTargets, TargetTransforms, WeakOwner, PreviewTransform, Plan, Count, bAlignNormals]()
+                    .OnClicked_Lambda([WeakWindow, WeakSource, WeakTargets, TargetTransforms, WeakOwner, PreviewTransform, Plan, Count, bAlignNormals, OnAppliedHolder, OriginalIndices, ResultPoints, WeakGhost]()
                     {
                         USplineComponent* Source = WeakSource.Get();
                         bool bTargetsChanged = false;
@@ -811,26 +1074,54 @@ void SplineEditorCommands::ProjectComponentOntoScene(USplineComponent* Spline,
                         const FScopedTransaction Transaction(LOCTEXT("ProjectSurfaceTransaction", "Project Strand Spline to Surface"));
                         if (AActor* SourceOwner = Source->GetOwner()) { SourceOwner->Modify(); }
                         Source->Modify();
-                        for (const FProjectedAnchor& Edit : Plan)
+                        // Commit the *exact* reviewed native point data including
+                        // inserted conform samples and reconstructed tangents.
+                        const bool bWasClosed = Source->IsClosedLoop();
+                        Source->ClearSplinePoints(false);
+                        for (int32 I = 0; I < ResultPoints.Num(); ++I)
                         {
-                            Source->SetLocationAtSplinePoint(Edit.Index, Edit.NewLocalPosition,
-                                ESplineCoordinateSpace::Local, false);
-                            if (bAlignNormals)
+                            FSplinePoint Point = ResultPoints[I];
+                            Point.InputKey = static_cast<float>(I);
+                            Source->AddPoint(Point, false);
+                        }
+                        Source->SetClosedLoop(bWasClosed, false);
+                        Source->UpdateSpline();
+                        if (bAlignNormals)
+                        {
+                            // Copy the reviewed up vectors, including remapped originals.
+                            if (USplineComponent* Preview = WeakGhost.Get())
                             {
-                                Source->SetUpVectorAtSplinePoint(Edit.Index, Edit.LocalNormal,
-                                    ESplineCoordinateSpace::Local, false);
+                                for (int32 I = 0; I < ResultPoints.Num(); ++I)
+                                {
+                                    Source->SetUpVectorAtSplinePoint(I,
+                                        Preview->GetUpVectorAtSplinePoint(I, ESplineCoordinateSpace::Local),
+                                        ESplineCoordinateSpace::Local, false);
+                                }
                             }
                         }
                         Source->UpdateSpline();
-                        Source->MarkPackageDirty();
-                        StrandSplineRefresh::NotifySplineChanged(Source);
+                        if (*OnAppliedHolder)
+                        {
+                            // Asset-editor sessions commit the temporary source back to the asset.
+                            // The callback owns the asset transaction and preview refresh.
+                            (*OnAppliedHolder)(Source, OriginalIndices);
+                        }
+                        else
+                        {
+                            Source->MarkPackageDirty();
+                            StrandSplineRefresh::NotifySplineChanged(Source);
+                        }
                         if (const TSharedPtr<SWindow> Preview = WeakWindow.Pin()) { Preview->RequestDestroyWindow(); }
                         return FReply::Handled();
                     })]
             ]
         ]);
     // Nonmodal: the artist can inspect the ghost in the Level viewport before Apply.
-    FSlateApplication::Get().AddWindow(Window);
+    if (ParentWindow.IsValid())
+    {
+        FSlateApplication::Get().AddWindowAsNativeChild(Window, ParentWindow.ToSharedRef());
+    }
+    else { FSlateApplication::Get().AddWindow(Window); }
 }
 
 void SplineEditorCommands::UpdateComponentAsset(USplineComponent* Spline)

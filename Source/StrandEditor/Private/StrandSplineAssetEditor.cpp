@@ -1,4 +1,6 @@
 #include "StrandSplineAssetEditor.h"
+#include "StrandProjectionWorkbench.h"
+#include "StrandProjectionAssetCommit.h"
 #include "StrandEditorPreferences.h"
 #include "StrandCameraSpaceMath.h"
 #include "StrandPrecisionOperations.h"
@@ -23,8 +25,11 @@
 #include "IAssetTools.h"
 #include "Subsystems/AssetEditorSubsystem.h"
 #include "Editor.h"
+#include "Engine/Selection.h"
 #include "Misc/PackageName.h"
 #include "Components/SplineComponent.h"
+#include "Engine/World.h"
+#include "GameFramework/Actor.h"
 #include "EditorFramework/AssetImportData.h"
 #include "PropertyEditorModule.h"
 #include "IDetailsView.h"
@@ -183,6 +188,17 @@ FText FStrandSplineAssetEditor::GetToolkitToolTipText() const
 
 FStrandSplineAssetEditor::~FStrandSplineAssetEditor()
 {
+    ProjectionLifecycleGuard.Reset();
+    if (TSharedPtr<SWindow> Window = ActiveProjectionWindow.Pin())
+    { Window->RequestDestroyWindow(); }
+    if (AActor* Temporary = TemporaryProjectionActor.Get())
+    {
+        if (GEditor && GEditor->GetSelectedActors() && GEditor->GetSelectedActors()->IsSelected(Temporary))
+        { GEditor->SelectActor(Temporary, false, true, true); }
+        if (UWorld* World = Temporary->GetWorld()) { World->DestroyActor(Temporary); }
+    }
+    TemporaryProjectionActor.Reset();
+    bProjectionActive = false;
     if (TSharedPtr<SWindow> Window = ActiveSnapWindow.Pin())
     { Window->RequestDestroyWindow(); }
     if (PreviewWidget.IsValid()) { PreviewWidget->SetSnapPreviewSegments({}); }
@@ -386,54 +402,120 @@ TSharedRef<SWidget> FStrandSplineAssetEditor::BuildAssetActionToolbar()
                     Menu.AddMenuEntry(LOCTEXT("InspectUsage", "Inspect Usage"), LOCTEXT("InspectUsageTip", "Inspect actors using this asset."),
                         FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this]() { InspectUsage(); })));
                     Menu.AddMenuSeparator();
-                    Menu.AddMenuEntry(LOCTEXT("ProjectionSelectedInstance", "Surface Projection: Selected Level Instance..."),
-                        LOCTEXT("ProjectionSelectedInstanceHelp", "Review projection using a selected Strand Spline Actor or Multi-Spline Actor linked to this asset. The level actor supplies its target, scope, camera mode, and conform settings. This changes the level instance only, not the open asset."),
-                        FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this]()
-                        {
-                            USplineDataAsset* Active = Asset.Get();
-                            TArray<USplineComponent*> Eligible;
-                            TArray<AStrandSplineActor*> Owners;
-                            for (AActor* Candidate : SplineEditorCommands::SelectedActors())
-                            {
-                                AStrandSplineActor* Owner = Cast<AStrandSplineActor>(Candidate);
-                                if (!IsValid(Owner)) { continue; }
-                                TArray<USplineComponent*> Components;
-                                Owner->GetComponents<USplineComponent>(Components);
-                                for (USplineComponent* Component : Components)
-                                {
-                                    if (UStrandSplineUserData::GetAssignedAsset(Component) == Active)
-                                    {
-                                        Eligible.Add(Component);
-                                        Owners.Add(Owner);
-                                    }
-                                }
-                            }
-                            if (Eligible.Num() != 1)
-                            {
-                                FMessageDialog::Open(EAppMsgType::Ok, FText::FromString(FString::Printf(
-                                    TEXT("Select exactly one placed Strand spline instance linked to '%s' in the Level Editor (found %d). Then use this command again. The standalone asset preview has no level collision world."),
-                                    IsValid(Active) ? *Active->GetName() : TEXT("Unknown"), Eligible.Num())));
-                                return;
-                            }
-                            const AStrandSplineActor* Owner = Owners[0];
-                            FStrandProjectionOptions Options;
-                            Options.TargetScope = Owner->StrandProjectionTargetScope;
-                            Options.RayMode = Owner->StrandProjectionRayMode;
-                            Options.Target = Owner->StrandProjectionTarget;
-                            for (AActor* Target : Owner->StrandProjectionTargets) { Options.Targets.Add(Target); }
-                            Options.WorldDirection = Owner->StrandProjectionDirection;
-                            Options.MaxDistance = Owner->StrandProjectionMaxDistance;
-                            Options.Clearance = Owner->StrandProjectionClearance;
-                            Options.Strength = Owner->StrandProjectionStrength;
-                            Options.FirstAnchor = Owner->StrandProjectionFirstAnchor;
-                            Options.LastAnchor = Owner->StrandProjectionLastAnchor;
-                            Options.bAlignNormals = Owner->bStrandProjectionAlignNormals;
-                            SplineEditorCommands::ProjectComponentOntoScene(Eligible[0], Options);
-                        })));
+                    Menu.AddMenuEntry(LOCTEXT("ProjectionSelectedInstance", "Projection..."),
+                        LOCTEXT("ProjectionSelectedInstanceHelp", "Project the active spline into the Level Editor with a temporary preview actor. Apply returns the result directly to this asset; Cancel discards it."),
+                        FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this]() { OpenProjectionWorkbench(); })));
 
                     return Menu.MakeWidget();
                 })
                 .ButtonContent()[ActionContent(TEXT("Strand.Actors"), LOCTEXT("ActorsButton", "Actors"))]];
+}
+
+
+void FStrandSplineAssetEditor::OpenProjectionWorkbench()
+{
+    if (bProjectionActive)
+    {
+        if (TSharedPtr<SWindow> Window = ActiveProjectionWindow.Pin()) { Window->BringToFront(true); }
+        return;
+    }
+    USplineDataAsset* Current = Asset.Get();
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+    if (!IsValid(Current) || !IsValid(World) || !NativePreview.IsValid() || Current->Points.IsEmpty())
+    {
+        FMessageDialog::Open(EAppMsgType::Ok,
+            LOCTEXT("ProjectionRequiresLevel", "Projection requires an open Level Editor world and an asset containing spline anchors."));
+        return;
+    }
+    EndViewportPointDrag();
+    FActorSpawnParameters SpawnParams;
+    SpawnParams.ObjectFlags = RF_Transient;
+    SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+    SpawnParams.bHideFromSceneOutliner = false; // Visible only during this transient session, for native transform gizmo selection.
+    SpawnParams.bTemporaryEditorActor = true;
+    SpawnParams.bCreateActorPackage = false;
+    AActor* Temporary = World->SpawnActor<AActor>(AActor::StaticClass(), FVector::ZeroVector, FRotator::ZeroRotator, SpawnParams);
+    if (!IsValid(Temporary)) { return; }
+    Temporary->SetActorLabel(TEXT("Strand Projection (Temporary)"));
+    USplineComponent* Spline = NewObject<USplineComponent>(Temporary, NAME_None, RF_Transient);
+    Temporary->SetRootComponent(Spline);
+    Temporary->ClearFlags(RF_Transactional);
+    Spline->ClearFlags(RF_Transactional);
+    Spline->SetMobility(EComponentMobility::Movable);
+    Spline->RegisterComponent();
+    Current->ApplyToSplineComponent(Spline);
+    Spline->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+    Spline->SetDrawDebug(true);
+
+    TemporaryProjectionActor = Temporary;
+    bProjectionActive = true;
+    FStrandProjectionOptions Options;
+    Options.TargetScope = EStrandProjectionTargetScope::EntireLevel;
+    Options.RayMode = EStrandProjectionRayMode::WorldDirection;
+    const TArray<int32> Selection = GetSelectedIndices();
+    if (!Selection.IsEmpty())
+    {
+        Options.bUseAnchorWeights = true;
+        Options.AnchorWeights.Reserve(Current->Points.Num());
+        for (int32 Index = 0; Index < Current->Points.Num(); ++Index)
+        {
+            const double Weight = StrandCameraSpace::InfluenceAt(Current->Points, Selection, Index,
+                NativePreview.Get(), SoftSelectionMode == 1 ? StrandCameraSpace::EInfluence::Spatial3D :
+                (SoftSelectionMode == 2 ? StrandCameraSpace::EInfluence::AlongSpline : StrandCameraSpace::EInfluence::Off),
+                SoftSelectionRadius, static_cast<StrandCameraSpace::EFalloff>(SoftSelectionFalloff));
+            Options.AnchorWeights.Add(Weight);
+        }
+    }
+    const TWeakPtr<bool> WeakGuard = ProjectionLifecycleGuard;
+    ActiveProjectionWindow = StrandProjectionWorkbench::Open(Spline, Options,
+        [this, WeakGuard](USplineComponent* Result, const TArray<int32>& OriginalIndices, bool bBakeWorld)
+        {
+            if (!WeakGuard.IsValid() || !bProjectionActive || !IsValid(Result)) { return; }
+            if (USplineDataAsset* Active = Asset.Get())
+            {
+                // The outer Projection Apply transaction owns this asset edit.
+                if (!StrandProjectionAssetCommit::Apply(Active, Result, &OriginalIndices, bBakeWorld)) { return; }
+                // Continuous conform inserts native points, shifting anchor indices.
+                // Keep the original selected anchors selected after Apply.
+                const TSet<int32> OldSelection = SelectedPointIndices;
+                const int32 OldActiveIndex = SelectedPointIndex;
+                SelectedPointIndices.Reset();
+                SelectedPointIndex = INDEX_NONE;
+                for (int32 NewIndex = 0; NewIndex < OriginalIndices.Num(); ++NewIndex)
+                {
+                    const int32 OldIndex = OriginalIndices[NewIndex];
+                    if (OldSelection.Contains(OldIndex) && OldIndex != INDEX_NONE)
+                    { SelectedPointIndices.Add(NewIndex); }
+                    if (OldIndex == OldActiveIndex && OldIndex != INDEX_NONE)
+                    { SelectedPointIndex = NewIndex; }
+                }
+                RebuildNativePreview();
+                PruneSelection();
+                SyncViewportSelection();
+                if (DetailsView.IsValid()) { DetailsView->ForceRefresh(); }
+            }
+            if (TSharedPtr<SWindow> Window = ActiveProjectionWindow.Pin())
+            { Window->RequestDestroyWindow(); }
+        },
+        [this, WeakGuard]()
+        {
+            if (!WeakGuard.IsValid()) { return; }
+            bProjectionActive = false;
+            if (AActor* Temporary = TemporaryProjectionActor.Get())
+            {
+                if (GEditor && GEditor->GetSelectedActors() && GEditor->GetSelectedActors()->IsSelected(Temporary))
+                { GEditor->SelectActor(Temporary, false, true, true); }
+                if (UWorld* ActorWorld = Temporary->GetWorld()) { ActorWorld->DestroyActor(Temporary); }
+            }
+            TemporaryProjectionActor.Reset();
+            ActiveProjectionWindow.Reset();
+        });
+    if (!ActiveProjectionWindow.IsValid())
+    {
+        bProjectionActive = false;
+        World->DestroyActor(Temporary);
+        TemporaryProjectionActor.Reset();
+    }
 }
 
 TSharedRef<SDockTab> FStrandSplineAssetEditor::SpawnPreviewTab(const FSpawnTabArgs& Args)
@@ -825,8 +907,21 @@ TSharedRef<SDockTab> FStrandSplineAssetEditor::SpawnPreviewTab(const FSpawnTabAr
                 .OnGetMenuContent(this, &FStrandSplineAssetEditor::MakeSplineToolsMenu)
                 .ButtonContent()[SNullWidget::NullWidget], FName(TEXT("Strand.More")))]]]
             + SHorizontalBox::Slot().FillWidth(1.0f)
-            [SAssignNew(PreviewWidget, SStrandSplineViewport)]
-        ]
+            [SNew(SOverlay)
+                + SOverlay::Slot()
+                [SAssignNew(PreviewWidget, SStrandSplineViewport)]
+                + SOverlay::Slot()
+                [SNew(SBorder)
+                    .Visibility_Lambda([this]() { return bProjectionActive ? EVisibility::Visible : EVisibility::Collapsed; })
+                    .BorderImage(FAppStyle::GetBrush("WhiteBrush"))
+                    .BorderBackgroundColor(FLinearColor(0.08f, 0.09f, 0.11f, 0.91f))
+                    .HAlign(HAlign_Center).VAlign(VAlign_Center)
+                    [SNew(STextBlock)
+                        .Text(LOCTEXT("ProjectionViewportLocked", "Strand Editor unavailable while Projection is active.\nUse the Level Editor viewport to review the projection."))
+                        .Justification(ETextJustify::Center)
+                        .AutoWrapText(true)]]
+            ] // Close the viewport SHorizontalBox slot containing the SOverlay.
+        ] // Close the outer SVerticalBox slot containing the viewport SHorizontalBox.
         + SVerticalBox::Slot().AutoHeight().Padding(9.0f, 6.0f, 9.0f, 2.0f)
         [SNew(STextBlock)
             .Text(this, &FStrandSplineAssetEditor::GetSummary)

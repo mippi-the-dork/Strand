@@ -4,6 +4,7 @@
 #include "StrandSplineUserData.h"
 #include "SplineDataAsset.h"
 #include "SplineEditorCommands.h"
+#include "StrandProjectionWorkbench.h"
 #include "StrandPlacement.h"
 #include "DetailLayoutBuilder.h"
 #include "DetailCategoryBuilder.h"
@@ -135,6 +136,32 @@ void FStrandActorDetails::CustomizeDetails(IDetailLayoutBuilder& Builder)
                         Options.LastAnchor = Owner->StrandProjectionLastAnchor;
                         Options.bAlignNormals = Owner->bStrandProjectionAlignNormals;
                         SplineEditorCommands::ProjectComponentOntoScene(Weak.Get(), Options);
+                    }
+                    return FReply::Handled();
+                })];
+            Links.AddCustomRow(FText::FromString(ComponentName + TEXT(" Projection")))
+            .WholeRowContent()
+            [SNew(SButton).Text(FText::Format(LOCTEXT("ProjectWorkbenchOne", "Projection Tools: {0}..."), Name))
+                .ToolTipText(LOCTEXT("ProjectWorkbenchTip", "Open temporary projection settings for this level spline. Select all-scene, one or multiple target actors, camera/world rays, strength, clearance and anchor range. Review in the level viewport before applying."))
+                .IsEnabled_Lambda([Weak]() { return Weak.IsValid(); })
+                .OnClicked_Lambda([Weak, Actors]()
+                {
+                    const AStrandSplineActor* Owner = Actors[0].Get();
+                    if (IsValid(Owner) && Weak.IsValid())
+                    {
+                        FStrandProjectionOptions Options;
+                        Options.TargetScope = Owner->StrandProjectionTargetScope;
+                        Options.RayMode = Owner->StrandProjectionRayMode;
+                        Options.Target = Owner->StrandProjectionTarget;
+                        for (AActor* Candidate : Owner->StrandProjectionTargets) { Options.Targets.Add(Candidate); }
+                        Options.WorldDirection = Owner->StrandProjectionDirection;
+                        Options.MaxDistance = Owner->StrandProjectionMaxDistance;
+                        Options.Clearance = Owner->StrandProjectionClearance;
+                        Options.Strength = Owner->StrandProjectionStrength;
+                        Options.FirstAnchor = Owner->StrandProjectionFirstAnchor;
+                        Options.LastAnchor = Owner->StrandProjectionLastAnchor;
+                        Options.bAlignNormals = Owner->bStrandProjectionAlignNormals;
+                        StrandProjectionWorkbench::Open(Weak.Get(), Options);
                     }
                     return FReply::Handled();
                 })];

@@ -28,6 +28,15 @@ namespace StrandSurfaceProjectionMath
         return Index >= FMath::Max(0, First) && Index <= End;
     }
 
+    // Selected-anchor mask and soft-selection use the same falloff as Strand's
+    // editor transforms. An empty mask means projection applies to every anchor.
+    inline double EffectiveStrength(double Strength, const TArray<double>& Weights, bool bUseWeights, int32 Index)
+    {
+        if (!bUseWeights) { return FMath::Clamp(Strength, 0.0, 1.0); }
+        if (!Weights.IsValidIndex(Index) || !FMath::IsFinite(Weights[Index])) { return 0.0; }
+        return FMath::Clamp(Strength, 0.0, 1.0) * FMath::Clamp(Weights[Index], 0.0, 1.0);
+    }
+
     inline FVector BlendWorldHitToLocal(const FTransform& Source,
         const FVector& OriginalWorld, const FVector& HitWorld,
         double Strength)

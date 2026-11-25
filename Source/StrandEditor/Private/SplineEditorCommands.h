@@ -5,6 +5,7 @@
 class AActor;
 class USplineDataAsset;
 class USplineComponent;
+class SWindow;
 enum class EStrandCoordinateMode : uint8;
 enum class EStrandAnchorMode : uint8;
 
@@ -24,6 +25,18 @@ struct FStrandProjectionOptions
     int32 FirstAnchor = 0;
     int32 LastAnchor = -1;
     bool bAlignNormals = false;
+    // Continuous conform adaptively inserts spline points along eligible spans.
+    bool bContinuousConform = false;
+    float ConformMaxSpacing = 100.0f; // cm along original spline
+    float ConformTolerance = 2.0f;  // cm maximum midpoint deviation
+    int32 ConformMaxNewPoints = 1024; // maximum inserted points; preview becomes best-effort when reached
+    bool bConformSmoothTangents = true;
+    // Asset editor only: bake the temporary actor's world transform into saved
+    // point geometry, rather than returning points in the temporary local frame.
+    bool bBakeWorldPlacementToAsset = false;
+    // Editor-only snapshot of selection/soft-selection influence. Empty means every eligible anchor.
+    TArray<double> AnchorWeights;
+    bool bUseAnchorWeights = false;
 };
 
 namespace SplineEditorCommands
@@ -43,7 +56,8 @@ namespace SplineEditorCommands
         EStrandCoordinateMode Mode, EStrandAnchorMode AnchorMode, int32 AnchorPointIndex);
     void ResetComponent(USplineComponent* Spline);
     void UpdateComponentAsset(USplineComponent* Spline);
-    void ProjectComponentOntoScene(USplineComponent* Spline, const FStrandProjectionOptions& Options);
+    void ProjectComponentOntoScene(USplineComponent* Spline, const FStrandProjectionOptions& Options,
+        TFunction<void(USplineComponent*, const TArray<int32>&)> OnApplied = {}, TSharedPtr<SWindow> ParentWindow = nullptr);
     void AssignAssetToComponent(TWeakObjectPtr<USplineComponent> Component, TWeakObjectPtr<USplineDataAsset> Asset);
 
     // Native, editor-only creation and assignment workflows.

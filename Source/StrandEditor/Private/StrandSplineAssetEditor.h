@@ -15,6 +15,7 @@ class USplineDataAsset;
 class USplineComponent;
 class SDockTab;
 class SWindow;
+class AActor;
 class SStrandSplineViewport;
 struct FStrandPenHit;
 struct FPropertyChangedEvent;
@@ -57,6 +58,10 @@ private:
     TStrongObjectPtr<USplineComponent> NativePreview;
     TSharedPtr<IDetailsView> DetailsView;
     TSharedPtr<SStrandSplineViewport> PreviewWidget;
+    TWeakPtr<SWindow> ActiveProjectionWindow;
+    TWeakObjectPtr<AActor> TemporaryProjectionActor;
+    bool bProjectionActive = false;
+    TSharedPtr<bool> ProjectionLifecycleGuard = MakeShared<bool>(true);
     TWeakPtr<SWindow> ActiveFlattenWindow; // Modeless camera-ray projection preview.
     TWeakPtr<SWindow> ActiveSnapWindow; // Preview candidate targets before changing anchor positions.
     TWeakPtr<SWindow> ActiveCleanupWindow; // One modeless live curve cleanup preview.
@@ -115,6 +120,7 @@ private:
     TSharedRef<SDockTab> SpawnDetailsTab(const FSpawnTabArgs& Args);
     TSharedRef<SDockTab> SpawnSourceTab(const FSpawnTabArgs& Args);
     TSharedRef<SWidget> BuildAssetActionToolbar();
+    void OpenProjectionWorkbench();
     TSharedRef<SWidget> MakePrimitiveMenu();
     TSharedRef<SWidget> MakeReplacePrimitiveMenu();
     void ReplaceSplineWithPrimitive(int32 Kind);
