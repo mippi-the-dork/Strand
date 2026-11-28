@@ -6,8 +6,98 @@
 #include "StrandSplineActor.h"
 #include "StrandSurfaceProjectionMath.h"
 #include "StrandProjectionAssetCommit.h"
+#include "StrandProjectionReviewSnapshot.h"
+#include "StrandProjectionAssetBaseline.h"
 #include "StrandContinuousProjection.h"
 
+
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStrandProjectionReviewSourceStaleTest,
+    "Strand.Editor.SurfaceProjection.ReviewRejectsStaleSource",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FStrandProjectionReviewSourceStaleTest::RunTest(const FString& Parameters)
+{
+    USplineComponent* Source = NewObject<USplineComponent>(GetTransientPackage());
+    Source->ClearSplinePoints(false);
+    Source->AddSplinePoint(FVector(0, 0, 0), ESplineCoordinateSpace::Local, false);
+    Source->AddSplinePoint(FVector(100, 0, 0), ESplineCoordinateSpace::Local, false);
+    Source->AddSplinePoint(FVector(200, 0, 0), ESplineCoordinateSpace::Local, false);
+    Source->UpdateSpline();
+    const StrandProjectionReviewSnapshot::FSnapshot Saved =
+        StrandProjectionReviewSnapshot::FSnapshot::Capture(Source);
+    TestTrue(TEXT("Unmodified native source passes review verification"), Saved.Matches(Source));
+    Source->SetLocationAtSplinePoint(2, FVector(200, 0, 90), ESplineCoordinateSpace::Local);
+    TestFalse(TEXT("Changes to an unprojected anchor invalidate the review"), Saved.Matches(Source));
+    Saved.Restore(Source);
+    TestTrue(TEXT("Source snapshot restores original point geometry"), Saved.Matches(Source));
+    Source->SetTangentAtSplinePoint(1, FVector(0, 150, 0), ESplineCoordinateSpace::Local);
+    TestFalse(TEXT("Tangent-only edits invalidate the review"), Saved.Matches(Source));
+    Saved.Restore(Source);
+    Source->SetClosedLoop(true);
+    TestFalse(TEXT("Closed-loop changes invalidate the review"), Saved.Matches(Source));
+    Saved.Restore(Source);
+    TestTrue(TEXT("Restoring the original closed-loop state succeeds"), Saved.Matches(Source));
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStrandProjectionAssetStaleTest,
+    "Strand.Editor.SurfaceProjection.ReviewRejectsStaleAsset",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FStrandProjectionAssetStaleTest::RunTest(const FString& Parameters)
+{
+    USplineDataAsset* Asset = NewObject<USplineDataAsset>(GetTransientPackage());
+    FSplinePointData A;
+    A.LocalPosition = FVector(10, 20, 30);
+    A.HandleMode = EStrandBezierHandleMode::Mirrored;
+    FSplinePointData B = A;
+    B.LocalPosition = FVector(100, 20, 30);
+    Asset->Points = {A, B};
+    const StrandProjectionAssetBaseline::FSnapshot Saved =
+        StrandProjectionAssetBaseline::FSnapshot::Capture(Asset);
+    TestTrue(TEXT("Unmodified asset passes stale-asset check"), Saved.Matches(Asset));
+    Asset->Points[1].LocalPosition.Z += 10;
+    TestFalse(TEXT("Unprojected asset anchor changes reject Apply"), Saved.Matches(Asset));
+    Asset->Points[1] = B;
+    Asset->Points[0].HandleMode = EStrandBezierHandleMode::Aligned;
+    TestFalse(TEXT("Handle-mode-only edits reject stale Apply"), Saved.Matches(Asset));
+    Asset->Points[0] = A;
+    Asset->DefaultCoordinateMode = EStrandCoordinateMode::Absolute;
+    TestFalse(TEXT("Placement-mode changes reject stale Apply"), Saved.Matches(Asset));
+    Asset->DefaultCoordinateMode = EStrandCoordinateMode::Relative;
+    TestTrue(TEXT("Restored asset allows Apply"), Saved.Matches(Asset));
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStrandProjectionInvalidCommitTest,
+    "Strand.Editor.SurfaceProjection.InvalidCommitIsNonDestructive",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FStrandProjectionInvalidCommitTest::RunTest(const FString& Parameters)
+{
+    USplineDataAsset* Asset = NewObject<USplineDataAsset>(GetTransientPackage());
+    FSplinePointData A;
+    A.LocalPosition = FVector(12, 34, 56);
+    A.HandleMode = EStrandBezierHandleMode::Aligned;
+    FSplinePointData B = A;
+    B.LocalPosition = FVector(98, 76, 54);
+    Asset->Points = {A, B};
+    USplineComponent* Source = NewObject<USplineComponent>(GetTransientPackage());
+    Asset->ApplyToSplineComponent(Source);
+    const TArray<int32> InvalidMapping = {0, 0};
+    TestFalse(TEXT("Duplicate original index mapping rejects Apply"),
+        StrandProjectionAssetCommit::Apply(Asset, Source, &InvalidMapping));
+    TestEqual(TEXT("Rejected apply retains original anchor count"), Asset->Points.Num(), 2);
+    TestTrue(TEXT("Rejected apply retains original positions"),
+        Asset->Points[0].LocalPosition.Equals(A.LocalPosition) &&
+        Asset->Points[1].LocalPosition.Equals(B.LocalPosition));
+    TestTrue(TEXT("Rejected apply retains authored handle mode"),
+        Asset->Points[0].HandleMode == EStrandBezierHandleMode::Aligned);
+    TestTrue(TEXT("Rejected apply does not change placement defaults"),
+        Asset->DefaultCoordinateMode == EStrandCoordinateMode::Relative);
+    return true;
+}
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStrandProjectionCameraPlacementTest,
     "Strand.Editor.SurfaceProjection.CameraPlacementTransform",

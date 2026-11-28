@@ -13,6 +13,7 @@
 #include "StrandSurfaceTargetTrace.h"
 #include "EngineUtils.h"
 #include "Components/SplineComponent.h"
+#include "Components/LineBatchComponent.h"
 #include "Components/PrimitiveComponent.h"
 #include "Engine/World.h"
 #include "LandscapeSplinesComponent.h"
@@ -29,6 +30,7 @@
 #include "Misc/MessageDialog.h"
 #include "UObject/SavePackage.h"
 #include "ScopedTransaction.h"
+#include "StrandProjectionReviewSnapshot.h"
 #include "DesktopPlatformModule.h"
 #include "IDesktopPlatform.h"
 #include "Framework/Application/SlateApplication.h"
@@ -290,38 +292,161 @@ void SplineEditorCommands::AssignAssetToComponents(const TArray<TWeakObjectPtr<U
 void SplineEditorCommands::CompareComponent(USplineComponent* Spline)
 {
     const USplineDataAsset* Asset = UStrandSplineUserData::GetAssignedAsset(Spline);
-    if (!IsValid(Spline) || !IsValid(Asset)) { return; }
+    if (!IsValid(Spline) || !IsValid(Asset) || !IsValid(Spline->GetWorld()) || !IsValid(Spline->GetOwner()))
+    {
+        Message(TEXT("Compare requires a valid level spline with an assigned Strand asset."));
+        return;
+    }
+
     const int32 Local = Spline->GetNumberOfSplinePoints();
     const int32 Saved = Asset->Points.Num();
     const UStrandSplineUserData* Placement = UStrandSplineUserData::Get(Spline);
-    const FVector AnchorOffset = Placement && Placement->CoordinateMode == EStrandCoordinateMode::Relative
-        ? Asset->GetPlacementAnchor(Placement->AnchorMode, Placement->AnchorPointIndex) : FVector::ZeroVector;
+    const EStrandCoordinateMode Mode = Placement ? Placement->CoordinateMode : Asset->DefaultCoordinateMode;
+    const EStrandAnchorMode Anchor = Placement ? Placement->AnchorMode : Asset->DefaultAnchorMode;
+    const int32 AnchorIndex = Placement ? Placement->AnchorPointIndex : Asset->DefaultAnchorPointIndex;
+    const FVector AnchorOffset = Mode == EStrandCoordinateMode::Relative
+        ? Asset->GetPlacementAnchor(Anchor, AnchorIndex) : FVector::ZeroVector;
+    const FTransform WorldTransform = Spline->GetComponentTransform();
+
     int32 DifferentPoints = 0;
-    double LargestPosDelta = 0;
+    double LargestPosDelta = 0.0;
     int32 FirstDifferentIndex = INDEX_NONE;
-    for (int32 I = 0; I < FMath::Min(Local, Saved); ++I)
+    const int32 Matching = FMath::Min(Local, Saved);
+    TArray<int32> ChangedIndices;
+    ChangedIndices.Reserve(Matching);
+    for (int32 I = 0; I < Matching; ++I)
     {
         const FSplinePoint Current = Spline->GetSplinePointAt(I, ESplineCoordinateSpace::Local);
         const FSplinePointData& Reference = Asset->Points[I];
+        const bool bCompareTangents = Reference.PointType.GetValue() != ESplinePointType::Linear;
         const bool bDifferent = !Current.Position.Equals(Reference.LocalPosition - AnchorOffset, 0.01) ||
-            !Current.ArriveTangent.Equals(Reference.ArriveTangent, 0.01) ||
-            !Current.LeaveTangent.Equals(Reference.LeaveTangent, 0.01) ||
+            (bCompareTangents && (!Current.ArriveTangent.Equals(Reference.ArriveTangent, 0.01) ||
+                !Current.LeaveTangent.Equals(Reference.LeaveTangent, 0.01))) ||
             !Current.Rotation.Equals(Reference.LocalRotation, 0.01) ||
             !Current.Scale.Equals(Reference.LocalScale, 0.01) ||
             Spline->GetSplinePointType(I) != Reference.PointType.GetValue();
         if (bDifferent)
         {
             ++DifferentPoints;
+            ChangedIndices.Add(I);
             if (FirstDifferentIndex == INDEX_NONE) { FirstDifferentIndex = I; }
         }
         LargestPosDelta = FMath::Max(LargestPosDelta,
             FVector::Distance(Current.Position, Reference.LocalPosition - AnchorOffset));
     }
     const bool bLoopMismatch = Spline->IsClosedLoop() != Asset->bIsClosedLoop;
-    Message(FString::Printf(TEXT("Strand comparison\n\nAsset points: %d\nLocal points: %d\nDiffering matched points: %d\nFirst different point index: %s\nLargest position delta: %.3f cm\nClosed loop differs: %s\n\nComparison only. No data was changed."),
-        Saved, Local, DifferentPoints,
+
+    // Build an unowned transient spline for the linked asset. Its transform is
+    // identical to the component being compared, so both curves are drawn in
+    // the same world frame and respect the instance's Relative/Absolute mode.
+    // Never call ApplyToSplineComponentWithPlacement here: that function marks
+    // packages dirty and is intended for actual authoring, not comparison.
+    USplineComponent* ReferenceSpline = NewObject<USplineComponent>(Spline->GetOwner(), NAME_None, RF_Transient);
+    ReferenceSpline->SetMobility(EComponentMobility::Movable);
+    ReferenceSpline->SetupAttachment(Spline->GetOwner()->GetRootComponent());
+    ReferenceSpline->RegisterComponentWithWorld(Spline->GetWorld());
+    ReferenceSpline->SetWorldTransform(WorldTransform);
+    ReferenceSpline->ClearSplinePoints(false);
+    for (int32 I = 0; I < Saved; ++I)
+    {
+        FSplinePoint Point = Asset->Points[I].ToSplinePoint(I);
+        Point.Position -= AnchorOffset;
+        ReferenceSpline->AddPoint(Point, false);
+    }
+    if (Asset->bIsClosedLoop && Saved >= 2)
+    {
+        ReferenceSpline->SetClosedLoopAtPosition(true, static_cast<float>(Saved), false);
+    }
+    else { ReferenceSpline->SetClosedLoop(false, false); }
+    ReferenceSpline->UpdateSpline();
+    ReferenceSpline->SetDrawDebug(false);
+    ReferenceSpline->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+    ReferenceSpline->SetHiddenInGame(true);
+
+    ULineBatchComponent* Lines = NewObject<ULineBatchComponent>(Spline->GetOwner(), NAME_None, RF_Transient);
+    Lines->SetMobility(EComponentMobility::Movable);
+    Lines->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+    Lines->RegisterComponentWithWorld(Spline->GetWorld());
+    constexpr uint8 Depth = SDPG_Foreground;
+    constexpr float Lifetime = 3600.0f; // Components are destroyed when Compare closes.
+    const FLinearColor AssetColor(0.10f, 0.85f, 0.95f, 1.0f);
+    const FLinearColor InstanceColor(1.0f, 0.65f, 0.14f, 1.0f);
+    const FLinearColor MismatchColor(1.0f, 0.23f, 0.32f, 1.0f);
+    auto DrawCurve = [Lines](const USplineComponent* Curve, const FLinearColor& Color, float Thickness)
+    {
+        const double Length = Curve->GetSplineLength();
+        if (!FMath::IsFinite(Length) || Length <= UE_SMALL_NUMBER) { return; }
+        const int32 Segments = FMath::Clamp(FMath::Max(Curve->GetNumberOfSplinePoints() * 8,
+            FMath::CeilToInt(FMath::Min(Length / 40.0, 2048.0))), 32, 2048);
+        FVector Prev = Curve->GetLocationAtDistanceAlongSpline(0.0f, ESplineCoordinateSpace::World);
+        for (int32 I = 1; I <= Segments; ++I)
+        {
+            const FVector Next = Curve->GetLocationAtDistanceAlongSpline(
+                Length * static_cast<double>(I) / Segments, ESplineCoordinateSpace::World);
+            Lines->DrawLine(Prev, Next, Color, Depth, Thickness, Lifetime, 0);
+            Prev = Next;
+        }
+    };
+    DrawCurve(ReferenceSpline, AssetColor, 2.5f);
+    DrawCurve(Spline, InstanceColor, 2.5f);
+
+    // Draw changed anchors even when tangent/rotation/type differences do not
+    // move their positions. Cap overlays for imported curves with many points.
+    const int32 IndexStep = FMath::Max(1, FMath::DivideAndRoundUp(ChangedIndices.Num(), 256));
+    for (int32 I = 0; I < ChangedIndices.Num(); I += IndexStep)
+    {
+        const int32 Index = ChangedIndices[I];
+        const FVector A = Spline->GetLocationAtSplinePoint(Index, ESplineCoordinateSpace::World);
+        const FVector B = ReferenceSpline->GetLocationAtSplinePoint(Index, ESplineCoordinateSpace::World);
+        Lines->DrawPoint(A, MismatchColor, 11.0f, Depth, Lifetime, 0);
+        Lines->DrawPoint(B, MismatchColor, 9.0f, Depth, Lifetime, 0);
+        if (!A.Equals(B, 0.01)) { Lines->DrawLine(A, B, MismatchColor, Depth, 1.5f, Lifetime, 0); }
+    }
+    if (GEditor) { GEditor->RedrawAllViewports(); }
+
+    const FString Summary = FString::Printf(
+        TEXT("Asset: %s\nActor spline: %s\n\n")
+        TEXT("Asset points: %d | Actor points: %d\n")
+        TEXT("Differing matched points: %d | First difference: %s\n")
+        TEXT("Largest anchor displacement: %.3f cm | Closed loop differs: %s\n\n")
+        TEXT("CYAN: linked asset at this actor's placement\n")
+        TEXT("AMBER: current actor spline\n")
+        TEXT("RED: differing anchors (connecting lines show displacement)\n\n")
+        TEXT("Comparison is read-only. Close this window to clear the overlay."),
+        *Asset->GetName(), *Spline->GetName(), Saved, Local, DifferentPoints,
         FirstDifferentIndex == INDEX_NONE ? TEXT("None") : *FString::FromInt(FirstDifferentIndex),
-        LargestPosDelta, bLoopMismatch ? TEXT("Yes") : TEXT("No")));
+        LargestPosDelta, bLoopMismatch ? TEXT("Yes") : TEXT("No"));
+
+    TSharedRef<SWindow> Window = SNew(SWindow)
+        .Title(LOCTEXT("VisualCompareTitle", "Strand | Compare Spline"))
+        .IsTopmostWindow(true)
+        .ClientSize(FVector2D(540, 295))
+        .SupportsMaximize(false).SupportsMinimize(false);
+    const TWeakObjectPtr<USplineComponent> WeakReference(ReferenceSpline);
+    const TWeakObjectPtr<ULineBatchComponent> WeakLines(Lines);
+    const TWeakPtr<SWindow> WeakWindow(Window);
+    Window->SetOnWindowClosed(FOnWindowClosed::CreateLambda([WeakReference, WeakLines](const TSharedRef<SWindow>&)
+    {
+        if (ULineBatchComponent* Batch = WeakLines.Get()) { Batch->DestroyComponent(); }
+        if (USplineComponent* Reference = WeakReference.Get()) { Reference->DestroyComponent(); }
+        if (GEditor) { GEditor->RedrawAllViewports(); }
+    }));
+    Window->SetContent(
+        SNew(SBox).Padding(16)
+        [SNew(SVerticalBox)
+            + SVerticalBox::Slot().FillHeight(1).Padding(0, 0, 0, 10)
+            [SNew(STextBlock).Text(FText::FromString(Summary)).AutoWrapText(true)]
+            + SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Right)
+            [SNew(SButton).Text(LOCTEXT("CloseVisualCompare", "Close Compare"))
+                .OnClicked_Lambda([WeakWindow]()
+                {
+                    if (TSharedPtr<SWindow> Active = WeakWindow.Pin()) { Active->RequestDestroyWindow(); }
+                    return FReply::Handled();
+                })]
+        ]);
+    // Non-modal so the designer can orbit/pan the Level viewport while the
+    // informational comparison window and temporary visual overlay remain open.
+    FSlateApplication::Get().AddWindow(Window);
 }
 
 USplineDataAsset* SplineEditorCommands::SelectedSplineAsset()
@@ -533,7 +658,7 @@ void SplineEditorCommands::ResetComponent(USplineComponent* Spline)
 // Operates on an explicit level target. This preview is a transient spline component
 // owned by the source actor: no asset, level package, or transaction is modified until Apply.
 void SplineEditorCommands::ProjectComponentOntoScene(USplineComponent* Spline,
-    const FStrandProjectionOptions& Options, TFunction<void(USplineComponent*, const TArray<int32>&)> OnApplied, TSharedPtr<SWindow> ParentWindow)
+    const FStrandProjectionOptions& Options, TFunction<bool(USplineComponent*, const TArray<int32>&)> OnApplied, TSharedPtr<SWindow> ParentWindow)
 {
     const bool bAllScene = Options.TargetScope == EStrandProjectionTargetScope::EntireLevel;
     TArray<AActor*> AllowedActors;
@@ -980,10 +1105,51 @@ void SplineEditorCommands::ProjectComponentOntoScene(USplineComponent* Spline,
     Ghost->SetSelectedSplineSegmentColor(FLinearColor(0.75f, 0.24f, 1.0f, 0.65f));
     Ghost->SetDrawDebug(true);
 
-    const TSharedRef<TFunction<void(USplineComponent*, const TArray<int32>&)>> OnAppliedHolder =
-        MakeShared<TFunction<void(USplineComponent*, const TArray<int32>&)>>(MoveTemp(OnApplied));
+    // Draw the review result independently of Show > Splines and actor selection.
+    // USplineComponent debug rendering alone is conditional on the viewport's
+    // Splines show flag and can silently vanish while Apply still works.
+    // A separate, transient line batch provides a visible, non-interactive
+    // foreground overlay. It is destroyed with the review window, not retained
+    // by the actor or saved to the level/asset.
+    ULineBatchComponent* PreviewLines = NewObject<ULineBatchComponent>(Owner, NAME_None, RF_Transient);
+    PreviewLines->SetMobility(EComponentMobility::Movable);
+    PreviewLines->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+    PreviewLines->RegisterComponentWithWorld(Owner->GetWorld());
+    const FLinearColor PreviewColor(0.86f, 0.34f, 1.0f, 1.0f);
+    constexpr float PreviewLineLifetimeSeconds = 3600.0f; // Removed on review close.
+    constexpr uint8 PreviewDepthPriority = SDPG_Foreground;
+    const double PreviewLength = Ghost->GetSplineLength();
+    if (FMath::IsFinite(PreviewLength) && PreviewLength > UE_SMALL_NUMBER)
+    {
+        // Keep the overlay responsive even for splines with many anchors.
+        const int32 PreviewSegmentCount = FMath::Clamp(
+            FMath::Max(Ghost->GetNumberOfSplinePoints() * 8,
+                FMath::CeilToInt(FMath::Min(PreviewLength / 40.0, 2048.0))), 32, 2048);
+        FVector Previous = Ghost->GetLocationAtDistanceAlongSpline(0.0f, ESplineCoordinateSpace::World);
+        for (int32 Segment = 1; Segment <= PreviewSegmentCount; ++Segment)
+        {
+            const double Distance = PreviewLength * static_cast<double>(Segment) / PreviewSegmentCount;
+            const FVector Current = Ghost->GetLocationAtDistanceAlongSpline(
+                Distance, ESplineCoordinateSpace::World);
+            PreviewLines->DrawLine(Previous, Current, PreviewColor, PreviewDepthPriority,
+                3.0f, PreviewLineLifetimeSeconds, 0);
+            Previous = Current;
+        }
+    }
+    // Show actual projected anchors separately from sampled curve segments.
+    const int32 AnchorCount = Ghost->GetNumberOfSplinePoints();
+    const int32 AnchorStep = FMath::Max(1, FMath::DivideAndRoundUp(AnchorCount, 512));
+    for (int32 I = 0; I < AnchorCount; I += AnchorStep)
+    {
+        PreviewLines->DrawPoint(Ghost->GetLocationAtSplinePoint(I, ESplineCoordinateSpace::World),
+            PreviewColor, 7.0f, PreviewDepthPriority, PreviewLineLifetimeSeconds, 0);
+    }
+
+    const TSharedRef<TFunction<bool(USplineComponent*, const TArray<int32>&)>> OnAppliedHolder =
+        MakeShared<TFunction<bool(USplineComponent*, const TArray<int32>&)>>(MoveTemp(OnApplied));
     const TWeakObjectPtr<USplineComponent> WeakSource(Spline);
     const TWeakObjectPtr<USplineComponent> WeakGhost(Ghost);
+    const TWeakObjectPtr<ULineBatchComponent> WeakPreviewLines(PreviewLines);
     TArray<TWeakObjectPtr<AActor>> WeakTargets;
     TArray<FTransform> TargetTransforms;
     for (AActor* A : AllowedActors)
@@ -993,6 +1159,7 @@ void SplineEditorCommands::ProjectComponentOntoScene(USplineComponent* Spline,
     }
     const TWeakObjectPtr<AActor> WeakOwner(Owner);
     const FTransform PreviewTransform = SourceTransform;
+    const StrandProjectionReviewSnapshot::FSnapshot SourceSnapshot = StrandProjectionReviewSnapshot::FSnapshot::Capture(Spline);
 
     int32 EligibleCount = 0;
     for (int32 Index = First; Index <= Last; ++Index)
@@ -1021,8 +1188,9 @@ void SplineEditorCommands::ProjectComponentOntoScene(USplineComponent* Spline,
         .ClientSize(FVector2D(530, 210))
         .SupportsMaximize(false).SupportsMinimize(false);
     const TWeakPtr<SWindow> WeakWindow = Window;
-    Window->SetOnWindowClosed(FOnWindowClosed::CreateLambda([WeakGhost](const TSharedRef<SWindow>&)
+    Window->SetOnWindowClosed(FOnWindowClosed::CreateLambda([WeakGhost, WeakPreviewLines](const TSharedRef<SWindow>&)
     {
+        if (ULineBatchComponent* Lines = WeakPreviewLines.Get()) { Lines->DestroyComponent(); }
         if (USplineComponent* Component = WeakGhost.Get()) { Component->DestroyComponent(); }
     }));
     Window->SetContent(
@@ -1043,7 +1211,7 @@ void SplineEditorCommands::ProjectComponentOntoScene(USplineComponent* Spline,
                     })]
                 + SHorizontalBox::Slot().AutoWidth().Padding(3)
                 [SNew(SButton).Text(LOCTEXT("ProjectionApply", "Apply Projection"))
-                    .OnClicked_Lambda([WeakWindow, WeakSource, WeakTargets, TargetTransforms, WeakOwner, PreviewTransform, Plan, Count, bAlignNormals, OnAppliedHolder, OriginalIndices, ResultPoints, WeakGhost]()
+                    .OnClicked_Lambda([WeakWindow, WeakSource, WeakTargets, TargetTransforms, WeakOwner, PreviewTransform, SourceSnapshot, Plan, Count, bAlignNormals, OnAppliedHolder, OriginalIndices, ResultPoints, WeakGhost]()
                     {
                         USplineComponent* Source = WeakSource.Get();
                         bool bTargetsChanged = false;
@@ -1054,8 +1222,7 @@ void SplineEditorCommands::ProjectComponentOntoScene(USplineComponent* Spline,
                             { bTargetsChanged = true; break; }
                         }
                         if (!IsValid(Source) || !WeakOwner.IsValid() || bTargetsChanged ||
-                            Source->GetNumberOfSplinePoints() != Count ||
-                            !Source->GetComponentTransform().Equals(PreviewTransform))
+                            !SourceSnapshot.Matches(Source))
                         {
                             Message(TEXT("The source or target changed during preview. Review the projection again."));
                             if (const TSharedPtr<SWindow> Preview = WeakWindow.Pin()) { Preview->RequestDestroyWindow(); }
@@ -1071,7 +1238,7 @@ void SplineEditorCommands::ProjectComponentOntoScene(USplineComponent* Spline,
                                 return FReply::Handled();
                             }
                         }
-                        const FScopedTransaction Transaction(LOCTEXT("ProjectSurfaceTransaction", "Project Strand Spline to Surface"));
+                        FScopedTransaction Transaction(LOCTEXT("ProjectSurfaceTransaction", "Project Strand Spline to Surface"));
                         if (AActor* SourceOwner = Source->GetOwner()) { SourceOwner->Modify(); }
                         Source->Modify();
                         // Commit the *exact* reviewed native point data including
@@ -1104,7 +1271,16 @@ void SplineEditorCommands::ProjectComponentOntoScene(USplineComponent* Spline,
                         {
                             // Asset-editor sessions commit the temporary source back to the asset.
                             // The callback owns the asset transaction and preview refresh.
-                            (*OnAppliedHolder)(Source, OriginalIndices);
+                            if (!(*OnAppliedHolder)(Source, OriginalIndices))
+                            {
+                                // Abort the transaction and restore the exact original geometry.
+                                // In asset-editor sessions the source is a nontransactional temp actor.
+                                Transaction.Cancel();
+                                SourceSnapshot.Restore(Source);
+                                Message(TEXT("The Strand asset changed or could not accept this projection. No changes were applied; reopen Projection to refresh the source."));
+                                if (const TSharedPtr<SWindow> Preview = WeakWindow.Pin()) { Preview->RequestDestroyWindow(); }
+                                return FReply::Handled();
+                            }
                         }
                         else
                         {

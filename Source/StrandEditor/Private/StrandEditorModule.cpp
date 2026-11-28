@@ -204,9 +204,10 @@ public:
         PropertyEditor.RegisterCustomClassLayout(AStrandSplineActor::StaticClass()->GetFName(),
             FOnGetDetailCustomizationInstance::CreateStatic(&FStrandActorDetails::MakeInstance));
         RegisteredDetailClasses.Add(AStrandSplineActor::StaticClass()->GetFName());
-        PropertyEditor.RegisterCustomClassLayout(AStrandMultiSplineActor::StaticClass()->GetFName(),
-            FOnGetDetailCustomizationInstance::CreateStatic(&FStrandActorDetails::MakeInstance));
-        RegisteredDetailClasses.Add(AStrandMultiSplineActor::StaticClass()->GetFName());
+        // Class Details layouts are inherited by derived actors. Registering
+        // both AStrandSplineActor and AStrandMultiSplineActor runs the same
+        // customization twice on multi-spline actors (duplicate Strand rows).
+        // The base registration covers both native actor classes.
         PropertyEditor.NotifyCustomizationModuleChanged();
 
         // Native Content Browser drag/drop calls this factory at the viewport drop location.

@@ -1,6 +1,7 @@
 #include "StrandSplineAssetEditor.h"
 #include "StrandProjectionWorkbench.h"
 #include "StrandProjectionAssetCommit.h"
+#include "StrandProjectionAssetBaseline.h"
 #include "StrandEditorPreferences.h"
 #include "StrandCameraSpaceMath.h"
 #include "StrandPrecisionOperations.h"
@@ -467,14 +468,18 @@ void FStrandSplineAssetEditor::OpenProjectionWorkbench()
         }
     }
     const TWeakPtr<bool> WeakGuard = ProjectionLifecycleGuard;
+    const StrandProjectionAssetBaseline::FSnapshot AssetBaseline = StrandProjectionAssetBaseline::FSnapshot::Capture(Current);
     ActiveProjectionWindow = StrandProjectionWorkbench::Open(Spline, Options,
-        [this, WeakGuard](USplineComponent* Result, const TArray<int32>& OriginalIndices, bool bBakeWorld)
+        [this, WeakGuard, AssetBaseline](USplineComponent* Result, const TArray<int32>& OriginalIndices, bool bBakeWorld) -> bool
         {
-            if (!WeakGuard.IsValid() || !bProjectionActive || !IsValid(Result)) { return; }
+            if (!WeakGuard.IsValid() || !bProjectionActive || !IsValid(Result)) { return false; }
             if (USplineDataAsset* Active = Asset.Get())
             {
-                // The outer Projection Apply transaction owns this asset edit.
-                if (!StrandProjectionAssetCommit::Apply(Active, Result, &OriginalIndices, bBakeWorld)) { return; }
+                // Reject stale asset edits BEFORE any asset mutation. The outer
+                // Projection Apply transaction owns the successful asset edit.
+                if (!AssetBaseline.Matches(Active) ||
+                    !StrandProjectionAssetCommit::Apply(Active, Result, &OriginalIndices, bBakeWorld))
+                { return false; }
                 // Continuous conform inserts native points, shifting anchor indices.
                 // Keep the original selected anchors selected after Apply.
                 const TSet<int32> OldSelection = SelectedPointIndices;
@@ -494,8 +499,10 @@ void FStrandSplineAssetEditor::OpenProjectionWorkbench()
                 SyncViewportSelection();
                 if (DetailsView.IsValid()) { DetailsView->ForceRefresh(); }
             }
+            else { return false; }
             if (TSharedPtr<SWindow> Window = ActiveProjectionWindow.Pin())
             { Window->RequestDestroyWindow(); }
+            return true;
         },
         [this, WeakGuard]()
         {

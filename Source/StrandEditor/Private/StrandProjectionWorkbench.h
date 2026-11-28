@@ -17,5 +17,5 @@ namespace StrandProjectionWorkbench
     /** Validate option combinations before allocating a preview or making collision queries. */
     bool ValidateOptions(const FStrandProjectionOptions& Options, int32 AnchorCount, FString& OutReason);
     TSharedPtr<SWindow> Open(USplineComponent* Source, const FStrandProjectionOptions& InitialOptions,
-        TFunction<void(USplineComponent*, const TArray<int32>&, bool)> OnApplied = {}, TFunction<void()> OnClosed = {});
+        TFunction<bool(USplineComponent*, const TArray<int32>&, bool)> OnApplied = {}, TFunction<void()> OnClosed = {});
 }

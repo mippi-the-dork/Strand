@@ -1,39 +1,39 @@
 {
-  "FileVersion": 3,
-  "Version": 95,
-  "VersionName": "0.6.56-dev.1",
-  "FriendlyName": "Strand",
-  "Description": "Native Unreal spline authoring with preview-based curve cleanup, tolerance-guided simplify/dissolve, exact subdivision, continuity and repair tools, split/join workflows, and 3D editing.",
-  "Category": "Editor",
-  "CreatedBy": "Strand",
-  "CanContainContent": false,
-  "IsBetaVersion": true,
-  "Installed": false,
-  "Modules": [
-    {
-      "Name": "Strand",
-      "Type": "Runtime",
-      "LoadingPhase": "Default"
-    },
-    {
-      "Name": "StrandPCG",
-      "Type": "Runtime",
-      "LoadingPhase": "Default"
-    },
-    {
-      "Name": "StrandEditor",
-      "Type": "Editor",
-      "LoadingPhase": "PostEngineInit"
-    }
-  ],
-  "Plugins": [
-    {
-      "Name": "PCG",
-      "Enabled": true
-    },
-    {
-      "Name": "AlembicImporter",
-      "Enabled": true
-    }
-  ]
+    "FileVersion": 3,
+    "Version": 107,
+    "VersionName": "0.6.61-dev.1",
+    "FriendlyName": "Strand",
+    "Description": "Native Unreal spline authoring with preview-based curve cleanup, tolerance-guided simplify/dissolve, exact subdivision, continuity and repair tools, split/join workflows, and 3D editing.",
+    "Category": "Editor",
+    "CreatedBy": "Strand",
+    "CanContainContent": false,
+    "IsBetaVersion": true,
+    "Installed": false,
+    "Modules": [
+        {
+            "Name": "Strand",
+            "Type": "Runtime",
+            "LoadingPhase": "Default"
+        },
+        {
+            "Name": "StrandPCG",
+            "Type": "Runtime",
+            "LoadingPhase": "Default"
+        },
+        {
+            "Name": "StrandEditor",
+            "Type": "Editor",
+            "LoadingPhase": "PostEngineInit"
+        }
+    ],
+    "Plugins": [
+        {
+            "Name": "PCG",
+            "Enabled": true
+        },
+        {
+            "Name": "AlembicImporter",
+            "Enabled": true
+        }
+    ]
 }

@@ -57,7 +57,7 @@ namespace SplineEditorCommands
     void ResetComponent(USplineComponent* Spline);
     void UpdateComponentAsset(USplineComponent* Spline);
     void ProjectComponentOntoScene(USplineComponent* Spline, const FStrandProjectionOptions& Options,
-        TFunction<void(USplineComponent*, const TArray<int32>&)> OnApplied = {}, TSharedPtr<SWindow> ParentWindow = nullptr);
+        TFunction<bool(USplineComponent*, const TArray<int32>&)> OnApplied = {}, TSharedPtr<SWindow> ParentWindow = nullptr);
     void AssignAssetToComponent(TWeakObjectPtr<USplineComponent> Component, TWeakObjectPtr<USplineDataAsset> Asset);
 
     // Native, editor-only creation and assignment workflows.
